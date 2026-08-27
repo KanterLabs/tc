@@ -17,6 +17,14 @@ import (
 	"roadmap/internal/store"
 )
 
+type staticCloudflareVerifier struct {
+	claims auth.CloudflareClaims
+}
+
+func (v staticCloudflareVerifier) Verify(context.Context, string) (auth.CloudflareClaims, error) {
+	return v.claims, nil
+}
+
 func testServer(t *testing.T, mode string) (*Server, *store.Store) {
 	t.Helper()
 	database, err := db.Open(context.Background(), ":memory:")
@@ -158,6 +166,29 @@ func TestFirstAdminSetupIsSingleton(t *testing.T) {
 	}
 	if successes != 1 {
 		t.Fatalf("setup successes = %d", successes)
+	}
+}
+
+func TestCloudflareStatusBrowserNavigationReturnsToApp(t *testing.T) {
+	server, _ := testServer(t, "cloudflare")
+	server.Auth = auth.NewManagerWithVerifier(server.Store, server.Cfg, staticCloudflareVerifier{
+		claims: auth.CloudflareClaims{Email: "owner@example.com", Name: "Owner"},
+	})
+
+	browser := request(t, server, http.MethodGet, "/api/v1/auth/status", nil, map[string]string{
+		"Accept":                  "text/html,application/xhtml+xml",
+		"Cf-Access-Jwt-Assertion": "valid-access-assertion",
+	})
+	if browser.Code != http.StatusSeeOther || browser.Header().Get("Location") != "/" {
+		t.Fatalf("browser status = %d location=%q body=%s", browser.Code, browser.Header().Get("Location"), browser.Body.String())
+	}
+
+	apiResponse := request(t, server, http.MethodGet, "/api/v1/auth/status", nil, map[string]string{
+		"Accept":                  "application/json",
+		"Cf-Access-Jwt-Assertion": "valid-access-assertion",
+	})
+	if apiResponse.Code != http.StatusOK || !strings.Contains(apiResponse.Body.String(), `"authenticated":true`) {
+		t.Fatalf("API status = %d body=%s", apiResponse.Code, apiResponse.Body.String())
 	}
 }
 

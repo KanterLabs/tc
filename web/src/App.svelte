@@ -1,6 +1,6 @@
 <script lang="ts">
   import { onMount, tick } from 'svelte';
-  import { api, listAllTasks, unwrapActor } from './lib/api';
+  import { API_PREFIX, api, listAllTasks, unwrapActor } from './lib/api';
   import {
     actorId,
     actorName,
@@ -75,6 +75,8 @@
   let setupName = '';
   let setupEmail = '';
   let setupPassword = '';
+
+  const accessBootstrapKey = 'roadmap.cloudflare-access-bootstrap';
 
   let theme: 'light' | 'dark' = 'light';
   let view: View = 'board';
@@ -310,8 +312,11 @@
   async function bootstrap() {
     booting = true;
     authError = '';
+    let authStatusLoaded = false;
     try {
       authStatus = await api.authStatus();
+      authStatusLoaded = true;
+      sessionStorage.removeItem(accessBootstrapKey);
       if (authStatus.setup_required || authStatus.needs_setup) {
         authView = 'setup';
         booting = false;
@@ -338,6 +343,22 @@
       }
       await finishAuthentication();
     } catch (error) {
+      // Cloudflare Access protects the browser UI and API as distinct
+      // applications so agents can use Service Auth on /api/v1/*. A browser
+      // therefore needs one top-level API navigation to receive the API-path
+      // authorization cookie; an XHR cannot complete that cross-origin login
+      // redirect. The status endpoint sends HTML navigations back here after
+      // Access has issued the cookie.
+      if (
+        !authStatusLoaded &&
+        error instanceof TypeError &&
+        window.location.protocol === 'https:' &&
+        sessionStorage.getItem(accessBootstrapKey) !== window.location.origin
+      ) {
+        sessionStorage.setItem(accessBootstrapKey, window.location.origin);
+        window.location.assign(`${API_PREFIX}/auth/status`);
+        return;
+      }
       authError = friendlyError(error, 'Roadmap could not connect to the server.');
     } finally {
       booting = false;
@@ -1350,9 +1371,11 @@
           {#if authSubmitting}<span class="button-spinner"></span>{/if}
           {authView === 'setup' ? 'Create workspace' : 'Sign in'}
         </button>
-        <button class="text-button auth-switch" type="button" on:click={() => { authView = authView === 'setup' ? 'login' : 'setup'; authError = ''; }}>
-          {authView === 'setup' ? 'Already have an account? Sign in' : 'First time here? Set up your workspace'}
-        </button>
+        {#if authStatus?.mode === 'local'}
+          <button class="text-button auth-switch" type="button" on:click={() => { authView = authView === 'setup' ? 'login' : 'setup'; authError = ''; }}>
+            {authView === 'setup' ? 'Already have an account? Sign in' : 'First time here? Set up your workspace'}
+          </button>
+        {/if}
       </form>
     </section>
   </main>

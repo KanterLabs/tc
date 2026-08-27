@@ -713,6 +713,14 @@ func (s *Server) authStatus(w http.ResponseWriter, r *http.Request) {
 		status["authenticated"] = true
 		status["actor"] = identity.Actor
 		status["user"] = identity.Actor
+		// The UI and API use separate Cloudflare Access applications. A normal
+		// browser navigation to this endpoint lets Access issue its API-path
+		// authorization cookie, then returns the user to the SPA. API clients and
+		// fetch requests explicitly ask for JSON and retain the status response.
+		if s.Cfg.AuthMode == "cloudflare" && !identity.IsToken && strings.Contains(r.Header.Get("Accept"), "text/html") {
+			http.Redirect(w, r, "/", http.StatusSeeOther)
+			return
+		}
 	}
 	s.writeJSON(w, http.StatusOK, status)
 }
