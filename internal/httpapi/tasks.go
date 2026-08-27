@@ -65,6 +65,26 @@ func (s *Server) tasks(w http.ResponseWriter, r *http.Request, identity auth.Ide
 			s.writeError(w, http.StatusBadRequest, "invalid_request", err.Error(), nil)
 			return
 		}
+		kind, err := parseOptionalEnum(r, "kind", taskKinds)
+		if err != nil {
+			s.writeError(w, http.StatusBadRequest, "invalid_request", err.Error(), nil)
+			return
+		}
+		severity, err := parseOptionalEnum(r, "severity", bugSeverityFilters)
+		if err != nil {
+			s.writeError(w, http.StatusBadRequest, "invalid_request", err.Error(), nil)
+			return
+		}
+		reporter, err := parseOptionalIdentifier(r, "reporter")
+		if err != nil {
+			s.writeError(w, http.StatusBadRequest, "invalid_request", err.Error(), nil)
+			return
+		}
+		resolution, err := parseOptionalEnum(r, "resolution", bugResolutionFilters)
+		if err != nil {
+			s.writeError(w, http.StatusBadRequest, "invalid_request", err.Error(), nil)
+			return
+		}
 		query, err := parseOptionalSearch(r)
 		if err != nil {
 			s.writeError(w, http.StatusBadRequest, "invalid_request", err.Error(), nil)
@@ -75,7 +95,7 @@ func (s *Server) tasks(w http.ResponseWriter, r *http.Request, identity auth.Ide
 			s.writeError(w, http.StatusBadRequest, "invalid_request", err.Error(), nil)
 			return
 		}
-		filter := store.TaskFilter{State: state, Column: columnFilter, Priority: priority, Label: label, Assignee: assignee, Query: query, Cursor: offset, Limit: limit, UpdatedAfter: updatedAfter}
+		filter := store.TaskFilter{State: state, Column: columnFilter, Priority: priority, Label: label, Assignee: assignee, Kind: kind, Severity: severity, Reporter: reporter, Resolution: resolution, Query: query, Cursor: offset, Limit: limit, UpdatedAfter: updatedAfter}
 		tasks, more, err := s.Store.ListTasksWithExtra(r.Context(), project.ID, filter)
 		if err != nil {
 			s.writeInternal(w, err)
@@ -205,7 +225,7 @@ func decodeTaskInput(r *http.Request, creating bool) (store.TaskInput, error) {
 	payload = fields
 	for name := range payload {
 		switch name {
-		case "title", "description", "priority", "column_id", "column", "position", "assignee", "assignee_id", "due_at", "labels", "label_ids":
+		case "title", "description", "priority", "kind", "bug", "column_id", "column", "position", "assignee", "assignee_id", "due_at", "labels", "label_ids":
 		default:
 			return store.TaskInput{}, taskInputError("unknown task field: " + name)
 		}
@@ -221,7 +241,7 @@ func decodeTaskInput(r *http.Request, creating bool) (store.TaskInput, error) {
 	// clients cannot accidentally believe an ignored field was applied.
 	if !creating {
 		recognized := false
-		for _, name := range []string{"title", "description", "priority", "column_id", "column", "position", "assignee", "assignee_id", "due_at", "labels", "label_ids"} {
+		for _, name := range []string{"title", "description", "priority", "kind", "bug", "column_id", "column", "position", "assignee", "assignee_id", "due_at", "labels", "label_ids"} {
 			if _, ok := payload[name]; ok {
 				recognized = true
 				break
@@ -267,6 +287,28 @@ func decodeTaskInput(r *http.Request, creating bool) (store.TaskInput, error) {
 			return store.TaskInput{}, taskInputError("priority must not be empty")
 		}
 		input.Priority = value
+	}
+	if raw, ok := preferredTaskField(payload, "kind"); ok {
+		value, err := parseTaskString(raw, "kind", false)
+		if err != nil {
+			return store.TaskInput{}, err
+		}
+		if value == nil || strings.TrimSpace(*value) == "" {
+			return store.TaskInput{}, taskInputError("kind must not be empty")
+		}
+		input.Kind = value
+	}
+	if raw, ok := preferredTaskField(payload, "bug"); ok {
+		input.BugSet = true
+		if isJSONNull(raw) {
+			input.Bug = nil
+		} else {
+			bug, err := decodeBugInput(raw)
+			if err != nil {
+				return store.TaskInput{}, err
+			}
+			input.Bug = &bug
+		}
 	}
 	if raw, ok := preferredTaskField(payload, "column_id"); ok {
 		value, err := parseTaskString(raw, "column_id", false)
@@ -355,6 +397,65 @@ func decodeTaskInput(r *http.Request, creating bool) (store.TaskInput, error) {
 			}
 			input.LabelsSet = true
 		}
+	}
+	return input, nil
+}
+
+func decodeBugInput(raw json.RawMessage) (store.BugInput, error) {
+	var payload map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &payload); err != nil || payload == nil {
+		return store.BugInput{}, taskInputError("bug must be an object")
+	}
+	for name := range payload {
+		switch name {
+		case "severity", "actual_behavior", "expected_behavior", "reproduction_steps", "environment", "affected_version":
+		default:
+			return store.BugInput{}, taskInputError("unknown bug field: " + name)
+		}
+	}
+	var input store.BugInput
+	if value, ok := payload["severity"]; ok {
+		input.SeveritySet = true
+		if !isJSONNull(value) {
+			parsed, err := parseTaskString(value, "severity", false)
+			if err != nil {
+				return store.BugInput{}, err
+			}
+			input.Severity = parsed
+		}
+	}
+	if value, ok := payload["actual_behavior"]; ok {
+		if isJSONNull(value) {
+			return store.BugInput{}, taskInputError("actual_behavior cannot be null")
+		}
+		parsed, err := parseTaskString(value, "actual_behavior", false)
+		if err != nil {
+			return store.BugInput{}, err
+		}
+		input.ActualBehavior, input.ActualBehaviorSet = parsed, true
+	}
+	for name, target := range map[string]struct {
+		value **string
+		set   *bool
+	}{
+		"expected_behavior":  {&input.ExpectedBehavior, &input.ExpectedBehaviorSet},
+		"reproduction_steps": {&input.ReproductionSteps, &input.ReproductionStepsSet},
+		"environment":        {&input.Environment, &input.EnvironmentSet},
+		"affected_version":   {&input.AffectedVersion, &input.AffectedVersionSet},
+	} {
+		value, ok := payload[name]
+		if !ok {
+			continue
+		}
+		*target.set = true
+		if isJSONNull(value) {
+			continue
+		}
+		parsed, err := parseTaskString(value, name, false)
+		if err != nil {
+			return store.BugInput{}, err
+		}
+		*target.value = parsed
 	}
 	return input, nil
 }

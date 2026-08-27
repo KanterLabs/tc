@@ -1,9 +1,9 @@
 # Roadmap
 
-Roadmap is a small, self-hosted project board for teams where humans and
-software agents move work together. Humans get a focused Kanban workspace;
-agents get a stable, auditable API for discovering, claiming, updating, and
-finishing tasks without sharing a human login.
+Roadmap is a small, self-hosted project board and internal bug tracker for
+teams where humans and software agents move work together. Humans get a
+focused Kanban workspace; agents get a stable, auditable API for discovering,
+claiming, updating, and finishing tasks without sharing a human login.
 
 Roadmap v1 intentionally keeps the model small: one board per project,
 ordered semantic columns, and SQLite persistence. It is not intended to be a
@@ -15,17 +15,27 @@ Trello-compatible API or a full team-suite replacement.
   and a persistent project switcher (`Cmd/Ctrl+K`).
 - Work from a board with Backlog, Ready, In progress, Blocked, and Done
   columns. Create tasks quickly, move them with drag-and-drop or keyboard
-  controls, and filter by text, state, priority, label, or assignee.
+  controls, and filter by text, state, kind, priority, severity, label,
+  assignee, reporter, or resolution.
 - Keep task context in Markdown descriptions, priorities, due dates, labels,
-  assignees, comments, and chronological human/agent activity.
+  assignees, comments, and chronological human/agent activity. Record bugs
+  with actual versus expected behavior, reproduction steps, environment, and
+  affected version.
 - See assigned and claimed work across projects in **My work**, or inspect
   completion, overdue work, upcoming deadlines, and recent activity in the
   **Roadmap** view.
 - Coordinate safely through atomic leased claims, renew/release/complete/block
-  actions, optimistic versions (`ETag`/`If-Match`), idempotency keys, and a
-  cursor-based event feed.
+  actions, bug triage/resolve/reopen actions, optimistic versions
+  (`ETag`/`If-Match`), idempotency keys, and a cursor-based event feed.
 - Create agents and issue project-scoped bearer tokens with independently
   selected read, write, claim, and event scopes.
+
+The built-in bug tracker is an internal MVP. Bugs use the existing task,
+board, claim, comment, scope, and event model. Public issue intake, external
+tracker synchronization, notifications, attachments, service-level
+agreements, and a separate bug-permission model are out of scope for now. See
+[`docs/API_CONTRACT.md`](docs/API_CONTRACT.md) for the lifecycle and complete
+request/response contract.
 
 Screenshots are not checked in yet; run the local stack below to see the
 current UI.
@@ -118,6 +128,34 @@ The API contract is documented in [`docs/API_CONTRACT.md`](docs/API_CONTRACT.md)
 The human-edited OpenAPI source is [`openapi.yaml`](openapi.yaml); the checked-in
 JSON document is [`internal/httpapi/openapi.json`](internal/httpapi/openapi.json)
 and is served at `/openapi.json`.
+
+Tasks declare `kind: task` or `kind: bug`. Bug creation requires nested
+`bug.actual_behavior`; triage sets `severity` (`s1`–`s4`), resolve records a
+documented resolution, and reopen records a reason. These mutations use the
+same `If-Match`, idempotency, claim, and bearer-scope rules as other task
+actions. Agents with `tasks:read` can use `GET /api/v1/issues` to list bugs
+across their permitted projects with lifecycle, board, ownership, search, and
+pagination filters.
+
+Agent issue workflow:
+
+1. Report with `POST /api/v1/projects/{project}/tasks`, `kind: "bug"`, nested
+   bug details, and an `Idempotency-Key`; the server records the reporter.
+2. Discover work with `GET /api/v1/issues?severity=untriaged`, then claim the
+   selected task with `POST /api/v1/tasks/{task}/claim`.
+3. Triage severity, priority, assignment, and destination together with
+   `POST /api/v1/tasks/{task}/triage` and the current `If-Match` value.
+4. Use the ordinary task patch, comment, claim-renewal, and event-polling APIs
+   while working the bug.
+5. Finish through `POST .../resolve` with an explicit resolution; use
+   `POST .../reopen` with a reason if the regression returns. Retry mutations
+   with the same idempotency key and refresh after a stale ETag conflict.
+
+The Issues view exposes operational counts for open, untriaged, S1/S2,
+recently resolved, and recently reopened bugs. Command search opens issue keys
+and titles directly. Filters use the same global issue query vocabulary, so a
+filtered URL can be bookmarked as a working view without a separate issue
+permission or search system.
 
 ```sh
 # Contract and liveness checks

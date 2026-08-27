@@ -376,6 +376,37 @@ input:focus, textarea:focus, select:focus { border-color: var(--purple); }
 .list-skeleton { display: grid; gap: 8px; }
 .list-skeleton > div { height: 75px; border-radius: 10px; background: linear-gradient(110deg, var(--surface-muted), var(--surface-hover), var(--surface-muted)); background-size: 200% 100%; animation: shimmer 1.5s infinite; }
 
+/* Issues */
+.issues-toolbar { min-height: 43px; display: flex; align-items: center; flex-wrap: wrap; gap: 8px; margin-bottom: 19px; }
+.issues-toolbar .filter-group { flex-wrap: wrap; }
+.issue-metrics { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 10px; margin: 0 0 18px; }
+.issue-metrics article { display: flex; align-items: center; justify-content: space-between; gap: 12px; min-width: 0; padding: 12px 14px; border: 1px solid var(--border); border-radius: 12px; background: var(--surface); }
+.issue-metrics span { color: var(--muted); font-size: 10px; }
+.issue-metrics strong { font-family: var(--font-display); font-size: 18px; line-height: 1; }
+.issues-list { display: grid; gap: 7px; }
+.issue-row { min-height: 79px; display: flex; align-items: center; gap: 12px; width: 100%; padding: 11px 14px; border: 1px solid var(--border); border-radius: 10px; color: var(--ink); background: var(--surface); box-shadow: var(--shadow-sm); text-align: left; transition: border-color .15s ease, transform .15s ease, box-shadow .15s ease; }
+.issue-row:hover { border-color: color-mix(in srgb, var(--red), var(--border) 60%); box-shadow: 0 5px 13px rgba(35, 42, 61, .08); transform: translateY(-1px); }
+.issue-kind-badge { display: inline-flex; align-items: center; justify-content: center; min-width: 36px; min-height: 21px; padding: 2px 7px; border-radius: 5px; color: var(--red); background: var(--red-soft); font-size: 9px; font-weight: 800; }
+.issue-kind-badge.task-kind { color: var(--purple); background: var(--purple-soft); }
+.issue-main { min-width: 0; flex: 1; display: flex; flex-direction: column; gap: 4px; }
+.issue-row-top { display: flex; align-items: center; gap: 7px; }
+.issue-main strong { overflow: hidden; font-size: 12px; text-overflow: ellipsis; white-space: nowrap; }
+.issue-project-name { overflow: hidden; color: var(--muted); font-size: 10px; text-overflow: ellipsis; white-space: nowrap; }
+.issue-status { min-width: 135px; display: flex; flex-direction: column; align-items: flex-start; gap: 5px; }
+.severity-badge, .resolution-badge { display: inline-flex; align-items: center; min-height: 19px; padding: 2px 7px; border-radius: 5px; color: var(--red); background: var(--red-soft); font-size: 9px; font-weight: 800; }
+.severity-badge.untriaged { color: var(--amber); background: var(--amber-soft); }
+.resolution-badge { color: var(--green); background: var(--green-soft); font-weight: 700; }
+.resolution-badge.open { color: var(--muted); background: var(--surface-muted); }
+.issue-column { min-width: 95px; color: var(--ink-soft); font-size: 10px; }
+.issues-empty { min-height: 300px; }
+.drawer-bug-controls { max-height: min(52vh, 570px); overflow: auto; padding-bottom: 4px; }
+.bug-details-section, .bug-triage-section, .bug-resolution-section { margin-right: 22px; margin-left: 22px; padding: 15px 0 0; border-top: 1px solid var(--border); }
+.bug-details-section { margin-top: 0; }
+.bug-details-section textarea, .bug-resolution-section textarea { width: 100%; }
+.bug-triage-section > .button, .bug-resolution-section > .button { width: 100%; }
+.bug-create-modal { width: min(620px, calc(100vw - 30px)); }
+.bug-create-modal .form-row { grid-template-columns: 1fr 1fr; }
+
 /* Roadmap */
 .roadmap-content { display: grid; gap: 18px; }
 .roadmap-hero { min-height: 180px; display: flex; align-items: center; justify-content: space-between; gap: 30px; padding: 29px 32px; overflow: hidden; border: 1px solid var(--border); border-radius: 14px; background: radial-gradient(circle at 82% 30%, color-mix(in srgb, var(--purple-soft) 80%, transparent), transparent 36%), var(--surface); }
@@ -553,11 +584,15 @@ legend { margin-bottom: 8px; color: var(--ink-soft); font-size: 10px; font-weigh
   .task-total { margin-left: auto; }
   .metric-grid { grid-template-columns: repeat(2, 1fr); }
   .roadmap-columns { grid-template-columns: 1fr; }
+  .issues-toolbar .filter-group { width: 100%; flex-wrap: nowrap; overflow-x: auto; }
+  .issues-toolbar .filter-group select { flex: 1; min-width: 125px; }
+  .issue-metrics { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .issue-column { display: none; }
 }
 @media (max-width: 600px) {
   .sidebar { display: none; }
   .topbar { padding: 0 15px; }
-  .mobile-nav { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 4px; padding: 7px 10px; border-bottom: 1px solid var(--border); background: var(--surface); }
+  .mobile-nav { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 4px; padding: 7px 10px; border-bottom: 1px solid var(--border); background: var(--surface); }
   .mobile-nav button { min-width: 0; min-height: 42px; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 3px; padding: 4px 2px; border: 0; border-radius: 8px; color: var(--muted); background: transparent; font-size: 10px; font-weight: 700; }
   .mobile-nav button:hover, .mobile-nav button.active { color: var(--purple); background: var(--purple-soft); }
   .mobile-nav-icon { font-size: 16px; line-height: 1; }
@@ -588,7 +623,14 @@ legend { margin-bottom: 8px; color: var(--ink-soft); font-size: 10px; font-weigh
   .drawer-title-input { font-size: 20px; }
   .drawer-actions .button { flex: 1; }
   .drawer-field-grid { grid-template-columns: 1fr; }
+  .bug-details-section, .bug-triage-section, .bug-resolution-section { margin-right: 16px; margin-left: 16px; }
+  .drawer-bug-controls { max-height: 46vh; }
+  .issue-row { align-items: flex-start; gap: 8px; padding: 11px 10px; }
+  .issue-status { min-width: 86px; }
+  .issue-status .severity-badge, .issue-status .resolution-badge { max-width: 86px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .issue-kind-badge { min-width: 32px; padding-right: 5px; padding-left: 5px; }
   .modal { padding: 20px 16px; }
+  .bug-create-modal .form-row { grid-template-columns: 1fr; }
   .auth-page { padding: 0; }
   .auth-panel { min-height: 100vh; display: flex; flex-direction: column; border: 0; border-radius: 0; }
   .auth-intro { min-height: 290px; padding: 32px 28px; }

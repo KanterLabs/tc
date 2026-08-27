@@ -11,9 +11,15 @@ import {
   type Comment,
   type Label,
   type Project,
+  type BugInput,
+  type BugSeverity,
+  type BugResolution,
   type RoadmapSummary,
   type Task,
-  type TaskPatch
+  type TaskPatch,
+  type TriageInput,
+  type ResolveInput,
+  type ReopenInput
 } from './types';
 
 export const API_PREFIX = '/api/v1';
@@ -30,10 +36,18 @@ export interface TaskListParams {
   priority?: string;
   label?: string;
   assignee?: string;
+  kind?: Task['kind'];
+  severity?: BugSeverity | 'untriaged' | 'none';
+  reporter?: string;
+  resolution?: BugResolution | 'unresolved' | 'none';
   q?: string;
   updated_after?: string;
   cursor?: string;
   limit?: number;
+}
+
+export interface IssueListParams extends Omit<TaskListParams, 'kind'> {
+  project?: string;
 }
 
 function pathWithQuery(path: string, query?: Record<string, string | number | undefined | null>): string {
@@ -169,6 +183,28 @@ export const api = {
         priority: params.priority,
         label: params.label,
         assignee: params.assignee,
+        kind: params.kind,
+        severity: params.severity,
+        reporter: params.reporter,
+        resolution: params.resolution,
+        q: params.q,
+        updated_after: params.updated_after,
+        cursor: params.cursor,
+        limit: params.limit ?? 200
+      })
+    ).then(collectionFrom),
+  listIssues: (params: IssueListParams = {}) =>
+    request<Collection<Task> | Task[]>(
+      pathWithQuery('/issues', {
+        project: params.project,
+        state: params.state,
+        column: params.column,
+        priority: params.priority,
+        label: params.label,
+        assignee: params.assignee,
+        severity: params.severity,
+        reporter: params.reporter,
+        resolution: params.resolution,
         q: params.q,
         updated_after: params.updated_after,
         cursor: params.cursor,
@@ -181,6 +217,8 @@ export const api = {
       title: string;
       description?: string;
       priority?: Task['priority'];
+      kind?: Task['kind'];
+      bug?: BugInput;
       column_id?: string;
       position?: number;
       due_at?: string | null;
@@ -198,6 +236,28 @@ export const api = {
   patchTask: (task: string, input: TaskPatch, version: number) =>
     request<Task>(`/tasks/${encodeURIComponent(task)}`, {
       method: 'PATCH',
+      body: input,
+      ifMatch: version,
+      idempotencyKey: key()
+    }),
+
+  triageTask: (task: string, version: number, input: TriageInput) =>
+    request<Task>(`/tasks/${encodeURIComponent(task)}/triage`, {
+      method: 'POST',
+      body: input,
+      ifMatch: version,
+      idempotencyKey: key()
+    }),
+  resolveTask: (task: string, version: number, input: ResolveInput) =>
+    request<Task>(`/tasks/${encodeURIComponent(task)}/resolve`, {
+      method: 'POST',
+      body: input,
+      ifMatch: version,
+      idempotencyKey: key()
+    }),
+  reopenTask: (task: string, version: number, input: ReopenInput) =>
+    request<Task>(`/tasks/${encodeURIComponent(task)}/reopen`, {
+      method: 'POST',
       body: input,
       ifMatch: version,
       idempotencyKey: key()
@@ -312,6 +372,10 @@ export const api = {
 /** Fetch every page for a board while retaining the contract's cursor API. */
 export async function listAllTasks(project: string, params: TaskListParams = {}): Promise<Collection<Task>> {
   return collectPages((cursor) => api.listTasks(project, { ...params, cursor, limit: params.limit ?? 200 }), params.cursor);
+}
+
+export async function listAllIssues(params: IssueListParams = {}): Promise<Collection<Task>> {
+  return collectPages((cursor) => api.listIssues({ ...params, cursor, limit: params.limit ?? 200 }), params.cursor);
 }
 
 export function unwrapActor(value: Actor | { user: Actor }): Actor {

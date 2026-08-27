@@ -33,6 +33,40 @@ describe('public API client', () => {
     expect((init as RequestInit).headers).toBeInstanceOf(Headers);
   });
 
+  it('passes issue filters and mutation payloads through the bug endpoints', async () => {
+    const fetchMock = vi.spyOn(globalThis, 'fetch')
+      .mockResolvedValueOnce(response({ data: [], next_cursor: null }))
+      .mockResolvedValueOnce(response({ id: 'bug-1', version: 3 }))
+      .mockResolvedValueOnce(response({ id: 'bug-1', version: 4 }))
+      .mockResolvedValueOnce(response({ id: 'bug-1', version: 5 }));
+
+    await api.listTasks('project-1', { kind: 'bug', severity: 's1', reporter: 'alex', resolution: 'fixed' });
+    expect(String(fetchMock.mock.calls[0][0])).toContain('kind=bug');
+    expect(String(fetchMock.mock.calls[0][0])).toContain('severity=s1');
+    expect(String(fetchMock.mock.calls[0][0])).toContain('reporter=alex');
+    expect(String(fetchMock.mock.calls[0][0])).toContain('resolution=fixed');
+
+    await api.triageTask('bug-1', 2, { severity: 's1', priority: 'urgent', assignee: 'alex' });
+    await api.resolveTask('bug-1', 3, { resolution: 'fixed', note: 'Patched in release' });
+    await api.reopenTask('bug-1', 4, { reason: 'Regression returned' });
+
+    expect(String(fetchMock.mock.calls[1][0])).toContain('/api/v1/tasks/bug-1/triage');
+    expect(JSON.parse(String((fetchMock.mock.calls[1][1] as RequestInit).body))).toEqual({ severity: 's1', priority: 'urgent', assignee: 'alex' });
+    expect((fetchMock.mock.calls[1][1]?.headers as Headers).get('If-Match')).toBe('"v2"');
+    expect(String(fetchMock.mock.calls[2][0])).toContain('/api/v1/tasks/bug-1/resolve');
+    expect(JSON.parse(String((fetchMock.mock.calls[2][1] as RequestInit).body))).toEqual({ resolution: 'fixed', note: 'Patched in release' });
+    expect(String(fetchMock.mock.calls[3][0])).toContain('/api/v1/tasks/bug-1/reopen');
+  });
+
+  it('supports the global issue collection route', async () => {
+    const fetchMock = vi.spyOn(globalThis, 'fetch').mockResolvedValue(response({ data: [], next_cursor: null }));
+    await api.listIssues({ project: 'project-1', severity: 'untriaged', resolution: 'unresolved', limit: 25 });
+    expect(String(fetchMock.mock.calls[0][0])).toContain('/api/v1/issues?');
+    expect(String(fetchMock.mock.calls[0][0])).toContain('project=project-1');
+    expect(String(fetchMock.mock.calls[0][0])).toContain('severity=untriaged');
+    expect(String(fetchMock.mock.calls[0][0])).toContain('resolution=unresolved');
+  });
+
   it('collects every project page before rendering the project switcher', async () => {
     const fetchMock = vi.spyOn(globalThis, 'fetch')
       .mockResolvedValueOnce(response({ data: [{ id: 'one' }], next_cursor: 'cursor-2' }))

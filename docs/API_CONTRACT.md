@@ -95,6 +95,7 @@ defaults to `#94a3b8` when omitted or null.
 ## Tasks, comments, and claims
 
 - `GET|POST /api/v1/projects/{project}/tasks`
+- `GET /api/v1/issues`
 - `GET|PATCH|DELETE /api/v1/tasks/{task}`
 - `GET|POST /api/v1/tasks/{task}/comments`
 - `POST /api/v1/tasks/{task}/claim`
@@ -102,13 +103,17 @@ defaults to `#94a3b8` when omitted or null.
 - `POST /api/v1/tasks/{task}/release`
 - `POST /api/v1/tasks/{task}/complete`
 - `POST /api/v1/tasks/{task}/block`
+- `POST /api/v1/tasks/{task}/triage`
+- `POST /api/v1/tasks/{task}/resolve`
+- `POST /api/v1/tasks/{task}/reopen`
 
 Task references accept an opaque task ID or a project-local key such as
 `OPS-42`; key matching is case-insensitive. A task contains `id`, `number`,
-`key`, `project_id`, non-null `column_id`, `title`, Markdown `description`,
-`priority`, `position`, `version`, timestamps, `labels`, and
-`comment_count`. The assignee, current claimant, claim expiry, due date, and
-completion timestamp are omitted when unset.
+`key`, `project_id`, `kind`, non-null `column_id`, `title`, Markdown
+`description`, `priority`, `position`, `version`, timestamps, `labels`, and
+`comment_count`. `kind` is `task` or `bug`; bug tasks also contain the optional
+nested `bug` details described below. The assignee, current claimant, claim
+expiry, due date, and completion timestamp are omitted when unset.
 
 Task PATCH requires at least one recognized field. `{}` and unknown-only bodies
 return `400`. `column_id`/`column`, `position`, and other non-null fields
@@ -122,7 +127,8 @@ Successful task mutations return the full Task for humans and bearer tokens
 with `tasks:read`. Bearer tokens without `tasks:read` receive exactly
 `{ "id": "...", "version": N }`, with the strong ETag still set to `"vN"`.
 This reduced form applies to task creation, PATCH, claim, renew, release,
-complete, and block, and idempotent retries replay the already-reduced body.
+complete, block, triage, resolve, and reopen, and idempotent retries replay the
+already-reduced body.
 Direct task GET and task collections still require `tasks:read`.
 
 PATCH, DELETE, and task action requests require an exact quoted `If-Match: "vN"`
@@ -151,6 +157,64 @@ Comments return `id`, `task_id`, `actor_id`, `body`, `created_at`, and
 when both are non-empty, `body` wins, otherwise a non-empty `text` is used.
 Both empty returns `400`.
 
+### Built-in bug tracker (internal MVP)
+
+Bug tracking uses the existing task resource. Create a bug by sending
+`kind: "bug"` and a nested `bug` object; `bug.actual_behavior` is required on
+creation. A normal task may send `kind: "task"` and omit `bug`; omitting kind
+preserves the legacy default of `task`. The nested bug
+details may contain `reporter_id`, nullable `severity` (`s1` through `s4`),
+`actual_behavior`, `expected_behavior`, `reproduction_steps`, `environment`,
+`affected_version`, and lifecycle fields `resolution`, `resolved_by`,
+`resolved_at`, and `duplicate_of`. Unset optional fields are omitted. PATCH
+merges the supplied nested bug fields, so omitted fields are unchanged.
+`reporter_id` is populated from the authenticated creator; resolution fields
+are controlled by the lifecycle actions rather than arbitrary client input.
+
+The bug lifecycle is intentionally small:
+
+- A newly-created bug is open and may be untriaged. `POST .../triage` requires
+  `severity` and may also change `priority`, `assignee`/`assignee_id`, or
+  `column`/`column_id`.
+- `POST .../resolve` requires `resolution`. The allowed values are `fixed`,
+  `duplicate`, `not_planned`, `cannot_reproduce`, and `works_as_designed`.
+  `duplicate_of` is required only for `duplicate` resolutions. Resolution
+  records the actor and timestamp in `resolved_by` and `resolved_at`.
+- `POST .../reopen` requires a non-empty `reason` and clears the resolution,
+  resolved actor/timestamp, and duplicate reference. The reason is retained
+  as a task comment and in the associated event history.
+
+Severity describes the impact of a defect (`s1` is highest impact and `s4` is
+lowest). Priority remains the scheduling signal for all work items. They are
+independent: triage never changes priority unless the request supplies one,
+and a high-priority task can still have a low-severity bug.
+
+All three bug actions require the exact quoted `If-Match` task ETag and accept
+`Idempotency-Key`. They return the same full-or-reduced task mutation response
+as other task mutations and obey the `tasks:write` scope, task-read response
+rules, claim checks, stale-version `409`, and idempotent replay rules. Every
+accepted action records
+the actor and appends its bug lifecycle event atomically with the task update;
+clients can poll those events through `/api/v1/events?after=...`.
+
+This is an internal-only MVP. It does not provide public issue intake, external
+issue-tracker synchronization, email/Slack notifications, attachments,
+service-level agreements, or a separate bug-permission model. Bugs remain
+project tasks and use the existing board columns, claims, labels, comments,
+scopes, and audit/event feed.
+
+`GET /api/v1/issues` is the agent-friendly global bug listing. It requires
+`tasks:read`, returns only `kind: "bug"` tasks, and respects the caller's
+project ceiling. Unscoped identities may omit `project` to search all visible
+projects; project-scoped bearer tokens may also omit `project` to search the
+union of their permitted projects. An optional `project` ID, key, or slug
+narrows the result to one permitted project. Optional filters are `project`,
+`state`, `column`, `priority`, `severity`, `label`, `assignee`, `reporter`,
+`resolution`, `q`,
+`updated_after`, `cursor`, and `limit`. Use `severity=untriaged` and
+`resolution=unresolved` to find bugs whose corresponding lifecycle field is
+unset. Pagination and validation follow the existing collection contract.
+
 ## Pagination and filters
 
 Collection routes default to 50 records and cap `limit` at 200. Non-positive,
@@ -163,8 +227,10 @@ string, not JSON null. Boolean filters (`archived`, `favorite`, and agent
 `kind=agent` only and disabled agents are excluded by default; pass
 `disabled=true` to include them.
 
-Task listings support `state`, `column`, `priority`, `label`, `assignee`,
-`q`, `updated_after`, `cursor`, and `limit`. Column names and label names are
+Task listings support `state`, `column`, `kind`, `priority`, `severity`,
+`label`, `assignee`, `reporter`, `resolution`, `q`, `updated_after`, `cursor`,
+and `limit`. `kind` filters `task` or `bug`; `severity`, `reporter`, and
+`resolution` apply to bug details. Column names and label names are
 matched case-insensitively. Enum values must use the documented lowercase
 spelling; mixed-case values are rejected. Enum, identifier, and timestamp
 filters reject empty, malformed, repeated, or out-of-range values with `400`;
@@ -245,4 +311,9 @@ budget; exhaustion returns `507`. Body-buffer saturation may return `503` with
 `Retry-After`.
 
 All accepted mutations record their actor and append an event in the same
-database transaction.
+database transaction. Bug lifecycle actions append `bug.triaged`,
+`bug.resolved` (or `bug.duplicated` for duplicate resolution), and
+`bug.reopened` events with lifecycle/version metadata; resolution events carry
+the selected resolution, while a reopen reason is retained in the atomic
+`comment.created` event and task comment. They are available through the same
+`/api/v1/events` cursor and require `events:read` for bearer tokens.

@@ -546,6 +546,8 @@ func (s *Server) dispatchAuthed(w http.ResponseWriter, r *http.Request, identity
 			s.roadmap(w, r, identity, "", false)
 		case "my-work":
 			s.myWork(w, r, identity)
+		case "issues":
+			s.issues(w, r, identity)
 		case "agents":
 			s.agents(w, r, identity)
 		default:
@@ -597,6 +599,8 @@ func (s *Server) dispatchAuthed(w http.ResponseWriter, r *http.Request, identity
 				s.taskAction(w, r, identity, parts[1], "complete")
 			case "block":
 				s.taskAction(w, r, identity, parts[1], "block")
+			case "triage", "resolve", "reopen":
+				s.issueAction(w, r, identity, parts[1], parts[2])
 			default:
 				s.writeError(w, http.StatusNotFound, "not_found", "route not found", nil)
 			}
@@ -1358,6 +1362,26 @@ var semanticStates = map[string]struct{}{
 
 var taskPriorities = map[string]struct{}{
 	"low": {}, "normal": {}, "high": {}, "urgent": {},
+}
+
+var taskKinds = map[string]struct{}{
+	"task": {}, "bug": {},
+}
+
+var bugSeverities = map[string]struct{}{
+	"s1": {}, "s2": {}, "s3": {}, "s4": {},
+}
+
+var bugSeverityFilters = map[string]struct{}{
+	"s1": {}, "s2": {}, "s3": {}, "s4": {}, "untriaged": {},
+}
+
+var bugResolutions = map[string]struct{}{
+	"fixed": {}, "duplicate": {}, "not_planned": {}, "cannot_reproduce": {}, "works_as_designed": {},
+}
+
+var bugResolutionFilters = map[string]struct{}{
+	"fixed": {}, "duplicate": {}, "not_planned": {}, "cannot_reproduce": {}, "works_as_designed": {}, "unresolved": {},
 }
 
 func parseOptionalIdentifier(r *http.Request, name string) (string, error) {

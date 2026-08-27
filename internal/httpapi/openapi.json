@@ -4,7 +4,7 @@
   "info": {
     "title": "Roadmap API",
     "version": "1.0.0",
-    "description": "Stable JSON API for the Roadmap project board. Humans use a session\ncookie or Cloudflare Access identity; agents use scoped bearer tokens.\nSingle-resource responses contain the resource directly. Collections use\na cursor-paginated object containing data and next_cursor. Collection\ncursors are opaque URL-safe offsets and an empty next_cursor means that\nthere is no next page. Every response includes X-Request-ID; deployments\nthat provide a release revision also include X-Roadmap-Revision.\nCookie- and Cloudflare-authenticated mutations require an Origin that\nexactly matches the configured public origin; bearer-token mutations do\nnot require Origin. Temporary bearer-authentication or request-body\nadmission saturation returns 503 with Retry-After.\n",
+    "description": "Stable JSON API for the Roadmap project board and its built-in internal bug\ntracker. Humans use a session cookie or Cloudflare Access identity; agents\nuse scoped bearer tokens.\nSingle-resource responses contain the resource directly. Collections use\na cursor-paginated object containing data and next_cursor. Collection\ncursors are opaque URL-safe offsets and an empty next_cursor means that\nthere is no next page. Every response includes X-Request-ID; deployments\nthat provide a release revision also include X-Roadmap-Revision.\nCookie- and Cloudflare-authenticated mutations require an Origin that\nexactly matches the configured public origin; bearer-token mutations do\nnot require Origin. Temporary bearer-authentication or request-body\nadmission saturation returns 503 with Retry-After.\n",
     "license": {
       "name": "MIT",
       "identifier": "MIT"
@@ -71,7 +71,7 @@
     },
     {
       "name": "Tasks",
-      "description": "Tasks, comments, labels, and task coordination actions"
+      "description": "Tasks, internal bugs, comments, labels, and coordination actions"
     },
     {
       "name": "Labels",
@@ -1348,7 +1348,7 @@
       "get": {
         "operationId": "listProjectTasks",
         "summary": "List tasks in a project",
-        "description": "Results are ordered by column position and task position. `state`,\n`column`, `priority`, `label`, `assignee`, `q`, and `updated_after`\ncan be combined. `state` filters by a column's semantic state. Supplied\nscalar filters are single-valued; empty identifier/enum/timestamp values\nand values outside their declared enum, format, or length are rejected\nwith `400`.\n",
+        "description": "Results are ordered by column position and task position. `state`,\n`column`, `kind`, `priority`, `severity`, `label`, `assignee`,\n`reporter`, `resolution`, `q`, and `updated_after` can be combined.\n`state` filters by a column's semantic state. Supplied scalar filters\nare single-valued; empty identifier/enum/timestamp values and values\noutside their declared enum, format, or length are rejected with\n`400`.\n",
         "tags": [
           "Tasks"
         ],
@@ -1360,13 +1360,25 @@
             "$ref": "#/components/parameters/ColumnFilter"
           },
           {
+            "$ref": "#/components/parameters/TaskKindFilter"
+          },
+          {
             "$ref": "#/components/parameters/PriorityFilter"
+          },
+          {
+            "$ref": "#/components/parameters/SeverityFilter"
           },
           {
             "$ref": "#/components/parameters/LabelFilter"
           },
           {
             "$ref": "#/components/parameters/AssigneeFilter"
+          },
+          {
+            "$ref": "#/components/parameters/ReporterFilter"
+          },
+          {
+            "$ref": "#/components/parameters/ResolutionFilter"
           },
           {
             "$ref": "#/components/parameters/SearchQuery"
@@ -1448,6 +1460,7 @@
               },
               "example": {
                 "title": "Add event polling",
+                "kind": "task",
                 "description": "Implement incremental event polling for agents.",
                 "priority": "high",
                 "column_id": "col_ready",
@@ -1523,6 +1536,110 @@
         }
       }
     },
+    "/api/v1/issues": {
+      "get": {
+        "operationId": "listIssues",
+        "summary": "List internal bugs across projects",
+        "description": "Agent-friendly global listing of bug tasks. Results are ordered by\nproject, column position, and task position and always have\n`kind: bug`. An unscoped identity may search every project; a\nproject-scoped bearer token searches the union of its permitted\nprojects when `project` is omitted and can never receive issues\noutside that project ceiling. An optional `project` narrows the\nresult to one permitted project. Requires `tasks:read`.\n`severity=untriaged` and `resolution=unresolved` select bugs whose\ncorresponding lifecycle field is unset.\n",
+        "tags": [
+          "Tasks"
+        ],
+        "parameters": [
+          {
+            "name": "project",
+            "in": "query",
+            "required": false,
+            "description": "Restrict issues to a permitted project ID, key, or stable slug; omitted project-scoped tokens search their permitted project ceiling.",
+            "schema": {
+              "$ref": "#/components/schemas/Identifier"
+            },
+            "example": "operations"
+          },
+          {
+            "$ref": "#/components/parameters/TaskState"
+          },
+          {
+            "$ref": "#/components/parameters/ColumnFilter"
+          },
+          {
+            "$ref": "#/components/parameters/PriorityFilter"
+          },
+          {
+            "$ref": "#/components/parameters/IssueSeverityFilter"
+          },
+          {
+            "$ref": "#/components/parameters/LabelFilter"
+          },
+          {
+            "$ref": "#/components/parameters/AssigneeFilter"
+          },
+          {
+            "$ref": "#/components/parameters/ReporterFilter"
+          },
+          {
+            "$ref": "#/components/parameters/IssueResolutionFilter"
+          },
+          {
+            "$ref": "#/components/parameters/SearchQuery"
+          },
+          {
+            "$ref": "#/components/parameters/UpdatedAfter"
+          },
+          {
+            "$ref": "#/components/parameters/Cursor"
+          },
+          {
+            "$ref": "#/components/parameters/Limit"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Cursor-paginated bug tasks",
+            "headers": {
+              "X-Request-ID": {
+                "$ref": "#/components/headers/XRequestID"
+              },
+              "X-Roadmap-Revision": {
+                "$ref": "#/components/headers/XRoadmapRevision"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TaskCollection"
+                },
+                "examples": {
+                  "issues": {
+                    "$ref": "#/components/examples/IssueCollectionExample"
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalServerError"
+          },
+          "503": {
+            "$ref": "#/components/responses/ServiceUnavailable"
+          }
+        }
+      }
+    },
     "/api/v1/tasks/{task}": {
       "parameters": [
         {
@@ -1585,7 +1702,7 @@
       "patch": {
         "operationId": "updateTask",
         "summary": "Update a task",
-        "description": "Update one or more editable fields. Movement is represented by column_id\nand position. An empty object or a body with no recognized task field\nreturns 400. Sending null for description, assignee (or assignee_id),\ndue_at, labels, or label_ids clears that nullable value; column_id,\ncolumn, position, title, and priority are non-null fields. A human\nadministrator may explicitly override an active claim for this\noperation; bearer tokens and ordinary human actors cannot.\n",
+        "description": "Update one or more editable fields. Movement is represented by column_id\nand position. `kind` and nested `bug` details extend the task model;\nwhen changing a task to a bug, supply the bug details required by the\nbug lifecycle. An empty object or a body with no recognized task field\nreturns 400. Sending null for description, assignee (or assignee_id),\ndue_at, labels, or label_ids clears that nullable value; column_id,\ncolumn, position, title, priority, and kind are non-null fields. A\nhuman administrator may explicitly override an active claim for this\noperation; bearer tokens and ordinary human actors cannot.\n",
         "tags": [
           "Tasks"
         ],
@@ -1983,6 +2100,7 @@
                         "key": "OPS-42",
                         "project_id": "proj_ops",
                         "column_id": "col_active",
+                        "kind": "task",
                         "title": "Add event polling",
                         "description": "Implement incremental event polling for agents.",
                         "priority": "high",
@@ -2357,6 +2475,295 @@
           },
           "409": {
             "$ref": "#/components/responses/StaleTask"
+          },
+          "413": {
+            "$ref": "#/components/responses/RequestTooLarge"
+          },
+          "428": {
+            "$ref": "#/components/responses/PreconditionRequired"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalServerError"
+          },
+          "503": {
+            "$ref": "#/components/responses/ServiceUnavailable"
+          },
+          "507": {
+            "$ref": "#/components/responses/InsufficientStorage"
+          }
+        }
+      }
+    },
+    "/api/v1/tasks/{task}/triage": {
+      "parameters": [
+        {
+          "$ref": "#/components/parameters/TaskPath"
+        }
+      ],
+      "post": {
+        "operationId": "triageTask",
+        "summary": "Triage a bug",
+        "description": "Set the bug severity and optionally update its priority, assignee, or\ncolumn in one optimistic-concurrency mutation. This action applies to\nbug tasks; ordinary tasks return `400`. Severity is independent of\ntask priority and is required even when the bug already has one.\nBearer callers need the `tasks:write` scope.\n",
+        "tags": [
+          "Tasks"
+        ],
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/IfMatch"
+          },
+          {
+            "$ref": "#/components/parameters/IdempotencyKey"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/TriageRequest"
+              },
+              "example": {
+                "severity": "s2",
+                "priority": "high",
+                "assignee_id": "agent_ada",
+                "column_id": "col_ready"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Bug triaged; humans and bearer tokens with tasks:read receive the full task, while write-only bearer tokens receive only id/version metadata.",
+            "headers": {
+              "X-Request-ID": {
+                "$ref": "#/components/headers/XRequestID"
+              },
+              "X-Roadmap-Revision": {
+                "$ref": "#/components/headers/XRoadmapRevision"
+              },
+              "ETag": {
+                "$ref": "#/components/headers/ETag"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TaskMutationResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "#/components/responses/TaskMutationConflict"
+          },
+          "413": {
+            "$ref": "#/components/responses/RequestTooLarge"
+          },
+          "428": {
+            "$ref": "#/components/responses/PreconditionRequired"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalServerError"
+          },
+          "503": {
+            "$ref": "#/components/responses/ServiceUnavailable"
+          },
+          "507": {
+            "$ref": "#/components/responses/InsufficientStorage"
+          }
+        }
+      }
+    },
+    "/api/v1/tasks/{task}/resolve": {
+      "parameters": [
+        {
+          "$ref": "#/components/parameters/TaskPath"
+        }
+      ],
+      "post": {
+        "operationId": "resolveTask",
+        "summary": "Resolve a bug",
+        "description": "Resolve a bug with one of the documented resolutions. `duplicate_of`\nis required when `resolution` is `duplicate` and must identify another\ntask in the same project. This action applies to bug tasks; ordinary\ntasks return `400`. Bearer callers need the `tasks:write` scope.\n",
+        "tags": [
+          "Tasks"
+        ],
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/IfMatch"
+          },
+          {
+            "$ref": "#/components/parameters/IdempotencyKey"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ResolveRequest"
+              },
+              "examples": {
+                "fixed": {
+                  "value": {
+                    "resolution": "fixed"
+                  }
+                },
+                "duplicate": {
+                  "value": {
+                    "resolution": "duplicate",
+                    "duplicate_of": "task_17"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Bug resolved; humans and bearer tokens with tasks:read receive the full task, while write-only bearer tokens receive only id/version metadata.",
+            "headers": {
+              "X-Request-ID": {
+                "$ref": "#/components/headers/XRequestID"
+              },
+              "X-Roadmap-Revision": {
+                "$ref": "#/components/headers/XRoadmapRevision"
+              },
+              "ETag": {
+                "$ref": "#/components/headers/ETag"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TaskMutationResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "#/components/responses/TaskMutationConflict"
+          },
+          "413": {
+            "$ref": "#/components/responses/RequestTooLarge"
+          },
+          "428": {
+            "$ref": "#/components/responses/PreconditionRequired"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalServerError"
+          },
+          "503": {
+            "$ref": "#/components/responses/ServiceUnavailable"
+          },
+          "507": {
+            "$ref": "#/components/responses/InsufficientStorage"
+          }
+        }
+      }
+    },
+    "/api/v1/tasks/{task}/reopen": {
+      "parameters": [
+        {
+          "$ref": "#/components/parameters/TaskPath"
+        }
+      ],
+      "post": {
+        "operationId": "reopenTask",
+        "summary": "Reopen a bug",
+        "description": "Reopen a previously resolved bug and record the reason. Reopening\nclears its resolution, resolved-by, resolved-at, and duplicate-of\ndetails. This action applies to bug tasks; ordinary tasks return `400`.\nBearer callers need the `tasks:write` scope.\n",
+        "tags": [
+          "Tasks"
+        ],
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/IfMatch"
+          },
+          {
+            "$ref": "#/components/parameters/IdempotencyKey"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ReopenRequest"
+              },
+              "example": {
+                "reason": "The regression is reproducible on the current release."
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Bug reopened; humans and bearer tokens with tasks:read receive the full task, while write-only bearer tokens receive only id/version metadata.",
+            "headers": {
+              "X-Request-ID": {
+                "$ref": "#/components/headers/XRequestID"
+              },
+              "X-Roadmap-Revision": {
+                "$ref": "#/components/headers/XRoadmapRevision"
+              },
+              "ETag": {
+                "$ref": "#/components/headers/ETag"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TaskMutationResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "#/components/responses/TaskMutationConflict"
           },
           "413": {
             "$ref": "#/components/responses/RequestTooLarge"
@@ -2813,7 +3220,7 @@
       "get": {
         "operationId": "listEvents",
         "summary": "Poll the append-only event feed",
-        "description": "Supply `after` with the last integer cursor seen to receive subsequent\nproject, task, claim, comment, and completion events.\n",
+        "description": "Supply `after` with the last integer cursor seen to receive subsequent\nproject, task, claim, comment, completion, and bug lifecycle events.\nBug lifecycle events (`bug.created`, `bug.updated`, `bug.triaged`,\n`bug.resolved`, `bug.duplicated`, and `bug.reopened`) carry lifecycle\nand version metadata and are emitted in the same transaction as the\naction. Resolution events include the selected resolution; a reopen\nreason is recorded in the atomic comment.created event associated with\nthe action.\n",
         "tags": [
           "Events"
         ],
@@ -3436,6 +3843,16 @@
         },
         "example": "col_ready"
       },
+      "TaskKindFilter": {
+        "name": "kind",
+        "in": "query",
+        "required": false,
+        "description": "Filter by task kind.",
+        "schema": {
+          "$ref": "#/components/schemas/TaskKind"
+        },
+        "example": "bug"
+      },
       "PriorityFilter": {
         "name": "priority",
         "in": "query",
@@ -3445,6 +3862,16 @@
           "$ref": "#/components/schemas/Priority"
         },
         "example": "high"
+      },
+      "SeverityFilter": {
+        "name": "severity",
+        "in": "query",
+        "required": false,
+        "description": "Filter by bug severity. Tasks without bug details do not match.",
+        "schema": {
+          "$ref": "#/components/schemas/BugSeverity"
+        },
+        "example": "s1"
       },
       "LabelFilter": {
         "name": "label",
@@ -3466,6 +3893,62 @@
           "minLength": 1
         },
         "example": "agent_ada"
+      },
+      "ReporterFilter": {
+        "name": "reporter",
+        "in": "query",
+        "required": false,
+        "description": "Filter bug tasks by reporter actor ID.",
+        "schema": {
+          "$ref": "#/components/schemas/Identifier"
+        },
+        "example": "human_ada"
+      },
+      "ResolutionFilter": {
+        "name": "resolution",
+        "in": "query",
+        "required": false,
+        "description": "Filter bug tasks by resolution; unresolved bugs have no resolution.",
+        "schema": {
+          "$ref": "#/components/schemas/BugResolution"
+        },
+        "example": "fixed"
+      },
+      "IssueSeverityFilter": {
+        "name": "severity",
+        "in": "query",
+        "required": false,
+        "description": "Filter bug severity; use `untriaged` for bugs without a severity.",
+        "schema": {
+          "oneOf": [
+            {
+              "$ref": "#/components/schemas/BugSeverity"
+            },
+            {
+              "type": "string",
+              "const": "untriaged"
+            }
+          ]
+        },
+        "example": "s1"
+      },
+      "IssueResolutionFilter": {
+        "name": "resolution",
+        "in": "query",
+        "required": false,
+        "description": "Filter bug resolution; use `unresolved` for bugs without a resolution.",
+        "schema": {
+          "oneOf": [
+            {
+              "$ref": "#/components/schemas/BugResolution"
+            },
+            {
+              "type": "string",
+              "const": "unresolved"
+            }
+          ]
+        },
+        "example": "unresolved"
       },
       "SearchQuery": {
         "name": "q",
@@ -3918,6 +4401,35 @@
           "high",
           "urgent"
         ]
+      },
+      "TaskKind": {
+        "type": "string",
+        "enum": [
+          "task",
+          "bug"
+        ],
+        "description": "Work item kind. Bug-specific fields are present only for `bug`."
+      },
+      "BugSeverity": {
+        "type": "string",
+        "enum": [
+          "s1",
+          "s2",
+          "s3",
+          "s4"
+        ],
+        "description": "Impact severity for a bug, from s1 (highest) to s4 (lowest)."
+      },
+      "BugResolution": {
+        "type": "string",
+        "enum": [
+          "fixed",
+          "duplicate",
+          "not_planned",
+          "cannot_reproduce",
+          "works_as_designed"
+        ],
+        "description": "Resolution recorded when a bug is resolved."
       },
       "Color": {
         "type": "string",
@@ -4445,6 +4957,7 @@
           "number",
           "key",
           "project_id",
+          "kind",
           "column_id",
           "title",
           "description",
@@ -4474,6 +4987,9 @@
           "project_id": {
             "$ref": "#/components/schemas/Identifier"
           },
+          "kind": {
+            "$ref": "#/components/schemas/TaskKind"
+          },
           "column_id": {
             "$ref": "#/components/schemas/Identifier"
           },
@@ -4486,6 +5002,10 @@
             "type": "string",
             "description": "Markdown task description.",
             "maxLength": 100000
+          },
+          "bug": {
+            "$ref": "#/components/schemas/BugDetails",
+            "description": "Bug-specific details; omitted for ordinary tasks."
           },
           "priority": {
             "$ref": "#/components/schemas/Priority"
@@ -4541,6 +5061,215 @@
         },
         "additionalProperties": false
       },
+      "BugDetails": {
+        "type": "object",
+        "required": [
+          "reporter_id",
+          "actual_behavior"
+        ],
+        "description": "Details for a bug task. `actual_behavior` is required when a bug is\ncreated; the remaining fields are filled during triage and resolution.\nUnset fields are omitted. `severity` is nullable so a bug may be\nexplicitly returned to an untriaged state.\n",
+        "properties": {
+          "reporter_id": {
+            "$ref": "#/components/schemas/Identifier",
+            "description": "Actor who reported the bug; set from the authenticated actor on creation."
+          },
+          "severity": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "enum": [
+              "s1",
+              "s2",
+              "s3",
+              "s4",
+              null
+            ],
+            "description": "Impact severity, from s1 (highest) to s4 (lowest), or null when untriaged."
+          },
+          "actual_behavior": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 100000,
+            "description": "What the system actually did."
+          },
+          "expected_behavior": {
+            "type": "string",
+            "maxLength": 100000,
+            "description": "What the system should have done."
+          },
+          "reproduction_steps": {
+            "type": "string",
+            "maxLength": 100000,
+            "description": "Steps or inputs needed to reproduce the bug."
+          },
+          "environment": {
+            "type": "string",
+            "maxLength": 10000,
+            "description": "Runtime, platform, or deployment context."
+          },
+          "affected_version": {
+            "type": "string",
+            "maxLength": 200,
+            "description": "Application version known to be affected."
+          },
+          "resolution": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/BugResolution"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Resolution; omitted for an open bug and null when explicitly cleared."
+          },
+          "resolved_by": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/Identifier"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Actor who resolved the bug; omitted until resolution."
+          },
+          "resolved_at": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/Timestamp"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Resolution timestamp; omitted until resolution."
+          },
+          "duplicate_of": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/Identifier"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Task ID of the canonical bug when resolution is duplicate."
+          }
+        },
+        "additionalProperties": false
+      },
+      "BugCreateDetails": {
+        "type": "object",
+        "required": [
+          "actual_behavior"
+        ],
+        "description": "Bug report fields accepted when creating a bug; reporter and lifecycle fields are server-managed.",
+        "properties": {
+          "severity": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "enum": [
+              "s1",
+              "s2",
+              "s3",
+              "s4",
+              null
+            ]
+          },
+          "actual_behavior": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 100000
+          },
+          "expected_behavior": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "maxLength": 100000
+          },
+          "reproduction_steps": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "maxLength": 100000
+          },
+          "environment": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "maxLength": 10000
+          },
+          "affected_version": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "maxLength": 200
+          }
+        },
+        "additionalProperties": false
+      },
+      "BugPatchDetails": {
+        "type": "object",
+        "description": "Partial bug report details merged by task PATCH; reporter and lifecycle fields are server-managed.",
+        "properties": {
+          "severity": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "enum": [
+              "s1",
+              "s2",
+              "s3",
+              "s4",
+              null
+            ],
+            "description": "Impact severity, or null to mark the bug untriaged."
+          },
+          "actual_behavior": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 100000
+          },
+          "expected_behavior": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "maxLength": 100000
+          },
+          "reproduction_steps": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "maxLength": 100000
+          },
+          "environment": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "maxLength": 10000
+          },
+          "affected_version": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "maxLength": 200
+          }
+        },
+        "additionalProperties": false
+      },
       "TaskMutationSummary": {
         "type": "object",
         "description": "Reduced task mutation response for bearer tokens without tasks:read.",
@@ -4576,11 +5305,60 @@
         "required": [
           "title"
         ],
+        "description": "Create an ordinary task with `kind: task`, or an internal bug with\n`kind: bug` and nested `bug` details. When kind is omitted it defaults\nto `task` for compatibility. Bug creation requires\n`bug.actual_behavior`; other bug fields may be added during triage and\nresolution. The nested object is omitted for ordinary tasks.\n",
+        "oneOf": [
+          {
+            "properties": {
+              "kind": {
+                "const": "task"
+              }
+            },
+            "required": [
+              "kind"
+            ],
+            "not": {
+              "required": [
+                "bug"
+              ]
+            }
+          },
+          {
+            "properties": {
+              "kind": {
+                "const": "bug"
+              }
+            },
+            "required": [
+              "kind",
+              "bug"
+            ]
+          },
+          {
+            "not": {
+              "anyOf": [
+                {
+                  "required": [
+                    "kind"
+                  ]
+                },
+                {
+                  "required": [
+                    "bug"
+                  ]
+                }
+              ]
+            }
+          }
+        ],
         "properties": {
           "title": {
             "type": "string",
             "minLength": 1,
             "maxLength": 500
+          },
+          "kind": {
+            "$ref": "#/components/schemas/TaskKind",
+            "default": "task"
           },
           "description": {
             "type": "string",
@@ -4643,6 +5421,10 @@
             "items": {
               "$ref": "#/components/schemas/Identifier"
             }
+          },
+          "bug": {
+            "$ref": "#/components/schemas/BugCreateDetails",
+            "description": "Required when kind is `bug`; omitted for kind `task`."
           }
         },
         "additionalProperties": false
@@ -4650,11 +5432,15 @@
       "TaskPatchRequest": {
         "type": "object",
         "minProperties": 1,
+        "description": "Patch ordinary task fields and, for bug tasks, merge fields in the\nnested `bug` object. Omitted nested fields remain unchanged. The\n`kind` field is optional because PATCH is partial.\n",
         "properties": {
           "title": {
             "type": "string",
             "minLength": 1,
             "maxLength": 500
+          },
+          "kind": {
+            "$ref": "#/components/schemas/TaskKind"
           },
           "description": {
             "type": [
@@ -4720,6 +5506,10 @@
             "items": {
               "$ref": "#/components/schemas/Identifier"
             }
+          },
+          "bug": {
+            "$ref": "#/components/schemas/BugPatchDetails",
+            "description": "Partial bug details; only valid for bug tasks."
           }
         },
         "additionalProperties": false
@@ -4762,6 +5552,119 @@
             "type": "string",
             "maxLength": 10000,
             "description": "Optional Markdown explanation for blocking the task."
+          }
+        },
+        "additionalProperties": false
+      },
+      "TriageRequest": {
+        "type": "object",
+        "required": [
+          "severity"
+        ],
+        "description": "Set bug severity and optionally update task routing fields.",
+        "properties": {
+          "severity": {
+            "$ref": "#/components/schemas/BugSeverity"
+          },
+          "priority": {
+            "$ref": "#/components/schemas/Priority"
+          },
+          "assignee_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "minLength": 1,
+            "description": "Assignee actor ID; null clears the assignee."
+          },
+          "assignee": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "minLength": 1,
+            "description": "Alias for assignee_id; null clears the assignee."
+          },
+          "column_id": {
+            "type": "string",
+            "minLength": 1,
+            "description": "Destination column."
+          },
+          "column": {
+            "type": "string",
+            "minLength": 1,
+            "description": "Alias for column_id."
+          }
+        },
+        "additionalProperties": false
+      },
+      "ResolveRequest": {
+        "type": "object",
+        "required": [
+          "resolution"
+        ],
+        "description": "Record a bug resolution. `duplicate_of` is required only when\n`resolution` is `duplicate`.\n",
+        "properties": {
+          "resolution": {
+            "$ref": "#/components/schemas/BugResolution"
+          },
+          "duplicate_of": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/Identifier"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Canonical task ID; required and non-null for duplicate resolution."
+          },
+          "note": {
+            "type": "string",
+            "maxLength": 10000,
+            "description": "Optional Markdown resolution note recorded as a task comment atomically with the resolution."
+          }
+        },
+        "oneOf": [
+          {
+            "properties": {
+              "resolution": {
+                "const": "duplicate"
+              },
+              "duplicate_of": {
+                "$ref": "#/components/schemas/Identifier"
+              }
+            },
+            "required": [
+              "duplicate_of"
+            ]
+          },
+          {
+            "properties": {
+              "resolution": {
+                "enum": [
+                  "fixed",
+                  "not_planned",
+                  "cannot_reproduce",
+                  "works_as_designed"
+                ]
+              }
+            }
+          }
+        ],
+        "additionalProperties": false
+      },
+      "ReopenRequest": {
+        "type": "object",
+        "required": [
+          "reason"
+        ],
+        "description": "Markdown reason for reopening a resolved bug.",
+        "properties": {
+          "reason": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 10000
           }
         },
         "additionalProperties": false
@@ -5118,7 +6021,7 @@
           "type": {
             "type": "string",
             "minLength": 1,
-            "description": "Event type, for example task.claimed or task.completed.",
+            "description": "Event type, for example task.claimed, task.completed, bug.triaged, bug.resolved, bug.duplicated, or bug.reopened.",
             "example": "task.claimed"
           },
           "actor_id": {
@@ -5753,6 +6656,7 @@
           "key": "OPS-42",
           "project_id": "proj_ops",
           "column_id": "col_ready",
+          "kind": "task",
           "title": "Add event polling",
           "description": "Implement incremental event polling for agents.",
           "priority": "high",
@@ -5775,6 +6679,35 @@
           "comment_count": 1
         }
       },
+      "BugExample": {
+        "summary": "Open internal bug",
+        "value": {
+          "id": "task_99",
+          "number": 99,
+          "key": "OPS-99",
+          "project_id": "proj_ops",
+          "kind": "bug",
+          "column_id": "col_ready",
+          "title": "Event cursor skips a record",
+          "description": "The polling client occasionally misses the first event after reconnecting.",
+          "priority": "high",
+          "position": 1,
+          "version": 3,
+          "created_at": "2026-08-27T09:45:00Z",
+          "updated_at": "2026-08-27T10:15:00Z",
+          "bug": {
+            "reporter_id": "human_ada",
+            "severity": "s2",
+            "actual_behavior": "The first event after reconnecting is not returned.",
+            "expected_behavior": "Every event after the supplied cursor is returned exactly once.",
+            "reproduction_steps": "Reconnect while events are being appended, then poll with the last cursor.",
+            "environment": "Roadmap 1.0 on Debian 12",
+            "affected_version": "1.0.0"
+          },
+          "labels": [],
+          "comment_count": 0
+        }
+      },
       "TaskClaimedExample": {
         "summary": "Claimed task",
         "value": {
@@ -5783,6 +6716,7 @@
           "key": "OPS-42",
           "project_id": "proj_ops",
           "column_id": "col_active",
+          "kind": "task",
           "title": "Add event polling",
           "description": "Implement incremental event polling for agents.",
           "priority": "high",
@@ -5831,6 +6765,7 @@
               "key": "OPS-42",
               "project_id": "proj_ops",
               "column_id": "col_ready",
+              "kind": "task",
               "title": "Add event polling",
               "description": "Implement incremental event polling for agents.",
               "priority": "high",
@@ -5851,6 +6786,7 @@
               "key": "OPS-42",
               "project_id": "proj_ops",
               "column_id": "col_ready",
+              "kind": "task",
               "title": "Add event polling",
               "description": "Implement incremental event polling for agents.",
               "priority": "high",
@@ -5971,6 +6907,7 @@
               "key": "OPS-42",
               "project_id": "proj_ops",
               "column_id": "col_ready",
+              "kind": "task",
               "title": "Add event polling",
               "description": "Implement incremental event polling for agents.",
               "priority": "high",
@@ -5982,6 +6919,40 @@
               "updated_at": "2026-08-27T10:00:00Z",
               "labels": [],
               "comment_count": 1
+            }
+          ],
+          "next_cursor": ""
+        }
+      },
+      "IssueCollectionExample": {
+        "summary": "Internal bug collection",
+        "value": {
+          "data": [
+            {
+              "id": "task_99",
+              "number": 99,
+              "key": "OPS-99",
+              "project_id": "proj_ops",
+              "kind": "bug",
+              "column_id": "col_ready",
+              "title": "Event cursor skips a record",
+              "description": "The polling client occasionally misses the first event after reconnecting.",
+              "priority": "high",
+              "position": 1,
+              "version": 3,
+              "created_at": "2026-08-27T09:45:00Z",
+              "updated_at": "2026-08-27T10:15:00Z",
+              "bug": {
+                "reporter_id": "human_ada",
+                "severity": "s2",
+                "actual_behavior": "The first event after reconnecting is not returned.",
+                "expected_behavior": "Every event after the supplied cursor is returned exactly once.",
+                "reproduction_steps": "Reconnect while events are being appended, then poll with the last cursor.",
+                "environment": "Roadmap 1.0 on Debian 12",
+                "affected_version": "1.0.0"
+              },
+              "labels": [],
+              "comment_count": 0
             }
           ],
           "next_cursor": ""
@@ -6099,6 +7070,7 @@
                 "key": "OPS-42",
                 "project_id": "proj_ops",
                 "column_id": "col_active",
+                "kind": "task",
                 "title": "Add event polling",
                 "description": "Implement incremental event polling for agents.",
                 "priority": "high",

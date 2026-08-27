@@ -23,6 +23,9 @@ The product should optimize for:
 - Humans authenticate with local accounts.
 - Agents authenticate with scoped bearer tokens.
 - Every state-changing request records the responsible actor.
+- The v1 task model includes an internal-only bug kind with a small triage and
+  resolution lifecycle; public issue intake and external tracker integrations
+  are deferred.
 - SQLite is the default and only supported v1 database.
 - The application deploys as one container with one persistent data volume.
 
@@ -86,10 +89,14 @@ A human or agent responsible for an action.
 - Internal immutable ID
 - Project-local number and display key, such as `OPS-42`
 - `project_id`
+- `kind`: `task` or `bug`
 - `column_id`
 - `title`
 - Markdown `description`
 - `priority`: `low`, `normal`, `high`, or `urgent`
+- Optional nested bug details: reporter, nullable severity (`s1`–`s4`), actual
+  and expected behavior, reproduction steps, environment, affected version,
+  resolution, resolver/timestamp, and duplicate reference
 - `claimed_by`
 - `claim_expires_at`
 - `due_at`
@@ -123,12 +130,16 @@ PATCH  /api/v1/columns/{column}
 
 GET    /api/v1/projects/{project}/tasks
 POST   /api/v1/projects/{project}/tasks
+GET    /api/v1/issues
 GET    /api/v1/tasks/{task}
 PATCH  /api/v1/tasks/{task}
 
 POST   /api/v1/tasks/{task}/claim
 POST   /api/v1/tasks/{task}/release
 POST   /api/v1/tasks/{task}/complete
+POST   /api/v1/tasks/{task}/triage
+POST   /api/v1/tasks/{task}/resolve
+POST   /api/v1/tasks/{task}/reopen
 POST   /api/v1/tasks/{task}/comments
 
 GET    /api/v1/events
@@ -144,15 +155,32 @@ GET    /api/v1/events
 - A stale update returns `409 Conflict` with the current task representation.
 - Collection endpoints use cursor pagination and bounded page sizes.
 - Errors use one consistent machine-readable envelope.
-- Project task listing supports state, column, priority, label, assignee, and
-  update-time filters.
+- Project task listing supports state, column, kind, priority, severity, label,
+  assignee, reporter, resolution, and update-time filters.
+- `GET /api/v1/issues` provides a global, `tasks:read`-scoped bug listing with
+  optional project, lifecycle, board, ownership, search, and pagination
+  filters; project-scoped tokens remain inside their project ceiling.
 - All identifiers and timestamps have stable, documented formats.
+
+### Internal bug lifecycle
+
+- Creating a bug requires `kind: bug` and `bug.actual_behavior`; ordinary tasks
+  use `kind: task` and omit bug details.
+- Triage requires severity and may optionally set priority, assignee, or
+  column. Severity describes impact; priority remains the scheduling signal.
+- Resolve requires a resolution; duplicate resolutions also require
+  `duplicate_of`. Reopen requires a reason and clears resolution metadata.
+- Triage, resolve, and reopen require `If-Match` and accept an
+  `Idempotency-Key`, return the scope-aware task mutation body, and honor the
+  same claim/concurrency checks as other task actions.
 
 ### Event feed
 
 Agents can incrementally poll `/api/v1/events?after=<cursor>` for project,
-task, claim, comment, and completion changes. Webhooks and streaming transports
-are deferred until there is a demonstrated need.
+task, claim, comment, completion, and bug lifecycle (`bug.created`,
+`bug.updated`, `bug.triaged`, `bug.resolved`, `bug.duplicated`, and
+`bug.reopened`) changes. Webhooks and streaming transports are deferred until
+there is a demonstrated need.
 
 ## 6. Human experience
 
@@ -177,6 +205,8 @@ are deferred until there is a demonstrated need.
 
 - Open in a side drawer so board context is preserved.
 - Edit title, description, priority, labels, due date, and assignment.
+- For bugs, show reporter and reproduction context, severity, and triage,
+  resolve, and reopen controls.
 - Show claim owner and expiration clearly.
 - Show comments and chronological activity together.
 - Identify every action as human- or agent-generated.
@@ -207,12 +237,15 @@ Deliverables:
 - Actor, project, column, task, label, and comment models.
 - Project-local task numbering.
 - Project, column, task, and comment CRUD endpoints.
+- Internal bug task kind with nested report context and lifecycle actions.
 - Consistent validation and error responses.
 - OpenAPI contract and API examples.
 
 Exit criteria:
 
 - A client can create a project, create a task, move it, comment, and list it.
+- A client can create, triage, resolve, reopen, and filter a bug without a
+  separate issue-tracker integration.
 - Data survives container restarts.
 - API contract tests cover success, validation, and not-found behavior.
 
@@ -222,6 +255,7 @@ Deliverables:
 
 - Agent creation and scoped token management.
 - Atomic claim, renew, release, complete, and block actions.
+- Optimistic, idempotent triage, resolve, and reopen actions for bugs.
 - Lease expiration behavior.
 - Optimistic concurrency.
 - Idempotent mutations.
@@ -291,6 +325,8 @@ it, and a human can observe the entire history in the UI.
 - Trello-compatible API behavior
 - Trello import
 - Attachments and object storage
+- Public bug/issue intake and external issue-tracker synchronization
+- Bug notifications, service-level agreements, and separate bug permissions
 - OAuth, SAML, and directory synchronization
 - Complex team roles and per-task permissions
 - Email and push notifications

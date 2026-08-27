@@ -1,9 +1,12 @@
 <script lang="ts">
   import { onMount, tick } from 'svelte';
-  import { API_PREFIX, api, listAllTasks, unwrapActor } from './lib/api';
+  import { API_PREFIX, api, listAllIssues, listAllTasks, unwrapActor } from './lib/api';
   import {
     actorId,
     actorName,
+    bugReporterId,
+    bugResolution,
+    bugSeverity,
     dateToIso,
     displayEvent,
     filterTasks,
@@ -27,6 +30,8 @@
     type Agent,
     type ApiToken,
     type AuthStatus,
+    type BugResolution,
+    type BugSeverity,
     type Column,
     type Comment,
     type Label,
@@ -36,16 +41,17 @@
     type Priority
   } from './lib/types';
 
-  type View = 'board' | 'my-work' | 'roadmap' | 'settings';
+  type View = 'board' | 'issues' | 'my-work' | 'roadmap' | 'settings';
   type AuthView = 'login' | 'setup';
   type ToastKind = 'success' | 'error' | 'info';
   type CommandChoice = {
-    kind: 'project' | 'view';
+    kind: 'project' | 'view' | 'issue';
     id: string;
     label: string;
     hint: string;
     project?: Project;
     view?: View;
+    task?: Task;
   };
 
   const priorityLabels: Record<Priority, string> = {
@@ -61,6 +67,20 @@
     blocked: 'Blocked',
     completed: 'Done'
   };
+  const severityLabels: Record<BugSeverity, string> = {
+    s1: 'S1 · Critical',
+    s2: 'S2 · High',
+    s3: 'S3 · Medium',
+    s4: 'S4 · Low'
+  };
+  const resolutionLabels: Record<BugResolution, string> = {
+    fixed: 'Fixed',
+    duplicate: 'Duplicate',
+    not_planned: 'Not planned',
+    cannot_reproduce: 'Cannot reproduce',
+    works_as_designed: 'Works as designed'
+  };
+  const resolutionOptions: BugResolution[] = ['fixed', 'duplicate', 'not_planned', 'cannot_reproduce', 'works_as_designed'];
   const labelPalette = ['#6d5efc', '#2ea879', '#d49534', '#dc626f', '#4b9cf5'];
   const scopeOptions = ['projects:read', 'projects:write', 'tasks:read', 'tasks:write', 'tasks:claim', 'events:read'];
 
@@ -91,7 +111,24 @@
   let labels: Label[] = [];
   let boardLoading = false;
   let boardError = '';
+  let issueTasks: Task[] = [];
+  let issueColumns: Column[] = [];
+  let issuesLoading = false;
+  let issuesError = '';
+  let issueRequest = 0;
   let filters: BoardFilters = { query: '', priority: 'all', label: 'all', assignee: 'all', state: 'all' };
+  let issueFilters: BoardFilters = {
+    query: '',
+    priority: 'all',
+    label: 'all',
+    assignee: 'all',
+    state: 'all',
+    kind: 'bug',
+    severity: 'all',
+    reporter: 'all',
+    resolution: 'all'
+  };
+  let issueProjectFilter = 'all';
   let projectSwitcherOpen = false;
   let projectSwitcherQuery = '';
   let commandOpen = false;
@@ -119,6 +156,16 @@
   let draftDueDate = '';
   let draftAssignee = '';
   let draftLabels = '';
+  let draftBugActual = '';
+  let draftBugExpected = '';
+  let draftBugReproduction = '';
+  let draftBugEnvironment = '';
+  let draftBugVersion = '';
+  let triageSeverityDraft: BugSeverity = 's3';
+  let resolutionDraft: BugResolution = 'fixed';
+  let duplicateOfDraft = '';
+  let resolutionNoteDraft = '';
+  let reopenReasonDraft = '';
 
   let draggingTaskId = '';
   let quickAddColumn = '';
@@ -168,6 +215,24 @@
   let taskModalDueDate = '';
   let taskModalAssignee = '';
 
+  let showBugModal = false;
+  let bugModalLoading = false;
+  let bugModalCreating = false;
+  let bugModalError = '';
+  let bugModalProjectId = '';
+  let bugModalColumnId = '';
+  let bugModalColumns: Column[] = [];
+  let bugModalTitle = '';
+  let bugModalDescription = '';
+  let bugModalActual = '';
+  let bugModalExpected = '';
+  let bugModalReproduction = '';
+  let bugModalEnvironment = '';
+  let bugModalVersion = '';
+  let bugModalLabels = '';
+  let bugModalSeverity: BugSeverity | '' = '';
+  let bugModalPriority: Priority = 'normal';
+
   let events: ActivityEvent[] = [];
   let eventsCursor: number | undefined;
   let pollTimer: number | undefined;
@@ -176,6 +241,20 @@
 
   $: activeProject = projects.find((project) => project.slug === activeProjectSlug);
   $: visibleTasks = filterTasks(tasks, columns, filters);
+  $: visibleIssues = filterTasks(
+    issueTasks.filter((task) => issueProjectFilter === 'all' || task.project_id === issueProjectFilter),
+    issueColumns,
+    issueFilters
+  );
+  $: issueReporterOptions = Array.from(new Set(issueTasks.map((task) => bugReporterId(task)).filter(Boolean))).sort();
+  $: issueMetrics = {
+    open: issueTasks.filter((task) => !task.bug?.resolution).length,
+    untriaged: issueTasks.filter((task) => !task.bug?.severity && !task.bug?.resolution).length,
+    severe: issueTasks.filter((task) => !task.bug?.resolution && (task.bug?.severity === 's1' || task.bug?.severity === 's2')).length,
+    recentlyResolved: issueTasks.filter((task) => task.bug?.resolved_at && Date.now() - Date.parse(task.bug.resolved_at) <= 7 * 24 * 60 * 60 * 1000).length,
+    reopened: new Set(events.filter((event) => event.type === 'bug.reopened' && event.task_id).map((event) => event.task_id)).size
+  };
+  $: if (view === 'issues') syncIssueViewURL(issueFilters, issueProjectFilter);
   $: sortedColumns = [...columns].sort((a, b) => a.position - b.position);
   // Keep the board's column buckets as a reactive value. Calling a helper
   // from the template does not give Svelte a dependency on visibleTasks, so
@@ -408,12 +487,15 @@
     boardRequest += 1;
     roadmapRequest += 1;
     taskModalColumnsRequest += 1;
+    issueRequest += 1;
     if (drawerTask) closeDrawer();
     activeProjectSlug = '';
     roadmapProjectId = undefined;
     projects = [];
     columns = [];
     tasks = [];
+    issueTasks = [];
+    issueColumns = [];
     events = [];
     if (pollTimer) window.clearInterval(pollTimer);
     pollTimer = undefined;
@@ -449,6 +531,11 @@
         roadmapProjectId = undefined;
         view = 'my-work';
         await loadMyWork();
+      } else if (/^\/issues\/?$/.test(path)) {
+        roadmapProjectId = undefined;
+        applyIssueRouteFilters(new URL(window.location.href).searchParams);
+        view = 'issues';
+        await loadIssues();
       } else if (path === '/roadmap') {
         roadmapProjectId = undefined;
         view = 'roadmap';
@@ -499,6 +586,28 @@
       }
     } finally {
       if (requestId === boardRequest) boardLoading = false;
+    }
+  }
+
+  /** Load bug-capable tasks from every accessible project for the Issues view. */
+  async function loadIssues() {
+    const requestId = ++issueRequest;
+    issuesLoading = true;
+    issuesError = '';
+    try {
+      const [taskResult, columnResults] = await Promise.all([
+        listAllIssues({ limit: 200 }),
+        Promise.all(projects.map(async (project) => api.listAllColumns(project.id)))
+      ]);
+      if (requestId !== issueRequest || view !== 'issues') return;
+      issueTasks = taskResult.data;
+      issueColumns = columnResults.flatMap((result) => result.data);
+    } catch (error) {
+      if (requestId === issueRequest && view === 'issues') {
+        issuesError = friendlyError(error, 'Issues could not be loaded.');
+      }
+    } finally {
+      if (requestId === issueRequest) issuesLoading = false;
     }
   }
 
@@ -596,6 +705,7 @@
       eventsCursor = Math.max(...result.data.map((event) => event.cursor));
       const projectChanged = result.data.some((event) => !event.project_id || event.project_id === activeProject?.id);
       if (projectChanged && view === 'board' && !drawerSaving) await loadBoard();
+      if (projectChanged && view === 'issues' && !drawerSaving) await loadIssues();
       if (projectChanged && view === 'roadmap') await loadRoadmap();
     } catch {
       // Polling is best effort; the visible board remains usable during a blip.
@@ -642,6 +752,10 @@
     if (next === 'my-work') {
       if (push) navigate('/my-work');
       await loadMyWork();
+    } else if (next === 'issues') {
+      if (push) navigate('/issues');
+      syncIssueViewURL(issueFilters, issueProjectFilter);
+      await loadIssues();
     } else if (next === 'roadmap') {
       roadmapProjectId = undefined;
       if (push) navigate('/roadmap');
@@ -669,6 +783,10 @@
       return;
     }
     if (window.location.pathname === '/my-work') void setView('my-work', false);
+    else if (/^\/issues\/?$/.test(window.location.pathname)) {
+      applyIssueRouteFilters(new URL(window.location.href).searchParams);
+      void setView('issues', false);
+    }
     else if (window.location.pathname === '/roadmap') void setView('roadmap', false);
     else if (window.location.pathname === '/settings') void setView('settings', false);
   }
@@ -710,6 +828,11 @@
     projectSwitcherOpen = false;
     commandQuery = '';
     commandIndex = 0;
+    if (!issueTasks.length) {
+      void listAllIssues({ limit: 200 }).then((result) => {
+        issueTasks = result.data;
+      }).catch(() => undefined);
+    }
     void tick().then(() => commandInput?.focus());
   }
 
@@ -723,6 +846,12 @@
     showTaskModal = false;
     taskModalLoading = false;
     taskModalColumnsRequest += 1;
+    restoreDialogFocus();
+  }
+
+  function closeBugModal() {
+    showBugModal = false;
+    bugModalLoading = false;
     restoreDialogFocus();
   }
 
@@ -740,6 +869,7 @@
       else if (projectSwitcherOpen) projectSwitcherOpen = false;
       else if (showProjectModal) closeProjectModal();
       else if (showTaskModal) closeTaskModal();
+      else if (showBugModal) closeBugModal();
       else if (revealedToken) closeTokenReveal();
       else if (drawerTask) closeDrawer();
     }
@@ -748,10 +878,12 @@
   function buildCommandChoices(query: string): CommandChoice[] {
     const normalized = query.trim().toLowerCase();
     const choices: CommandChoice[] = [
+      { kind: 'view', id: 'issues', view: 'issues', label: 'Issues', hint: 'Track and triage reported bugs' },
       { kind: 'view', id: 'my-work', view: 'my-work', label: 'My work', hint: 'Assigned and claimed tasks' },
       { kind: 'view', id: 'roadmap', view: 'roadmap', label: 'Roadmap overview', hint: 'Progress across every project' },
       { kind: 'view', id: 'settings', view: 'settings', label: 'Settings', hint: 'Agents, tokens, and appearance' },
-      ...projects.map((project) => ({ kind: 'project' as const, id: project.id, project, label: project.name, hint: project.key }))
+      ...projects.map((project) => ({ kind: 'project' as const, id: project.id, project, label: project.name, hint: project.key })),
+      ...issueTasks.map((task) => ({ kind: 'issue' as const, id: task.id, task, label: task.title, hint: `${task.key} · ${task.bug?.severity?.toUpperCase() || 'Untriaged'}` }))
     ];
     return normalized
       ? choices.filter((choice) => `${choice.label} ${choice.hint}`.toLowerCase().includes(normalized))
@@ -774,6 +906,11 @@
 
   async function selectCommand(choice: CommandChoice) {
     if (choice.kind === 'project' && choice.project) await selectProject(choice.project);
+    else if (choice.kind === 'issue' && choice.task) {
+      commandOpen = false;
+      await setView('issues');
+      await openWorkTask(issueTasks.find((task) => task.id === choice.task?.id) || choice.task);
+    }
     else if (choice.view) await setView(choice.view);
   }
 
@@ -889,6 +1026,102 @@
     }
   }
 
+  async function openBugModal() {
+    if (!projects.length) {
+      openProjectModal();
+      return;
+    }
+    bugModalProjectId = activeProject?.id || projects[0].id;
+    bugModalColumnId = '';
+    bugModalColumns = activeProject?.id === bugModalProjectId ? [...columns] : [];
+    bugModalTitle = '';
+    bugModalDescription = '';
+    bugModalActual = '';
+    bugModalExpected = '';
+    bugModalReproduction = '';
+    bugModalEnvironment = '';
+    bugModalVersion = '';
+    bugModalLabels = '';
+    bugModalSeverity = '';
+    bugModalPriority = 'normal';
+    bugModalError = '';
+    rememberDialogFocus('[data-report-bug-trigger]');
+    showBugModal = true;
+    projectSwitcherOpen = false;
+    if (!bugModalColumns.length) {
+      bugModalLoading = true;
+      try {
+        bugModalColumns = bugModalProjectId === activeProject?.id
+          ? [...columns]
+          : (await api.listAllColumns(bugModalProjectId)).data;
+        bugModalColumnId = bugModalColumns.find((column) => column.semantic_state === 'ready')?.id || bugModalColumns[0]?.id || '';
+      } catch (error) {
+        bugModalError = friendlyError(error, 'This project’s columns could not be loaded.');
+      } finally {
+        bugModalLoading = false;
+      }
+    } else {
+      bugModalColumnId = bugModalColumns.find((column) => column.semantic_state === 'ready')?.id || bugModalColumns[0]?.id || '';
+    }
+  }
+
+  async function reportBug() {
+    if (!bugModalProjectId || !bugModalTitle.trim() || !bugModalActual.trim()) {
+      bugModalError = 'Choose a project, add a title, and describe what actually happened.';
+      return;
+    }
+    bugModalCreating = true;
+    bugModalError = '';
+    try {
+      const labelNames = bugModalLabels.split(',').map((value) => value.trim()).filter(Boolean);
+      const labelIds = await resolveTaskLabels(bugModalProjectId, labelNames);
+      const projectTasks = bugModalProjectId === activeProject?.id ? tasks : [];
+      const created = await api.createTask(bugModalProjectId, {
+        title: bugModalTitle.trim(),
+        description: bugModalDescription.trim(),
+        kind: 'bug',
+        priority: bugModalPriority,
+        column_id: bugModalColumnId || undefined,
+        position: bugModalColumnId ? nextPosition(projectTasks, bugModalColumnId) : undefined,
+        labels: labelIds,
+        bug: {
+          actual_behavior: bugModalActual.trim(),
+          expected_behavior: bugModalExpected.trim(),
+          reproduction_steps: bugModalReproduction.trim(),
+          environment: bugModalEnvironment.trim(),
+          affected_version: bugModalVersion.trim(),
+          ...(bugModalSeverity ? { severity: bugModalSeverity } : {})
+        }
+      });
+      issueTasks = [...issueTasks.filter((task) => task.id !== created.id), created];
+      if (bugModalProjectId === activeProject?.id) tasks = [...tasks, created];
+      closeBugModal();
+      toast('success', `${created.key} reported.`);
+    } catch (error) {
+      bugModalError = friendlyError(error, 'The bug could not be reported.');
+    } finally {
+      bugModalCreating = false;
+    }
+  }
+
+  async function changeBugModalProject() {
+    bugModalColumns = [];
+    bugModalColumnId = '';
+    bugModalError = '';
+    if (!bugModalProjectId) return;
+    bugModalLoading = true;
+    try {
+      bugModalColumns = bugModalProjectId === activeProject?.id
+        ? [...columns]
+        : (await api.listAllColumns(bugModalProjectId)).data;
+      bugModalColumnId = bugModalColumns.find((column) => column.semantic_state === 'ready')?.id || bugModalColumns[0]?.id || '';
+    } catch (error) {
+      bugModalError = friendlyError(error, 'This project’s columns could not be loaded.');
+    } finally {
+      bugModalLoading = false;
+    }
+  }
+
   async function toggleFavorite(event: MouseEvent, project: Project) {
     event.stopPropagation();
     try {
@@ -905,6 +1138,56 @@
 
   function clearFilters() {
     filters = { query: '', priority: 'all', label: 'all', assignee: 'all', state: 'all' };
+  }
+
+  function clearIssueFilters() {
+    issueFilters = {
+      query: '',
+      priority: 'all',
+      label: 'all',
+      assignee: 'all',
+      state: 'all',
+      kind: 'bug',
+      severity: 'all',
+      reporter: 'all',
+      resolution: 'all'
+    };
+    issueProjectFilter = 'all';
+  }
+
+  function applyIssueRouteFilters(params: URLSearchParams) {
+    const value = (name: string) => params.get(name)?.trim() || '';
+    const priority = value('priority');
+    const state = value('state');
+    const severity = value('severity');
+    const resolution = value('resolution');
+    issueFilters = {
+      ...issueFilters,
+      query: value('q'),
+      priority: ['low', 'normal', 'high', 'urgent'].includes(priority) ? priority : 'all',
+      state: ['backlog', 'ready', 'active', 'blocked', 'completed'].includes(state) ? state : 'all',
+      assignee: value('assignee') || 'all',
+      severity: ['s1', 's2', 's3', 's4', 'untriaged'].includes(severity) ? severity : 'all',
+      reporter: value('reporter') || 'all',
+      resolution: ['fixed', 'duplicate', 'not_planned', 'cannot_reproduce', 'works_as_designed', 'open'].includes(resolution) ? resolution : 'all'
+    };
+    issueProjectFilter = value('project') || 'all';
+  }
+
+  function syncIssueViewURL(current: BoardFilters, project: string) {
+    if (typeof window === 'undefined' || window.location.pathname !== '/issues') return;
+    const params = new URLSearchParams();
+    if (current.query) params.set('q', current.query);
+    if (current.priority !== 'all') params.set('priority', current.priority);
+    if (current.state !== 'all') params.set('state', current.state);
+    if (current.assignee !== 'all') params.set('assignee', current.assignee);
+    if (current.severity && current.severity !== 'all') params.set('severity', current.severity);
+    if (current.reporter && current.reporter !== 'all') params.set('reporter', current.reporter);
+    if (current.resolution && current.resolution !== 'all') params.set('resolution', current.resolution);
+    if (project !== 'all') params.set('project', project);
+    const query = params.toString();
+    const target = `/issues${query ? `?${query}` : ''}`;
+    if (`${window.location.pathname}${window.location.search}` !== target) window.history.replaceState({}, '', target);
   }
 
   function columnColor(column: Column): string {
@@ -949,6 +1232,9 @@
 
   function replaceTask(updated: Task) {
     tasks = tasks.some((task) => task.id === updated.id) ? tasks.map((task) => (task.id === updated.id ? updated : task)) : [updated, ...tasks];
+    if (issueTasks.some((task) => task.id === updated.id)) {
+      issueTasks = issueTasks.map((task) => (task.id === updated.id ? updated : task));
+    }
     if (drawerTask?.id === updated.id) {
       drawerTask = updated;
     }
@@ -1007,6 +1293,16 @@
     draftDueDate = toInputDate(task.due_at);
     draftAssignee = actorId(task.assignee);
     draftLabels = (task.labels || []).map((label) => label.name).join(', ');
+    draftBugActual = task.bug?.actual_behavior || '';
+    draftBugExpected = task.bug?.expected_behavior || '';
+    draftBugReproduction = task.bug?.reproduction_steps || '';
+    draftBugEnvironment = task.bug?.environment || '';
+    draftBugVersion = task.bug?.affected_version || '';
+    triageSeverityDraft = task.bug?.severity || 's3';
+    resolutionDraft = task.bug?.resolution || 'fixed';
+    duplicateOfDraft = task.bug?.duplicate_of || '';
+    resolutionNoteDraft = '';
+    reopenReasonDraft = '';
   }
 
   function findProjectLabel(projectId: string, value: string): Label | undefined {
@@ -1113,6 +1409,10 @@
       drawerError = 'A task needs a title.';
       return;
     }
+    if (drawerTask.kind === 'bug' && !draftBugActual.trim()) {
+      drawerError = 'A bug report needs actual behavior.';
+      return;
+    }
     drawerSaving = true;
     drawerError = '';
     try {
@@ -1127,7 +1427,18 @@
           due_at: dateToIso(draftDueDate),
           assignee: draftAssignee.trim() || null,
           labels: labelIds,
-          label_ids: labelIds
+          label_ids: labelIds,
+          ...(drawerTask.kind === 'bug'
+            ? {
+                bug: {
+                  actual_behavior: draftBugActual.trim(),
+                  expected_behavior: draftBugExpected.trim(),
+                  reproduction_steps: draftBugReproduction.trim(),
+                  environment: draftBugEnvironment.trim(),
+                  affected_version: draftBugVersion.trim()
+                }
+              }
+            : {})
         },
         drawerTask.version
       );
@@ -1182,6 +1493,73 @@
       toast('success', `${updated.key} ${action === 'renew' ? 'claim renewed' : `${action}d`}.`);
     } catch (error) {
       toast('error', friendlyError(error, 'That task action could not be completed.'));
+    } finally {
+      taskActionLoading = '';
+    }
+  }
+
+  async function triageBug() {
+    if (!drawerTask?.bug) return;
+    taskActionLoading = drawerTask.id;
+    drawerError = '';
+    try {
+      const updated = await api.triageTask(drawerTask.id, drawerTask.version, {
+        severity: triageSeverityDraft,
+        priority: draftPriority,
+        assignee: draftAssignee.trim() || null
+      });
+      replaceTask(updated);
+      syncDraft(updated);
+      toast('success', `${updated.key} triaged as ${triageSeverityDraft.toUpperCase()}.`);
+    } catch (error) {
+      drawerError = friendlyError(error, 'The issue could not be triaged. Refresh and try again.');
+      if (error instanceof ApiError && error.details.current) replaceTask(error.details.current as Task);
+    } finally {
+      taskActionLoading = '';
+    }
+  }
+
+  async function resolveBug() {
+    if (!drawerTask?.bug) return;
+    if (resolutionDraft === 'duplicate' && !duplicateOfDraft.trim()) {
+      drawerError = 'Add the task key or ID this issue duplicates.';
+      return;
+    }
+    taskActionLoading = drawerTask.id;
+    drawerError = '';
+    try {
+      const updated = await api.resolveTask(drawerTask.id, drawerTask.version, {
+        resolution: resolutionDraft,
+        duplicate_of: duplicateOfDraft.trim() || null,
+        note: resolutionNoteDraft.trim() || undefined
+      });
+      replaceTask(updated);
+      syncDraft(updated);
+      toast('success', `${updated.key} resolved.`);
+    } catch (error) {
+      drawerError = friendlyError(error, 'The issue could not be resolved. Refresh and try again.');
+      if (error instanceof ApiError && error.details.current) replaceTask(error.details.current as Task);
+    } finally {
+      taskActionLoading = '';
+    }
+  }
+
+  async function reopenBug() {
+    if (!drawerTask?.bug) return;
+    if (!reopenReasonDraft.trim()) {
+      drawerError = 'Explain why this issue is being reopened.';
+      return;
+    }
+    taskActionLoading = drawerTask.id;
+    drawerError = '';
+    try {
+      const updated = await api.reopenTask(drawerTask.id, drawerTask.version, { reason: reopenReasonDraft.trim() });
+      replaceTask(updated);
+      syncDraft(updated);
+      toast('success', `${updated.key} reopened.`);
+    } catch (error) {
+      drawerError = friendlyError(error, 'The issue could not be reopened. Refresh and try again.');
+      if (error instanceof ApiError && error.details.current) replaceTask(error.details.current as Task);
     } finally {
       taskActionLoading = '';
     }
@@ -1391,6 +1769,7 @@
       </div>
 
       <nav class="nav-links" aria-label="Workspace views">
+        <button class:active={view === 'issues'} type="button" aria-label="Issues" on:click={() => setView('issues')}><span class="nav-icon">⚠</span><span>Issues</span>{#if issueTasks.length}<span class="nav-count">{issueTasks.length}</span>{/if}</button>
         <button class:active={view === 'my-work'} type="button" aria-label="My work" on:click={() => setView('my-work')}><span class="nav-icon">◌</span><span>My work</span>{#if myWorkTasks.length}<span class="nav-count">{myWorkTasks.length}</span>{/if}</button>
         <button class:active={view === 'roadmap'} type="button" aria-label="Roadmap" on:click={() => setView('roadmap')}><span class="nav-icon">◒</span><span>Roadmap</span></button>
       </nav>
@@ -1470,6 +1849,7 @@
 
       <nav class="mobile-nav" aria-label="Primary navigation">
         <button class:active={view === 'board'} type="button" aria-label="Board" aria-current={view === 'board' ? 'page' : undefined} on:click={() => setView('board')}><span class="mobile-nav-icon" aria-hidden="true">▦</span><span>Board</span></button>
+        <button class:active={view === 'issues'} type="button" aria-label="Issues" aria-current={view === 'issues' ? 'page' : undefined} on:click={() => setView('issues')}><span class="mobile-nav-icon" aria-hidden="true">⚠</span><span>Issues</span></button>
         <button class:active={view === 'my-work'} type="button" aria-label="My work" aria-current={view === 'my-work' ? 'page' : undefined} on:click={() => setView('my-work')}><span class="mobile-nav-icon" aria-hidden="true">◌</span><span>My Work</span></button>
         <button class:active={view === 'roadmap'} type="button" aria-label="Roadmap" aria-current={view === 'roadmap' ? 'page' : undefined} on:click={() => setView('roadmap')}><span class="mobile-nav-icon" aria-hidden="true">◒</span><span>Roadmap</span></button>
         <button class:active={view === 'settings'} type="button" aria-label="Settings" aria-current={view === 'settings' ? 'page' : undefined} on:click={() => setView('settings')}><span class="mobile-nav-icon" aria-hidden="true">⚙</span><span>Settings</span></button>
@@ -1480,7 +1860,7 @@
           {#if activeProject}
             <section class="page-heading board-heading">
               <div><div class="breadcrumbs"><span>Workspace</span><span>/</span><span>{activeProject.key}</span></div><div class="heading-title-row"><span class="heading-project-dot" style={`--project-color: ${activeProject.color || '#6d5efc'}`}></span><h1>{activeProject.name}</h1><button class="icon-button favorite-heading" class:starred={activeProject.favorite} type="button" aria-label={activeProject.favorite ? 'Remove from favorites' : 'Add to favorites'} on:click={(event) => toggleFavorite(event, activeProject)}>{activeProject.favorite ? '★' : '☆'}</button></div><p>{activeProject.description || 'A focused space for turning ideas into shipped work.'}</p></div>
-              <div class="heading-actions"><button class="button quiet-button" type="button" on:click={openProjectRoadmap}><span aria-hidden="true">◒</span> Progress</button><button class="button primary" type="button" data-task-modal-trigger on:click={openTaskModal}><span aria-hidden="true">＋</span> New task</button></div>
+              <div class="heading-actions"><button class="button quiet-button" type="button" on:click={openProjectRoadmap}><span aria-hidden="true">◒</span> Progress</button><button class="button quiet-button" type="button" data-report-bug-trigger on:click={openBugModal}><span aria-hidden="true">⚠</span> Report bug</button><button class="button primary" type="button" data-task-modal-trigger on:click={openTaskModal}><span aria-hidden="true">＋</span> New task</button></div>
             </section>
 
             <section class="board-toolbar" aria-label="Board filters">
@@ -1508,7 +1888,7 @@
                         {#each tasksByColumn[column.id] as task (task.id)}
                           <article class="task-card" class:dragging={draggingTaskId === task.id} draggable="true" on:dragstart={(event) => dragStart(event, task)} on:dragend={() => draggingTaskId = ''}>
                             <button class="task-main" type="button" data-task-trigger on:click={() => openTask(task)} on:keydown={(event) => keyboardMove(event, task)}>
-                              <span class="task-card-top"><span class="task-key">{task.key}</span><span class={`priority-dot priority-${task.priority}`} title={`${priorityLabels[task.priority]} priority`}></span>{#if task.claimed_by}<span class="claim-mini" title={`Claimed by ${actorName(task.claimed_by) || 'another actor'}`}>●</span>{/if}</span>
+                              <span class="task-card-top"><span class="task-key">{task.key}</span>{#if task.kind === 'bug'}<span class="issue-kind-badge">Bug</span>{#if task.bug?.severity}<span class="severity-badge">{task.bug.severity.toUpperCase()}</span>{/if}{/if}<span class={`priority-dot priority-${task.priority}`} title={`${priorityLabels[task.priority]} priority`}></span>{#if task.claimed_by}<span class="claim-mini" title={`Claimed by ${actorName(task.claimed_by) || 'another actor'}`}>●</span>{/if}</span>
                               <strong class="task-title">{task.title}</strong>
                               {#if task.description}<span class="task-excerpt">{task.description.replace(/[#*_`]/g, '').slice(0, 92)}{task.description.length > 92 ? '…' : ''}</span>{/if}
                               {#if task.labels?.length}<span class="task-labels">{#each task.labels.slice(0, 3) as label}<span class="label-chip" style={`--label-color: ${label.color || '#8b7cf6'}`}>{label.name}</span>{/each}{#if task.labels.length > 3}<span class="label-more">+{task.labels.length - 3}</span>{/if}</span>{/if}
@@ -1530,6 +1910,53 @@
           {:else}
             <div class="empty-state welcome-state"><div class="welcome-orbit"><span>R</span></div><span class="eyebrow">Your workspace is ready</span><h1>Start with a project.</h1><p>Projects give your ideas a home. Create one, invite your agents, and keep the next step clear.</p><button class="button primary button-large" type="button" on:click={openProjectModal}>＋ Create your first project</button></div>
           {/if}
+        {:else if view === 'issues'}
+          <section class="page-heading issues-heading">
+            <div>
+              <div class="breadcrumbs"><span>Workspace</span><span>/</span><span>Issues</span></div>
+              <h1>Issues</h1>
+              <p>Report, triage, and resolve bugs across the projects you can access.</p>
+            </div>
+            <div class="heading-actions">
+              <button class="button quiet-button" type="button" on:click={loadIssues}>↻ Refresh</button>
+              <button class="button primary" type="button" data-report-bug-trigger on:click={openBugModal}><span aria-hidden="true">＋</span> Report bug</button>
+            </div>
+          </section>
+          <section class="issues-toolbar" aria-label="Issue filters">
+            <div class="filter-search"><span aria-hidden="true">⌕</span><input aria-label="Search issues" bind:value={issueFilters.query} placeholder="Search issues…" /><kbd>/</kbd></div>
+            <div class="filter-group">
+              <select aria-label="Filter by issue type" bind:value={issueFilters.kind}><option value="bug">Bugs</option><option value="task">Tasks</option><option value="all">All kinds</option></select>
+              <select aria-label="Filter by severity" bind:value={issueFilters.severity}><option value="all">All severities</option><option value="untriaged">Untriaged</option>{#each Object.entries(severityLabels) as pair}<option value={pair[0]}>{pair[1]}</option>{/each}</select>
+              <select aria-label="Filter by resolution" bind:value={issueFilters.resolution}><option value="all">All resolutions</option><option value="open">Open</option>{#each resolutionOptions as resolution}<option value={resolution}>{resolutionLabels[resolution]}</option>{/each}</select>
+              <select aria-label="Filter issues by project" bind:value={issueProjectFilter}><option value="all">All projects</option>{#each projects as project}<option value={project.id}>{project.key} · {project.name}</option>{/each}</select>
+              <select aria-label="Filter by reporter" bind:value={issueFilters.reporter}><option value="all">All reporters</option>{#each issueReporterOptions as reporter}<option value={reporter}>{reporter}</option>{/each}</select>
+            </div>
+            {#if issueFilters.query || issueFilters.kind !== 'bug' || issueFilters.severity !== 'all' || issueFilters.resolution !== 'all' || issueFilters.reporter !== 'all' || issueProjectFilter !== 'all'}<button class="clear-filters" type="button" on:click={clearIssueFilters}>Clear filters</button>{/if}
+            <span class="toolbar-spacer"></span><span class="task-total">{visibleIssues.length} {visibleIssues.length === 1 ? 'issue' : 'issues'}</span>
+          </section>
+          <section class="issue-metrics" aria-label="Issue health">
+            <article><span>Open</span><strong>{issueMetrics.open}</strong></article>
+            <article><span>Untriaged</span><strong>{issueMetrics.untriaged}</strong></article>
+            <article><span>S1 / S2 open</span><strong>{issueMetrics.severe}</strong></article>
+            <article><span>Resolved · 7d</span><strong>{issueMetrics.recentlyResolved}</strong></article>
+            <article><span>Reopened · recent activity</span><strong>{issueMetrics.reopened}</strong></article>
+          </section>
+          {#if issuesError}<div class="inline-alert error content-alert" role="alert"><span>!</span><span>{issuesError}</span><button class="text-button" type="button" on:click={loadIssues}>Retry</button></div>{/if}
+          {#if issuesLoading}<div class="list-skeleton" aria-label="Loading issues">{#each [1, 2, 3] as item}<div></div>{/each}</div>
+          {:else if !visibleIssues.length}
+            <div class="empty-state issues-empty"><div class="empty-icon">⚠</div><h2>No issues match these filters</h2><p>Report a bug when something behaves differently than expected, then keep its status visible here.</p><button class="button primary" type="button" data-report-bug-trigger on:click={openBugModal}>＋ Report a bug</button></div>
+          {:else}
+            <section class="issues-list" aria-label="Reported issues">
+              {#each visibleIssues as issue (issue.id)}
+                <button class="issue-row" type="button" on:click={() => openWorkTask(issue)}>
+                  <span class="issue-kind-badge" class:task-kind={issue.kind !== 'bug'}>{issue.kind === 'bug' ? 'Bug' : 'Task'}</span>
+                  <span class="issue-main"><span class="issue-row-top"><span class="task-key">{issue.key}</span><span class={`priority-pill priority-${issue.priority}`}>{priorityLabels[issue.priority]}</span></span><strong>{issue.title}</strong><span class="issue-project-name">{projectForTask(issue)?.name || 'Project'}{#if issue.bug?.reporter_id}<span> · Reported by {issue.bug.reporter_id}</span>{/if}</span></span>
+                  <span class="issue-status"><span class:untriaged={!issue.bug?.severity} class="severity-badge">{issue.bug?.severity ? severityLabels[issue.bug.severity] : 'Untriaged'}</span>{#if issue.bug?.resolution}<span class="resolution-badge">{resolutionLabels[issue.bug.resolution] || issue.bug.resolution}</span>{:else}<span class="resolution-badge open">Open</span>{/if}</span>
+                  <span class="issue-column">{issueColumns.find((column) => column.project_id === issue.project_id && column.id === issue.column_id)?.name || '—'}</span><span class="row-arrow">→</span>
+                </button>
+              {/each}
+            </section>
+          {/if}
         {:else if view === 'my-work'}
           <section class="page-heading"><div><div class="breadcrumbs"><span>Workspace</span><span>/</span><span>Personal</span></div><h1>My work</h1><p>Everything assigned or claimed by you, across projects.</p></div><div class="heading-actions"><button class="button quiet-button" type="button" on:click={loadMyWork}>↻ Refresh</button></div></section>
           {#if myWorkError}<div class="inline-alert error content-alert" role="alert"><span>!</span>{myWorkError}<button class="text-button" type="button" on:click={loadMyWork}>Retry</button></div>{/if}
@@ -1549,9 +1976,20 @@
     {#if drawerTask}
       <div class="drawer-backdrop" role="presentation" on:click={closeDrawer}></div>
       <div class="task-drawer" role="dialog" aria-modal="true" aria-labelledby="drawer-title" use:focusTrap>
-        <div class="drawer-header"><div><span class="drawer-key">{drawerTask.key}</span><span class={`priority-pill priority-${drawerTask.priority}`}>{priorityLabels[drawerTask.priority]}</span></div><button class="icon-button" type="button" aria-label="Close task details" on:click={closeDrawer}>×</button></div>
+        <div class="drawer-header"><div><span class="drawer-key">{drawerTask.key}</span><span class="issue-kind-badge" class:task-kind={drawerTask.kind !== 'bug'}>{drawerTask.kind === 'bug' ? 'Bug' : 'Task'}</span>{#if drawerTask.kind === 'bug'}<span class:untriaged={!drawerTask.bug?.severity} class="severity-badge">{drawerTask.bug?.severity ? severityLabels[drawerTask.bug.severity] : 'Untriaged'}</span>{/if}<span class={`priority-pill priority-${drawerTask.priority}`}>{priorityLabels[drawerTask.priority]}</span></div><button class="icon-button" type="button" aria-label="Close task details" on:click={closeDrawer}>×</button></div>
         {#if drawerLoading}<div class="drawer-loading"><span class="spinner"></span><span>Loading task details…</span></div>{/if}
         {#if drawerError}<div class="inline-alert error drawer-alert" role="alert"><span>!</span>{drawerError}</div>{/if}
+        {#if drawerTask.kind === 'bug'}
+          <div class="drawer-bug-controls">
+            <section class="drawer-section bug-details-section" aria-labelledby="bug-details-heading"><div class="section-heading-inline"><h2 id="bug-details-heading">Bug report</h2><span class="optional">Reporter: {drawerTask.bug?.reporter_id || 'Unknown'}</span></div><label>Actual behavior<textarea rows="3" bind:value={draftBugActual} placeholder="What happened?"></textarea></label><label>Expected behavior<textarea rows="3" bind:value={draftBugExpected} placeholder="What should have happened?"></textarea></label><label>Reproduction steps<textarea rows="3" bind:value={draftBugReproduction} placeholder="1. Open…&#10;2. Click…"></textarea></label><div class="drawer-field-grid"><label>Environment<input bind:value={draftBugEnvironment} placeholder="Browser, OS, device" /></label><label>Affected version<input bind:value={draftBugVersion} placeholder="e.g. 1.4.0" /></label></div></section>
+            <section class="drawer-section bug-triage-section" aria-labelledby="bug-triage-heading"><div class="section-heading-inline"><h2 id="bug-triage-heading">Triage</h2><span class="optional">Set severity and ownership</span></div><div class="drawer-field-grid"><label>Severity<select aria-label="Bug severity" bind:value={triageSeverityDraft}><option value="s1">{severityLabels.s1}</option><option value="s2">{severityLabels.s2}</option><option value="s3">{severityLabels.s3}</option><option value="s4">{severityLabels.s4}</option></select></label><label>Priority<select aria-label="Triage priority" bind:value={draftPriority}><option value="urgent">Urgent</option><option value="high">High</option><option value="normal">Normal</option><option value="low">Low</option></select></label></div><label>Assignee<input aria-label="Triage assignee" bind:value={draftAssignee} placeholder="Actor ID (optional)" /></label><button class="button primary" type="button" disabled={taskActionLoading === drawerTask.id} on:click={triageBug}>{#if taskActionLoading === drawerTask.id}<span class="button-spinner"></span>{/if}{drawerTask.bug?.severity ? 'Update triage' : 'Triage issue'}</button></section>
+            {#if drawerTask.bug?.resolution}
+              <section class="drawer-section bug-resolution-section" aria-labelledby="bug-resolution-heading"><div class="section-heading-inline"><h2 id="bug-resolution-heading">Resolved as {resolutionLabels[drawerTask.bug.resolution] || drawerTask.bug.resolution}</h2><span class="optional">Reopen if the issue persists</span></div><label>Reopen reason<textarea rows="2" bind:value={reopenReasonDraft} placeholder="Why does this need another look?"></textarea></label><button class="button quiet-button" type="button" disabled={taskActionLoading === drawerTask.id || !reopenReasonDraft.trim()} on:click={reopenBug}>Reopen issue</button></section>
+            {:else}
+              <section class="drawer-section bug-resolution-section" aria-labelledby="bug-resolution-heading"><div class="section-heading-inline"><h2 id="bug-resolution-heading">Resolve</h2><span class="optional">Close the loop for reporters</span></div><label>Resolution<select aria-label="Bug resolution" bind:value={resolutionDraft}>{#each resolutionOptions as resolution}<option value={resolution}>{resolutionLabels[resolution]}</option>{/each}</select></label>{#if resolutionDraft === 'duplicate'}<label>Duplicate of<input aria-label="Duplicate issue" bind:value={duplicateOfDraft} placeholder="Task key or ID" /></label>{/if}<label>Resolution note <span class="optional">Optional</span><textarea rows="2" bind:value={resolutionNoteDraft} placeholder="What changed or why was this closed?"></textarea></label><button class="button complete-button" type="button" disabled={taskActionLoading === drawerTask.id} on:click={resolveBug}>Resolve issue</button></section>
+            {/if}
+          </div>
+        {/if}
         <div class="drawer-scroll"><label class="drawer-title-label"><span class="sr-only">Task title</span><input id="drawer-title" class="drawer-title-input" data-dialog-initial-focus bind:value={draftTitle} /></label><div class="drawer-meta"><span class="task-project-marker" style={`--project-color: ${projectForTask(drawerTask)?.color || '#6d5efc'}`}></span><span>{projectForTask(drawerTask)?.name || 'Project'}</span><span>·</span><span>Updated {formatRelative(drawerTask?.updated_at)}</span></div><div class="drawer-actions"><button class="button quiet-button" type="button" disabled={taskActionLoading === drawerTask?.id} on:click={() => runTaskAction(claimAction(drawerTask))}>{drawerTask.claimed_by ? (actorId(drawerTask.claimed_by) === user?.id ? '↻ Renew claim' : `Claimed by ${actorName(drawerTask.claimed_by) || 'agent'}`) : '⚑ Claim task'}</button>{#if drawerTask.claimed_by && actorId(drawerTask.claimed_by) === user?.id}<button class="button quiet-button" type="button" disabled={taskActionLoading === drawerTask?.id} on:click={() => runTaskAction('release')}>Release</button>{/if}<button class="button complete-button" type="button" disabled={Boolean(drawerTask.completed_at) || taskActionLoading === drawerTask?.id} on:click={() => runTaskAction('complete')}>{drawerTask.completed_at ? '✓ Completed' : '✓ Complete'}</button></div><section class="drawer-section"><div class="drawer-field-grid"><label>Priority<select bind:value={draftPriority}><option value="urgent">Urgent</option><option value="high">High</option><option value="normal">Normal</option><option value="low">Low</option></select></label><label>Due date<input type="date" bind:value={draftDueDate} /></label></div><label>Assignee<input bind:value={draftAssignee} placeholder="Actor ID (optional)" /></label><label>Labels <span class="optional">Comma separated</span><input bind:value={draftLabels} placeholder="frontend, design" /></label>{#if labels.filter((label) => label.project_id === drawerTask?.project_id).length}<div class="drawer-label-picker"><span class="optional">Project labels</span><div class="drawer-label-options">{#each labels.filter((label) => label.project_id === drawerTask?.project_id) as label (label.id)}<span class="drawer-label-option" style={`--label-color: ${label.color || '#8b7cf6'}`}><span>{label.name}</span><button class="icon-button tiny danger-button" type="button" aria-label={`Delete label ${label.name}`} disabled={labelDeleting === label.id} on:click|stopPropagation={() => deleteProjectLabel(label)}>×</button></span>{/each}</div></div>{/if}</section><section class="drawer-section description-section"><div class="section-heading-inline"><h2>Description</h2><span class="markdown-hint">Markdown supported</span></div><textarea class="description-input" rows="7" bind:value={draftDescription} placeholder="What does success look like?"></textarea></section><button class="button primary save-task-button" type="button" disabled={drawerSaving || !draftTitle.trim()} on:click={saveTask}>{#if drawerSaving}<span class="button-spinner"></span>{/if}Save changes</button><section class="drawer-section activity-section"><div class="section-heading-inline"><h2>Comments &amp; activity</h2><span class="activity-count">{comments.length + drawerActivity.length}</span></div><form class="comment-form" on:submit|preventDefault={postComment}><span class="avatar mini-user-avatar">{projectInitials({ name: user.name, key: user.name })}</span><textarea rows="2" bind:value={commentBody} placeholder="Leave a note for your team…"></textarea><button class="icon-button comment-send" type="submit" disabled={!commentBody.trim() || commentSending} aria-label="Add comment">↑</button></form><div class="activity-list">{#if !comments.length && !drawerActivity.length}<div class="activity-empty">No updates yet. Be the first to leave context.</div>{:else}{#each comments as comment}<article class="activity-item"><span class="activity-avatar" class:agent={typeof comment.author !== 'object' && typeof comment.actor !== 'object'}>{(commentAuthor(comment).slice(0, 1) || '?').toUpperCase()}</span><div><p><strong>{commentAuthor(comment)}</strong><span> commented</span></p><div class="comment-body">{comment.body}</div><time datetime={comment.created_at}>{formatRelative(comment.created_at)}</time></div></article>{/each}{#each drawerActivity as event}<article class="activity-item system-activity"><span class="activity-avatar event-avatar">✦</span><div><p><strong>{eventAuthor(event)}</strong><span> {displayEvent(event).toLowerCase()}</span></p><time datetime={event.created_at}>{formatRelative(event.created_at)}</time></div></article>{/each}{/if}</div></section></div>
         <div class="drawer-delete-wrap"><button class="button danger-button" type="button" disabled={drawerSaving || taskActionLoading === drawerTask?.id} on:click={deleteDrawerTask}>Delete task</button></div>
       </div>
@@ -1561,7 +1999,7 @@
       <div class="modal-backdrop command-backdrop" role="presentation" on:click={closeCommandPalette}></div>
       <div class="command-menu" role="dialog" aria-modal="true" aria-label="Search Roadmap" use:focusTrap>
         <div class="command-input-wrap"><span aria-hidden="true">⌕</span><input bind:this={commandInput} data-dialog-initial-focus bind:value={commandQuery} on:keydown={commandKeydown} placeholder="Jump to a project or view…" aria-label="Search projects and views" /><kbd>ESC</kbd></div>
-        <div class="command-results">{#if commandChoices.length}{#each commandChoices as choice, index}<button class:selected={index === commandIndex} class="command-row" type="button" on:mouseenter={() => commandIndex = index} on:click={() => selectCommand(choice)}><span class={`command-icon ${choice.kind}`}>{choice.kind === 'project' ? (choice.project ? projectInitials(choice.project) : 'P') : choice.view === 'my-work' ? '◌' : choice.view === 'roadmap' ? '◒' : '⚙'}</span><span><strong>{choice.label}</strong><small>{choice.hint}</small></span><span class="command-enter">↵</span></button>{/each}{:else}<div class="command-empty">No projects or views match “{commandQuery}”</div>{/if}</div><div class="command-footer"><span><kbd>↑</kbd><kbd>↓</kbd> Navigate</span><span><kbd>↵</kbd> Open</span><span><kbd>ESC</kbd> Close</span></div>
+        <div class="command-results">{#if commandChoices.length}{#each commandChoices as choice, index}<button class:selected={index === commandIndex} class="command-row" type="button" on:mouseenter={() => commandIndex = index} on:click={() => selectCommand(choice)}><span class={`command-icon ${choice.kind}`}>{choice.kind === 'project' ? (choice.project ? projectInitials(choice.project) : 'P') : choice.kind === 'issue' ? '⚠' : choice.view === 'issues' ? '⚠' : choice.view === 'my-work' ? '◌' : choice.view === 'roadmap' ? '◒' : '⚙'}</span><span><strong>{choice.label}</strong><small>{choice.hint}</small></span><span class="command-enter">↵</span></button>{/each}{:else}<div class="command-empty">No projects, issues, or views match “{commandQuery}”</div>{/if}</div><div class="command-footer"><span><kbd>↑</kbd><kbd>↓</kbd> Navigate</span><span><kbd>↵</kbd> Open</span><span><kbd>ESC</kbd> Close</span></div>
       </div>
     {/if}
 
@@ -1577,6 +2015,26 @@
           <div class="form-row"><label>Priority<select bind:value={taskModalPriority}><option value="urgent">Urgent</option><option value="high">High</option><option value="normal">Normal</option><option value="low">Low</option></select></label><label>Due date <span class="optional">Optional</span><input type="date" bind:value={taskModalDueDate} /></label></div>
           <label>Assignee <span class="optional">Optional</span><input bind:value={taskModalAssignee} placeholder="Actor ID" /></label>
           <div class="modal-actions"><button class="text-button" type="button" on:click={closeTaskModal}>Cancel</button><button class="button primary" type="submit" disabled={taskModalCreating || taskModalLoading || !taskModalTitle.trim()}>{#if taskModalCreating}<span class="button-spinner"></span>{/if}Create task</button></div>
+        </form>
+      </div>
+    {/if}
+
+    {#if showBugModal}
+      <div class="modal-backdrop" role="presentation" on:click={closeBugModal}></div>
+      <div class="modal bug-create-modal" role="dialog" aria-modal="true" aria-labelledby="bug-modal-title" use:focusTrap>
+        <div class="modal-header"><div><span class="eyebrow">Capture a regression</span><h2 id="bug-modal-title">Report a bug</h2></div><button class="icon-button" type="button" aria-label="Close" on:click={closeBugModal}>×</button></div>
+        {#if bugModalError}<div class="inline-alert error" role="alert"><span>!</span>{bugModalError}</div>{/if}
+        <form on:submit|preventDefault={reportBug}>
+          <div class="form-row task-destination-row"><label>Project<select bind:value={bugModalProjectId} on:change={() => void changeBugModalProject()}>{#each projects as project}<option value={project.id}>{project.key} · {project.name}</option>{/each}</select></label><label>Column<select bind:value={bugModalColumnId} disabled={bugModalLoading || !bugModalColumns.length}>{#each bugModalColumns as column}<option value={column.id}>{column.name}</option>{/each}</select></label></div>
+          <label>Bug title<input data-dialog-initial-focus bind:value={bugModalTitle} placeholder="What went wrong?" /></label>
+          <label>Actual behavior<textarea rows="3" bind:value={bugModalActual} placeholder="What happened?" required></textarea></label>
+          <label>Expected behavior<textarea rows="2" bind:value={bugModalExpected} placeholder="What should have happened?"></textarea></label>
+          <label>Reproduction steps <span class="optional">Optional</span><textarea rows="2" bind:value={bugModalReproduction} placeholder="1. Open…&#10;2. Click…"></textarea></label>
+          <div class="form-row"><label>Environment <span class="optional">Optional</span><input bind:value={bugModalEnvironment} placeholder="Browser, OS, device" /></label><label>Affected version <span class="optional">Optional</span><input bind:value={bugModalVersion} placeholder="e.g. 1.4.0" /></label></div>
+          <div class="form-row"><label>Severity <span class="optional">Optional · triage later</span><select aria-label="Initial bug severity" bind:value={bugModalSeverity}><option value="">Untriaged</option><option value="s1">{severityLabels.s1}</option><option value="s2">{severityLabels.s2}</option><option value="s3">{severityLabels.s3}</option><option value="s4">{severityLabels.s4}</option></select></label><label>Priority<select bind:value={bugModalPriority}><option value="urgent">Urgent</option><option value="high">High</option><option value="normal">Normal</option><option value="low">Low</option></select></label></div>
+          <label>Description <span class="optional">Optional · Markdown supported</span><textarea rows="2" bind:value={bugModalDescription} placeholder="Add context beyond the reproduction details."></textarea></label>
+          <label>Labels <span class="optional">Optional · comma separated</span><input bind:value={bugModalLabels} placeholder="frontend, regression" /></label>
+          <div class="modal-actions"><button class="text-button" type="button" on:click={closeBugModal}>Cancel</button><button class="button primary" type="submit" disabled={bugModalCreating || bugModalLoading || !bugModalTitle.trim() || !bugModalActual.trim()}>{#if bugModalCreating}<span class="button-spinner"></span>{/if}Report bug</button></div>
         </form>
       </div>
     {/if}

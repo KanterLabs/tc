@@ -1,5 +1,8 @@
 export type SemanticState = 'backlog' | 'ready' | 'active' | 'blocked' | 'completed';
 export type Priority = 'low' | 'normal' | 'high' | 'urgent';
+export type TaskKind = 'task' | 'bug';
+export type BugSeverity = 's1' | 's2' | 's3' | 's4';
+export type BugResolution = 'fixed' | 'duplicate' | 'not_planned' | 'cannot_reproduce' | 'works_as_designed';
 export type ActorKind = 'human' | 'agent';
 export type Scope = 'projects:read' | 'projects:write' | 'tasks:read' | 'tasks:write' | 'tasks:claim' | 'events:read';
 
@@ -56,6 +59,44 @@ export interface Label {
   updated_at?: string;
 }
 
+/** Bug metadata is nested under a task in the runtime API response. */
+export interface BugDetails {
+  reporter_id: string;
+  severity?: BugSeverity | null;
+  actual_behavior: string;
+  expected_behavior: string;
+  reproduction_steps: string;
+  environment: string;
+  affected_version: string;
+  resolution?: BugResolution | null;
+  resolved_by?: string | null;
+  resolved_at?: string | null;
+  duplicate_of?: string | null;
+}
+
+/** Fields accepted when creating or patching nested bug metadata. */
+export type BugInput = Partial<Pick<BugDetails, 'severity' | 'expected_behavior' | 'reproduction_steps' | 'environment' | 'affected_version'>> & {
+  actual_behavior: string;
+};
+export type BugPatch = Partial<Pick<BugDetails, 'severity' | 'actual_behavior' | 'expected_behavior' | 'reproduction_steps' | 'environment' | 'affected_version'>>;
+
+export interface TriageInput {
+  severity: BugSeverity;
+  priority?: Priority;
+  assignee?: string | null;
+  column_id?: string | null;
+}
+
+export interface ResolveInput {
+  resolution: BugResolution;
+  duplicate_of?: string | null;
+  note?: string;
+}
+
+export interface ReopenInput {
+  reason: string;
+}
+
 export interface Task {
   id: string;
   number: number;
@@ -64,6 +105,9 @@ export interface Task {
   column_id: string;
   title: string;
   description?: string;
+  /** Existing task responses may omit kind while older servers are upgraded. */
+  kind?: TaskKind;
+  bug?: BugDetails | null;
   priority: Priority;
   position: number;
   /** Runtime task JSON uses actor IDs and omits unset references. */
@@ -204,6 +248,8 @@ export class ApiError extends Error {
 }
 
 export type TaskPatch = Partial<Pick<Task, 'title' | 'description' | 'priority' | 'column_id' | 'position'>> & {
+  kind?: TaskKind;
+  bug?: BugPatch | null;
   description?: string | null;
   due_at?: string | null;
   assignee?: string | null;

@@ -22,6 +22,9 @@ type TaskInput struct {
 	Title       *string
 	Description *string
 	Priority    *string
+	Kind        *string
+	Bug         *BugInput
+	BugSet      bool
 	ColumnID    *string
 	Position    *float64
 	Assignee    *string
@@ -31,6 +34,11 @@ type TaskInput struct {
 	Labels      []string
 	LabelsSet   bool
 }
+
+const (
+	defaultTaskKind = "task"
+	bugKind         = "bug"
+)
 
 func validateTaskInput(input TaskInput, creating bool) (TaskInput, error) {
 	if creating && input.Title == nil {
@@ -53,6 +61,37 @@ func validateTaskInput(input TaskInput, creating bool) (TaskInput, error) {
 		}
 		input.Priority = &value
 	}
+	if input.Kind != nil {
+		value := strings.ToLower(strings.TrimSpace(*input.Kind))
+		if value != defaultTaskKind && value != bugKind {
+			return TaskInput{}, invalid("kind must be task or bug", nil)
+		}
+		input.Kind = &value
+	}
+	if input.Bug != nil {
+		normalized, err := validateBugInput(*input.Bug, false)
+		if err != nil {
+			return TaskInput{}, err
+		}
+		input.Bug = &normalized
+		input.BugSet = true
+	}
+	if creating {
+		kind := defaultTaskKind
+		if input.Kind != nil {
+			kind = *input.Kind
+		}
+		if kind == bugKind {
+			if input.Bug == nil {
+				return TaskInput{}, invalid("bug details are required when kind is bug", nil)
+			}
+			if err := validateBugCreateInput(*input.Bug); err != nil {
+				return TaskInput{}, err
+			}
+		} else if input.Bug != nil || input.BugSet {
+			return TaskInput{}, invalid("bug details require kind bug", nil)
+		}
+	}
 	if input.Position != nil && (*input.Position < 0 || *input.Position > 1e12) {
 		return TaskInput{}, invalid("position is invalid", nil)
 	}
@@ -69,6 +108,76 @@ func validateTaskInput(input TaskInput, creating bool) (TaskInput, error) {
 	return input, nil
 }
 
+// validateBugInput normalizes patch values and enforces bounded text sizes.
+// A missing field remains nil; an explicit Set flag lets callers clear a
+// nullable or optional field without confusing it with omission.
+func validateBugInput(input BugInput, creating bool) (BugInput, error) {
+	if input.Severity != nil {
+		value := strings.ToLower(strings.TrimSpace(*input.Severity))
+		if !validBugSeverity(value) {
+			return BugInput{}, invalid("severity must be s1, s2, s3, or s4", nil)
+		}
+		input.Severity = &value
+	}
+	if input.ActualBehavior != nil {
+		value := strings.TrimSpace(*input.ActualBehavior)
+		if value == "" {
+			return BugInput{}, invalid("actual_behavior must not be empty", nil)
+		}
+		if len(value) > 100000 {
+			return BugInput{}, invalid("actual_behavior is too long", nil)
+		}
+		input.ActualBehavior = &value
+	}
+	for _, field := range []struct {
+		name  string
+		value **string
+		set   bool
+	}{
+		{"expected_behavior", &input.ExpectedBehavior, input.ExpectedBehaviorSet},
+		{"reproduction_steps", &input.ReproductionSteps, input.ReproductionStepsSet},
+		{"environment", &input.Environment, input.EnvironmentSet},
+		{"affected_version", &input.AffectedVersion, input.AffectedVersionSet},
+	} {
+		if *field.value == nil {
+			if field.set && creating {
+				// Explicit null is represented as an empty optional value on
+				// create; this keeps the stored shape deterministic.
+			}
+			continue
+		}
+		normalized := strings.TrimSpace(**field.value)
+		if len(normalized) > 100000 {
+			return BugInput{}, invalid(field.name+" is too long", nil)
+		}
+		*field.value = &normalized
+	}
+	return input, nil
+}
+
+func validateBugCreateInput(input BugInput) error {
+	if input.ActualBehavior == nil || strings.TrimSpace(*input.ActualBehavior) == "" {
+		return invalid("actual_behavior is required for bugs", nil)
+	}
+	return nil
+}
+
+func validBugSeverity(value string) bool {
+	switch value {
+	case "s1", "s2", "s3", "s4":
+		return true
+	}
+	return false
+}
+
+func validBugResolution(value string) bool {
+	switch value {
+	case "fixed", "duplicate", "not_planned", "cannot_reproduce", "works_as_designed":
+		return true
+	}
+	return false
+}
+
 func validPriority(value string) bool {
 	switch value {
 	case "low", "normal", "high", "urgent":
@@ -81,6 +190,21 @@ func (s *Store) CreateTask(ctx context.Context, projectID string, input TaskInpu
 	validated, err := validateTaskInput(input, true)
 	if err != nil {
 		return Task{}, err
+	}
+	kind := defaultTaskKind
+	if validated.Kind != nil {
+		kind = *validated.Kind
+	}
+	if kind == bugKind {
+		// ReporterID is intentionally the authenticated server actor rather
+		// than client-controlled bug input. Validate it before opening the
+		// mutation transaction so malformed bug creates fail cleanly.
+		if strings.TrimSpace(actorID) == "" {
+			return Task{}, invalid("a reporter actor is required for bugs", nil)
+		}
+		if _, err := s.GetActor(ctx, actorID); err != nil {
+			return Task{}, invalid("reporter actor not found", nil)
+		}
 	}
 	project, err := s.GetProject(ctx, projectID)
 	if err != nil {
@@ -101,6 +225,9 @@ func (s *Store) CreateTask(ctx context.Context, projectID string, input TaskInpu
 	}
 	if err != nil {
 		return Task{}, err
+	}
+	if kind == bugKind && column.SemanticState == "completed" {
+		return Task{}, invalid("bugs must be resolved before entering a completed column", nil)
 	}
 	priority := "normal"
 	if validated.Priority != nil {
@@ -142,7 +269,7 @@ func (s *Store) CreateTask(ctx context.Context, projectID string, input TaskInpu
 		if err := tx.QueryRowContext(ctx, `SELECT next_number - 1 FROM project_counters WHERE project_id = ?`, project.ID).Scan(&number); err != nil {
 			return err
 		}
-		if _, err := tx.ExecContext(ctx, `INSERT INTO tasks(id, project_id, number, column_id, title, description, priority, position, assignee_id, due_at, version, completed_at, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULLIF(?, ''), NULLIF(?, ''), 1, ?, ?, ?)`, id, project.ID, number, column.ID, *validated.Title, description, priority, position, assignee, dueAt, completedAt, created, created); err != nil {
+		if _, err := tx.ExecContext(ctx, `INSERT INTO tasks(id, project_id, number, column_id, kind, title, description, priority, position, assignee_id, due_at, version, completed_at, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULLIF(?, ''), NULLIF(?, ''), 1, ?, ?, ?)`, id, project.ID, number, column.ID, kind, *validated.Title, description, priority, position, assignee, dueAt, completedAt, created, created); err != nil {
 			return err
 		}
 		if validated.LabelsSet {
@@ -150,7 +277,16 @@ func (s *Store) CreateTask(ctx context.Context, projectID string, input TaskInpu
 				return err
 			}
 		}
-		_, err := insertEvent(ctx, tx, "task.created", actorID, project.ID, id, map[string]any{"number": number, "title": *validated.Title})
+		if kind == bugKind {
+			if err := insertBugDetailsTx(ctx, tx, id, actorID, *validated.Bug); err != nil {
+				return err
+			}
+		}
+		eventType := "task.created"
+		if kind == bugKind {
+			eventType = "bug.created"
+		}
+		_, err := insertEvent(ctx, tx, eventType, actorID, project.ID, id, map[string]any{"number": number})
 		return err
 	})
 	if err != nil {
@@ -220,6 +356,13 @@ func (s *Store) enrichTask(ctx context.Context, task *Task) error {
 	if task.Labels == nil {
 		task.Labels = []Label{}
 	}
+	if task.Kind == bugKind {
+		bug, err := s.getBugDetails(ctx, task.ID)
+		if err != nil {
+			return err
+		}
+		task.Bug = bug
+	}
 	return s.DB.QueryRowContext(ctx, `SELECT COUNT(1) FROM comments WHERE task_id=?`, task.ID).Scan(&task.CommentCount)
 }
 
@@ -266,14 +409,38 @@ func (s *Store) listTasks(ctx context.Context, projectID string, filter TaskFilt
 			args = append(args, filter.Assignee)
 		}
 	}
+	if filter.Kind != "" {
+		query += ` AND lower(t.kind) = lower(?)`
+		args = append(args, filter.Kind)
+	}
+	if filter.Severity != "" {
+		if strings.EqualFold(filter.Severity, "none") || strings.EqualFold(filter.Severity, "untriaged") {
+			query += ` AND EXISTS (SELECT 1 FROM bug_details bd WHERE bd.task_id=t.id AND bd.severity IS NULL)`
+		} else {
+			query += ` AND EXISTS (SELECT 1 FROM bug_details bd WHERE bd.task_id=t.id AND bd.severity=?)`
+			args = append(args, filter.Severity)
+		}
+	}
+	if filter.Reporter != "" {
+		query += ` AND EXISTS (SELECT 1 FROM bug_details bd WHERE bd.task_id=t.id AND bd.reporter_id=?)`
+		args = append(args, filter.Reporter)
+	}
+	if filter.Resolution != "" {
+		if strings.EqualFold(filter.Resolution, "none") || strings.EqualFold(filter.Resolution, "unresolved") {
+			query += ` AND EXISTS (SELECT 1 FROM bug_details bd WHERE bd.task_id=t.id AND bd.resolution IS NULL)`
+		} else {
+			query += ` AND EXISTS (SELECT 1 FROM bug_details bd WHERE bd.task_id=t.id AND bd.resolution=?)`
+			args = append(args, filter.Resolution)
+		}
+	}
 	if filter.Label != "" {
 		query += ` AND EXISTS (SELECT 1 FROM task_labels tl JOIN labels l ON l.id=tl.label_id WHERE tl.task_id=t.id AND (l.id=? OR lower(l.name)=lower(?)))`
 		args = append(args, filter.Label, filter.Label)
 	}
 	if filter.Query != "" {
-		query += ` AND (lower(t.title) LIKE ? OR lower(t.description) LIKE ?)`
+		query += ` AND (lower(t.title) LIKE ? OR lower(t.description) LIKE ? OR EXISTS (SELECT 1 FROM bug_details bd WHERE bd.task_id=t.id AND (lower(bd.actual_behavior) LIKE ? OR lower(bd.expected_behavior) LIKE ? OR lower(bd.reproduction_steps) LIKE ? OR lower(bd.environment) LIKE ? OR lower(bd.affected_version) LIKE ?)))`
 		q := "%" + strings.ToLower(filter.Query) + "%"
-		args = append(args, q, q)
+		args = append(args, q, q, q, q, q, q, q)
 	}
 	if filter.UpdatedAfter != nil {
 		query += ` AND t.updated_at > ?`
@@ -333,6 +500,45 @@ func (s *Store) UpdateTaskWithClaimOverride(ctx context.Context, id string, inpu
 	if err != nil {
 		return Task{}, err
 	}
+	if current.Kind == "" {
+		// Databases opened before migration 008 are upgraded before serving
+		// requests, but retain the safe default for direct store test fixtures.
+		current.Kind = defaultTaskKind
+	}
+	kind := current.Kind
+	if validated.Kind != nil {
+		kind = *validated.Kind
+	}
+	bugMutation := validated.BugSet || validated.Bug != nil
+	// Supplying bug details is an ergonomic shorthand for a task-to-bug
+	// conversion for direct store callers. HTTP clients normally send kind as
+	// well, and an explicit task kind still rejects a bug object below.
+	if validated.Kind == nil && current.Kind == defaultTaskKind && bugMutation {
+		kind = bugKind
+	}
+	if kind == bugKind && current.Kind == defaultTaskKind && !bugMutation {
+		return Task{}, invalid("bug details are required when changing kind to bug", nil)
+	}
+	if kind == defaultTaskKind && current.Kind == bugKind {
+		return Task{}, invalid("a bug cannot be changed back to a task", nil)
+	}
+	if kind == defaultTaskKind && bugMutation {
+		return Task{}, invalid("bug details require kind bug", nil)
+	}
+	if kind == bugKind && bugMutation && validated.Bug == nil {
+		return Task{}, invalid("bug details cannot be null for a bug", nil)
+	}
+	if current.Kind == defaultTaskKind && kind == bugKind {
+		if err := validateBugCreateInput(*validated.Bug); err != nil {
+			return Task{}, err
+		}
+		if strings.TrimSpace(actorID) == "" {
+			return Task{}, invalid("a reporter actor is required for bugs", nil)
+		}
+		if _, err := s.GetActor(ctx, actorID); err != nil {
+			return Task{}, invalid("reporter actor not found", nil)
+		}
+	}
 	title, description, priority, columnID, position := current.Title, current.Description, current.Priority, current.ColumnID, current.Position
 	assignee := ""
 	if current.Assignee != nil {
@@ -376,6 +582,12 @@ func (s *Store) UpdateTaskWithClaimOverride(ctx context.Context, id string, inpu
 	if column.ProjectID != current.ProjectID {
 		return Task{}, invalid("column belongs to another project", nil)
 	}
+	if kind == bugKind && column.SemanticState == "completed" && (current.Bug == nil || current.Bug.Resolution == nil) {
+		return Task{}, invalid("bugs must be resolved before entering a completed column", nil)
+	}
+	if kind == bugKind && current.Bug != nil && current.Bug.Resolution != nil && column.SemanticState != "completed" {
+		return Task{}, invalid("resolved bugs must be reopened before leaving a completed column", nil)
+	}
 	if assignee != "" {
 		if _, err := s.GetActor(ctx, assignee); err != nil {
 			return Task{}, invalid("assignee actor not found", nil)
@@ -391,8 +603,8 @@ func (s *Store) UpdateTaskWithClaimOverride(ctx context.Context, id string, inpu
 		}
 	}
 	err = s.withTx(ctx, func(tx *sql.Tx) error {
-		query := `UPDATE tasks SET title=?, description=?, priority=?, column_id=?, position=?, assignee_id=NULLIF(?, ''), due_at=NULLIF(?, ''), version=version+1, completed_at=?, updated_at=? WHERE id=? AND version=? AND deleted_at IS NULL`
-		args := []any{title, description, priority, columnID, position, assignee, dueAt, completedAt, updated, id, expected}
+		query := `UPDATE tasks SET kind=?, title=?, description=?, priority=?, column_id=?, position=?, assignee_id=NULLIF(?, ''), due_at=NULLIF(?, ''), version=version+1, completed_at=?, updated_at=? WHERE id=? AND version=? AND deleted_at IS NULL`
+		args := []any{kind, title, description, priority, columnID, position, assignee, dueAt, completedAt, updated, id, expected}
 		if !allowClaimOverride {
 			query += ` AND (claimed_by IS NULL OR claim_expires_at IS NULL OR julianday(claim_expires_at) <= julianday(?) OR claimed_by=?)`
 			args = append(args, updated, actorID)
@@ -419,8 +631,26 @@ func (s *Store) UpdateTaskWithClaimOverride(ctx context.Context, id string, inpu
 				return err
 			}
 		}
-		_, err = insertEvent(ctx, tx, "task.updated", actorID, current.ProjectID, id, map[string]any{"version": expected + 1})
-		return err
+		if current.Kind == defaultTaskKind && kind == bugKind {
+			if err := insertBugDetailsTx(ctx, tx, id, actorID, *validated.Bug); err != nil {
+				return err
+			}
+		} else if kind == bugKind && bugMutation {
+			if err := updateBugDetailsTx(ctx, tx, id, *validated.Bug); err != nil {
+				return err
+			}
+		}
+		taskMutation := validated.Title != nil || validated.Description != nil || validated.Priority != nil || validated.ColumnID != nil || validated.Position != nil || validated.AssigneeSet || validated.DueAtSet || validated.LabelsSet || kind != current.Kind
+		if taskMutation {
+			if _, err = insertEvent(ctx, tx, "task.updated", actorID, current.ProjectID, id, map[string]any{"version": expected + 1}); err != nil {
+				return err
+			}
+		}
+		if kind == bugKind && (bugMutation || current.Kind != kind) {
+			_, err = insertEvent(ctx, tx, "bug.updated", actorID, current.ProjectID, id, map[string]any{"version": expected + 1})
+			return err
+		}
+		return nil
 	})
 	if err != nil {
 		return Task{}, err
@@ -724,6 +954,12 @@ func (s *Store) transitionTask(ctx context.Context, id, actorID string, expected
 	current, err := s.GetTask(ctx, id)
 	if err != nil {
 		return Task{}, err
+	}
+	if current.Kind == bugKind && state == "completed" {
+		return Task{}, invalid("bugs must be completed with a resolution", nil)
+	}
+	if current.Kind == bugKind && current.Bug != nil && current.Bug.Resolution != nil && state != "completed" {
+		return Task{}, invalid("resolved bugs must be reopened before leaving a completed column", nil)
 	}
 	column, err := s.StateColumn(ctx, current.ProjectID, state)
 	if err != nil {

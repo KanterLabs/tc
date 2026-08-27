@@ -1,4 +1,4 @@
-import type { Column, Project, Task } from './types';
+import type { BugSeverity, Column, Project, Task } from './types';
 
 export interface BoardFilters {
   query: string;
@@ -6,6 +6,11 @@ export interface BoardFilters {
   label: string;
   assignee: string;
   state: string;
+  /** Issue filters remain optional so existing board callers stay source-compatible. */
+  kind?: string;
+  severity?: string;
+  reporter?: string;
+  resolution?: string;
 }
 
 export function actorId(value: Task['assignee'] | Task['claimed_by']): string {
@@ -18,17 +23,44 @@ export function actorName(value: Task['assignee'] | Task['claimed_by']): string 
   return typeof value === 'string' ? value : value.name;
 }
 
+export function bugReporterId(task: Task): string {
+  return task.bug?.reporter_id || '';
+}
+
+export function bugSeverity(task: Task): BugSeverity | '' {
+  return task.bug?.severity || '';
+}
+
+export function bugResolution(task: Task): string {
+  return task.bug?.resolution || '';
+}
+
 export function filterTasks(tasks: Task[], columns: Column[], filters: BoardFilters): Task[] {
   const query = filters.query.trim().toLowerCase();
   const columnById = new Map(columns.map((column) => [column.id, column]));
   return tasks.filter((task) => {
     const column = columnById.get(task.column_id);
-    if (query && !`${task.key} ${task.title} ${task.description ?? ''}`.toLowerCase().includes(query)) return false;
+    if (
+      query &&
+      !`${task.key} ${task.title} ${task.description ?? ''} ${task.bug?.actual_behavior ?? ''} ${task.bug?.expected_behavior ?? ''} ${task.bug?.reproduction_steps ?? ''} ${task.bug?.environment ?? ''} ${task.bug?.affected_version ?? ''}`
+        .toLowerCase()
+        .includes(query)
+    ) return false;
     if (filters.priority !== 'all' && task.priority !== filters.priority) return false;
     if (filters.state !== 'all' && column?.semantic_state !== filters.state) return false;
     if (filters.assignee !== 'all' && actorId(task.assignee) !== filters.assignee) return false;
     if (filters.label !== 'all' && !(task.labels ?? []).some((label) => label.id === filters.label || label.name === filters.label)) {
       return false;
+    }
+    if (filters.kind && filters.kind !== 'all' && (task.kind || 'task') !== filters.kind) return false;
+    if (filters.severity && filters.severity !== 'all') {
+      if ((filters.severity === 'untriaged' || filters.severity === 'none') && bugSeverity(task)) return false;
+      if (filters.severity !== 'untriaged' && filters.severity !== 'none' && bugSeverity(task) !== filters.severity) return false;
+    }
+    if (filters.reporter && filters.reporter !== 'all' && bugReporterId(task) !== filters.reporter) return false;
+    if (filters.resolution && filters.resolution !== 'all') {
+      if ((filters.resolution === 'open' || filters.resolution === 'unresolved' || filters.resolution === 'none') && bugResolution(task)) return false;
+      if (filters.resolution !== 'open' && filters.resolution !== 'unresolved' && filters.resolution !== 'none' && bugResolution(task) !== filters.resolution) return false;
     }
     return true;
   });

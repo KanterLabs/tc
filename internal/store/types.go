@@ -113,6 +113,7 @@ type Task struct {
 	Number         int     `json:"number"`
 	Key            string  `json:"key"`
 	ProjectID      string  `json:"project_id"`
+	Kind           string  `json:"kind"`
 	ColumnID       string  `json:"column_id"`
 	Title          string  `json:"title"`
 	Description    string  `json:"description"`
@@ -128,6 +129,68 @@ type Task struct {
 	UpdatedAt      string  `json:"updated_at"`
 	Labels         []Label `json:"labels"`
 	CommentCount   int     `json:"comment_count"`
+	Bug            *Bug    `json:"bug,omitempty"`
+}
+
+// Bug contains the typed metadata associated with a bug task. The detail row
+// is deliberately kept separate from tasks so existing task rows and clients
+// remain valid while a bug can still carry a richer lifecycle than a task.
+// Severity and resolution are nullable until triage/resolution respectively.
+type Bug struct {
+	ReporterID        string  `json:"reporter_id"`
+	Severity          *string `json:"severity,omitempty"`
+	ActualBehavior    string  `json:"actual_behavior"`
+	ExpectedBehavior  string  `json:"expected_behavior,omitempty"`
+	ReproductionSteps string  `json:"reproduction_steps,omitempty"`
+	Environment       string  `json:"environment,omitempty"`
+	AffectedVersion   string  `json:"affected_version,omitempty"`
+	Resolution        *string `json:"resolution,omitempty"`
+	ResolvedBy        *string `json:"resolved_by,omitempty"`
+	ResolvedAt        *string `json:"resolved_at,omitempty"`
+	DuplicateOf       *string `json:"duplicate_of,omitempty"`
+}
+
+// BugDetails is retained as an alias for callers that prefer the persistence
+// terminology. Task.Bug uses the shorter API-facing Bug name.
+type BugDetails = Bug
+
+// BugInput is the patch/create shape for bug metadata. Set flags distinguish
+// an omitted field from an explicit JSON null, which is important for nullable
+// severity and for clearing optional text on a patch.
+type BugInput struct {
+	Severity             *string
+	SeveritySet          bool
+	ActualBehavior       *string
+	ActualBehaviorSet    bool
+	ExpectedBehavior     *string
+	ExpectedBehaviorSet  bool
+	ReproductionSteps    *string
+	ReproductionStepsSet bool
+	Environment          *string
+	EnvironmentSet       bool
+	AffectedVersion      *string
+	AffectedVersionSet   bool
+}
+
+// TriageBugInput changes only the pre-resolution severity. A nil severity is
+// accepted when SeveritySet is true to explicitly return a bug to an
+// untriaged state.
+type TriageBugInput struct {
+	Severity    *string
+	SeveritySet bool
+	Priority    *string
+	Assignee    *string
+	AssigneeSet bool
+	ColumnID    *string
+}
+
+// ResolveBugInput supplies the terminal resolution. DuplicateOf is required
+// when Resolution is "duplicate" and ignored/forbidden for other resolutions.
+type ResolveBugInput struct {
+	Resolution     string
+	DuplicateOf    *string
+	DuplicateOfSet bool
+	Note           string
 }
 
 type Comment struct {
@@ -156,8 +219,15 @@ type TaskFilter struct {
 	Priority     string
 	Label        string
 	Assignee     string
+	Kind         string
+	Severity     string
+	Reporter     string
+	Resolution   string
 	Query        string
 	UpdatedAfter *time.Time
+	// ProjectIDs restricts global issue listings to an explicit allow-list.
+	// A non-nil empty slice intentionally matches no projects.
+	ProjectIDs []string
 	// Cursor is an opaque row offset for task and my-work listings. Event
 	// cursors remain monotonic database cursors via EventFilter.After.
 	Cursor int
@@ -287,7 +357,7 @@ func labelFromRow(scanner interface{ Scan(...any) error }) (Label, error) {
 func taskFromRow(scanner interface{ Scan(...any) error }) (Task, error) {
 	var t Task
 	var assignee, claimed, claimExpiry, due, completed sql.NullString
-	if err := scanner.Scan(&t.ID, &t.Number, &t.ProjectID, &t.ColumnID, &t.Title, &t.Description, &t.Priority, &t.Position, &assignee, &claimed, &claimExpiry, &due, &t.Version, &completed, &t.CreatedAt, &t.UpdatedAt); err != nil {
+	if err := scanner.Scan(&t.ID, &t.Number, &t.ProjectID, &t.Kind, &t.ColumnID, &t.Title, &t.Description, &t.Priority, &t.Position, &assignee, &claimed, &claimExpiry, &due, &t.Version, &completed, &t.CreatedAt, &t.UpdatedAt); err != nil {
 		return Task{}, err
 	}
 	t.Key = "" // populated by callers because it requires a project key.
@@ -295,7 +365,7 @@ func taskFromRow(scanner interface{ Scan(...any) error }) (Task, error) {
 	return t, nil
 }
 
-const taskColumns = `t.id, t.number, t.project_id, t.column_id, t.title, t.description,
+const taskColumns = `t.id, t.number, t.project_id, t.kind, t.column_id, t.title, t.description,
 	t.priority, t.position, t.assignee_id, t.claimed_by, t.claim_expires_at, t.due_at,
 	t.version, t.completed_at, t.created_at, t.updated_at`
 
