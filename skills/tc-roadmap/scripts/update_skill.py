@@ -7,6 +7,7 @@ import argparse
 import json
 import os
 import shutil
+import string
 import subprocess
 import sys
 import tempfile
@@ -56,8 +57,40 @@ def _validate_source(source: Path) -> None:
         raise UpdateError("GitHub checkout contains an invalid TC Roadmap skill")
 
 
-def install_from_source(source: Path, target: Path) -> None:
+def _read_installed_revision(target: Path) -> str:
+    marker = target / ".source-revision"
+    if target.is_symlink() or marker.is_symlink():
+        return ""
+    try:
+        _validate_source(target)
+    except (UpdateError, OSError, UnicodeError):
+        return ""
+    try:
+        revision = marker.read_text(encoding="utf-8").strip().lower()
+    except (OSError, UnicodeError):
+        return ""
+    if len(revision) not in {40, 64} or any(character not in string.hexdigits for character in revision):
+        return ""
+    return revision
+
+
+def _remote_revision(repository: str) -> str:
+    output = _run(["git", "ls-remote", "--exit-code", "--", repository, "refs/heads/main"])
+    lines = [line.split() for line in output.splitlines() if line.strip()]
+    matches = [parts[0].lower() for parts in lines if len(parts) == 2 and parts[1] == "refs/heads/main"]
+    if len(matches) != 1 or len(matches[0]) not in {40, 64} or any(
+        character not in string.hexdigits for character in matches[0]
+    ):
+        raise UpdateError("GitHub returned an invalid main revision")
+    return matches[0]
+
+
+def install_from_source(source: Path, target: Path, *, revision: str = "") -> None:
     _validate_source(source)
+    if revision and (
+        len(revision) not in {40, 64} or any(character not in string.hexdigits for character in revision)
+    ):
+        raise UpdateError("refusing to record an invalid source revision")
     parent = target.parent
     parent.mkdir(parents=True, exist_ok=True)
     if target.name != "tc-roadmap" or parent.name != "skills":
@@ -66,6 +99,8 @@ def install_from_source(source: Path, target: Path) -> None:
         stage_root = Path(raw_stage)
         stage = stage_root / "tc-roadmap"
         shutil.copytree(source, stage)
+        if revision:
+            (stage / ".source-revision").write_text(revision + "\n", encoding="utf-8")
         backup = stage_root / "previous"
         replaced = False
         try:
@@ -79,9 +114,12 @@ def install_from_source(source: Path, target: Path) -> None:
             raise
 
 
-def update(repository: str, target: Path) -> str:
+def update(repository: str, target: Path) -> tuple[bool, str]:
     if repository != DEFAULT_REPOSITORY:
         raise UpdateError("refusing to update from an untrusted repository")
+    remote_revision = _remote_revision(repository)
+    if _read_installed_revision(target) == remote_revision:
+        return False, remote_revision
     with tempfile.TemporaryDirectory(prefix="tc-roadmap-fetch-") as raw_checkout:
         checkout = Path(raw_checkout) / "repo"
         _run(
@@ -102,8 +140,8 @@ def update(repository: str, target: Path) -> str:
         )
         _run(["git", "sparse-checkout", "set", "--", str(SKILL_SUBDIRECTORY)], cwd=checkout)
         revision = _run(["git", "rev-parse", "HEAD"], cwd=checkout)
-        install_from_source(checkout / SKILL_SUBDIRECTORY, target)
-        return revision
+        install_from_source(checkout / SKILL_SUBDIRECTORY, target, revision=revision)
+        return True, revision
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -116,8 +154,8 @@ def build_parser() -> argparse.ArgumentParser:
 def main() -> int:
     try:
         args = build_parser().parse_args()
-        revision = update(args.repository, args.target.expanduser())
-        json.dump({"updated": True, "revision": revision}, sys.stdout, separators=(",", ":"))
+        updated, revision = update(args.repository, args.target.expanduser())
+        json.dump({"updated": updated, "revision": revision}, sys.stdout, separators=(",", ":"))
         sys.stdout.write("\n")
         return 0
     except (UpdateError, OSError) as exc:

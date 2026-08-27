@@ -38,6 +38,21 @@ Use TC as the durable project record for substantive work. The chat plan is temp
 
 4. Keep the returned task key. Mention it in normal progress updates when useful.
 
+For planning work that should remain unclaimed in Backlog, create a separate,
+implementation-sized card with acceptance criteria:
+
+```sh
+python3 scripts/tc_roadmap.py backlog \
+  --project TC \
+  --title "Show live agent progress on task cards" \
+  --goal "Make active agent work understandable without opening activity" \
+  --step "Show agent, phase, checkpoint count, and last update" \
+  --operation-id "stable-planning-item-id"
+```
+
+Do not use `backlog` for the work currently being performed; the current
+workstream still needs one active, claimed task.
+
 If the correct project is missing or credentials do not permit the work, report that clearly and continue the underlying task when safe. Do not widen token scopes or create credentials without Shane's authorization.
 
 ## Keep progress current
@@ -47,11 +62,23 @@ Post only meaningful milestones, decisions, validation results, and scope change
 ```sh
 python3 scripts/tc_roadmap.py progress \
   --task TC-1 \
+  --state working \
+  --phase "Updater" \
+  --completed 1 \
+  --total 3 \
   --message "Skill validation passed; installing the session updater next" \
+  --next "Verify a no-op update" \
   --operation-id "stable-session-local-id"
 ```
 
 Do not post narration, secrets, raw logs, customer data, tokens, local credential paths, or prompt contents. Update the Roadmap before a long external wait and after a material phase completes.
+
+Use the structured options when they are known so the in-progress experience
+can show a concise agent pulse without forcing Shane to read the full activity
+log. States are `working`, `waiting`, `verifying`, and `handoff`. Counts must be
+measurable checkpoints, not an invented percentage or ETA. Keep the message to
+the result or decision and `--next` to the next concrete action. Use plain
+`--message` for backward compatibility when structured context is unavailable.
 
 ## Finish
 

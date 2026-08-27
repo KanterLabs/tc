@@ -215,6 +215,27 @@ def cmd_start(client: Client, args: argparse.Namespace) -> Any:
     return {"task": claimed, "operation_id": args.operation_id}
 
 
+def cmd_backlog(client: Client, args: argparse.Namespace) -> Any:
+    project = _project(client, args.project)
+    project_id = str(project["id"])
+    columns, _ = client.call("GET", f"/projects/{parse.quote(project_id, safe='')}/columns?limit=200")
+    backlog = next((item for item in _data(columns) if item.get("semantic_state") == "backlog"), None)
+    if not backlog:
+        raise RoadmapError(f"project has no backlog column: {args.project}")
+    description = "Goal: " + args.goal.strip()
+    if args.step:
+        description += "\n\nAcceptance criteria\n" + "\n".join(f"- [ ] {step.strip()}" for step in args.step)
+    created, _ = client.call(
+        "POST",
+        f"/projects/{parse.quote(project_id, safe='')}/tasks",
+        body={"title": args.title.strip(), "description": description, "column_id": backlog["id"], "priority": args.priority},
+        idempotency_key=_idempotency(args.operation_id, "create-backlog"),
+    )
+    if not isinstance(created, dict) or not isinstance(created.get("version"), int):
+        raise RoadmapError("TC Roadmap returned an unexpected created task")
+    return {"task": created, "operation_id": args.operation_id}
+
+
 def cmd_resume(client: Client, args: argparse.Namespace) -> Any:
     current = _task(client, args.task)
     action = "renew" if current.get("claimed_by") else "claim"
@@ -230,13 +251,36 @@ def cmd_resume(client: Client, args: argparse.Namespace) -> Any:
 
 def cmd_progress(client: Client, args: argparse.Namespace) -> Any:
     current = _task(client, args.task)
+    message = _progress_message(args)
     comment, _ = client.call(
         "POST",
         "/tasks/" + parse.quote(str(current["id"]), safe="") + "/comments",
-        body={"body": args.message.strip()},
-        idempotency_key=_idempotency(args.operation_id, "progress", args.message.strip()),
+        body={"body": message},
+        idempotency_key=_idempotency(args.operation_id, "progress", message),
     )
     return {"task": current.get("key", current["id"]), "comment": comment}
+
+
+def _progress_message(args: argparse.Namespace) -> str:
+    completed = args.completed
+    total = args.total
+    if (completed is None) != (total is None):
+        raise RoadmapError("completed and total must be provided together")
+    if completed is not None and (total < 1 or completed < 0 or completed > total):
+        raise RoadmapError("progress must satisfy 0 <= completed <= total and total >= 1")
+    if not any((args.state, args.phase, args.next_step, completed is not None)):
+        return args.message.strip()
+    heading = ["Agent update"]
+    if args.state:
+        heading.append(args.state.capitalize())
+    if args.phase:
+        heading.append(args.phase.strip())
+    if completed is not None:
+        heading.append(f"{completed}/{total}")
+    lines = [" · ".join(heading), "", args.message.strip()]
+    if args.next_step:
+        lines.extend(("", "Next: " + args.next_step.strip()))
+    return "\n".join(lines)
 
 
 def _action(client: Client, args: argparse.Namespace, action: str, field: str) -> Any:
@@ -274,6 +318,15 @@ def build_parser() -> argparse.ArgumentParser:
     start.add_argument("--operation-id", required=True)
     start.set_defaults(handler=cmd_start)
 
+    backlog = subparsers.add_parser("backlog", help="Create an unclaimed backlog task")
+    backlog.add_argument("--project", required=True)
+    backlog.add_argument("--title", required=True)
+    backlog.add_argument("--goal", required=True)
+    backlog.add_argument("--step", action="append", default=[])
+    backlog.add_argument("--priority", choices=("low", "normal", "high", "urgent"), default="normal")
+    backlog.add_argument("--operation-id", required=True)
+    backlog.set_defaults(handler=cmd_backlog)
+
     resume = subparsers.add_parser("resume", help="Claim or renew an existing task")
     resume.add_argument("--task", required=True)
     resume.add_argument("--lease-seconds", type=int, choices=range(30, 604801), default=604800)
@@ -283,6 +336,11 @@ def build_parser() -> argparse.ArgumentParser:
     progress = subparsers.add_parser("progress", help="Post a meaningful progress comment")
     progress.add_argument("--task", required=True)
     progress.add_argument("--message", required=True)
+    progress.add_argument("--state", choices=("working", "waiting", "verifying", "handoff"))
+    progress.add_argument("--phase")
+    progress.add_argument("--completed", type=int)
+    progress.add_argument("--total", type=int)
+    progress.add_argument("--next", dest="next_step")
     progress.add_argument("--operation-id", required=True)
     progress.set_defaults(handler=cmd_progress)
 
