@@ -1,0 +1,41 @@
+name: roadmap
+
+services:
+  roadmap:
+    # A local `docker compose up --build` uses the source tree.  Production
+    # deployments set ROADMAP_IMAGE to the immutable SHA-tagged image.
+    image: ${ROADMAP_IMAGE:-roadmap:local}
+    build:
+      context: .
+      dockerfile: Dockerfile
+    init: true
+    restart: unless-stopped
+    stop_grace_period: 20s
+    ports:
+      - "127.0.0.1:8080:8080"
+    environment:
+      ROADMAP_ADDR: ${ROADMAP_ADDR:-0.0.0.0:8080}
+      ROADMAP_DB: ${ROADMAP_DB:-/data/roadmap.db}
+      ROADMAP_AUTH_MODE: ${ROADMAP_AUTH_MODE:-local}
+      ROADMAP_PUBLIC_ORIGIN: ${ROADMAP_PUBLIC_ORIGIN:-http://localhost:8080}
+      ROADMAP_ADMIN_EMAIL: ${ROADMAP_ADMIN_EMAIL:-}
+      ROADMAP_SECURE_COOKIES: ${ROADMAP_SECURE_COOKIES:-false}
+      ROADMAP_DEMO_SEED: ${ROADMAP_DEMO_SEED:-true}
+    volumes:
+      - roadmap-data:/data
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=16m
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/roadmap", "healthcheck"]
+      interval: 30s
+      timeout: 3s
+      start_period: 10s
+      retries: 5
+
+volumes:
+  roadmap-data:

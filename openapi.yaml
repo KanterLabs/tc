@@ -1,0 +1,4167 @@
+openapi: 3.1.0
+jsonSchemaDialect: https://json-schema.org/draft/2020-12/schema
+info:
+  title: Roadmap API
+  version: 1.0.0
+  description: |
+    Stable JSON API for the Roadmap project board. Humans use a session
+    cookie or Cloudflare Access identity; agents use scoped bearer tokens.
+    Single-resource responses contain the resource directly. Collections use
+    a cursor-paginated object containing data and next_cursor. Collection
+    cursors are opaque URL-safe offsets and an empty next_cursor means that
+    there is no next page. Every response includes X-Request-ID; deployments
+    that provide a release revision also include X-Roadmap-Revision.
+    Cookie- and Cloudflare-authenticated mutations require an Origin that
+    exactly matches the configured public origin; bearer-token mutations do
+    not require Origin. Temporary bearer-authentication or request-body
+    admission saturation returns 503 with Retry-After.
+  license:
+    name: MIT
+    identifier: MIT
+servers:
+  - url: /
+    description: Current Roadmap server
+externalDocs:
+  description: Roadmap v1 API contract
+  url: docs/API_CONTRACT.md
+security:
+  - cookieAuth: []
+  - bearerAuth: []
+  - cloudflareAccess: []
+x-authentication-modes:
+  - local
+  - cloudflare
+  - disabled
+x-common-response-headers: &commonResponseHeaders
+  X-Request-ID:
+    $ref: '#/components/headers/XRequestID'
+  X-Roadmap-Revision:
+    $ref: '#/components/headers/XRoadmapRevision'
+x-resource-limits:
+  request_body_bytes: 2097152
+  agent_lifetime_mutation_budget_bytes: 67108864
+  bearer_requests_per_second: 20
+  bearer_burst: 40
+  bearer_mutations_per_second: 1
+  bearer_mutation_burst: 10
+tags:
+  - name: Health
+    description: Liveness, readiness, and API discovery
+  - name: Authentication
+    description: Local account, session, and deployment identity operations
+  - name: Projects
+    description: Projects and their board columns
+  - name: Columns
+    description: Ordered semantic board columns
+  - name: Tasks
+    description: Tasks, comments, labels, and task coordination actions
+  - name: Labels
+    description: Project labels
+  - name: My work
+    description: Tasks assigned to the authenticated actor
+  - name: Roadmap
+    description: Progress summaries and activity
+  - name: Events
+    description: Append-only event feed for incremental polling
+  - name: Agents
+    description: Agent identities and scoped API tokens
+paths:
+  /healthz:
+    get:
+      operationId: getHealth
+      summary: Check process liveness
+      description: Returns 200 when the HTTP process is alive. This endpoint does not require authentication.
+      tags:
+        - Health
+      security:
+        - {}
+      responses:
+        '200':
+          description: Process is alive
+          headers: *commonResponseHeaders
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HealthStatus'
+              example:
+                status: ok
+                service: roadmap
+                revision: 0123456789abcdef0123456789abcdef01234567
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+        '405':
+          $ref: '#/components/responses/MethodNotAllowed'
+
+  /readyz:
+    get:
+      operationId: getReadiness
+      summary: Check service readiness
+      description: Returns 200 when the database and required dependencies are ready to serve traffic.
+      tags:
+        - Health
+      security:
+        - {}
+      responses:
+        '200':
+          description: Service is ready
+          headers: *commonResponseHeaders
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HealthStatus'
+              example:
+                status: ok
+                service: roadmap
+                revision: 0123456789abcdef0123456789abcdef01234567
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+        '405':
+          $ref: '#/components/responses/MethodNotAllowed'
+
+  /health:
+    get:
+      operationId: getHealthAlias
+      summary: Check process liveness
+      description: Compatibility alias for /healthz. This endpoint does not require authentication.
+      tags:
+        - Health
+      security:
+        - {}
+      responses:
+        '200':
+          description: Process is alive
+          headers: *commonResponseHeaders
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HealthStatus'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+        '405':
+          $ref: '#/components/responses/MethodNotAllowed'
+
+  /ready:
+    get:
+      operationId: getReadinessAlias
+      summary: Check service readiness
+      description: Compatibility alias for /readyz. This endpoint does not require authentication.
+      tags:
+        - Health
+      security:
+        - {}
+      responses:
+        '200':
+          description: Service is ready
+          headers: *commonResponseHeaders
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HealthStatus'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+        '405':
+          $ref: '#/components/responses/MethodNotAllowed'
+
+  /openapi.json:
+    get:
+      operationId: getOpenApiDocument
+      summary: Fetch the OpenAPI document
+      description: Returns this contract as JSON for generated clients and contract tooling.
+      tags:
+        - Health
+      security:
+        - {}
+      responses:
+        '200':
+          description: OpenAPI document
+          headers: *commonResponseHeaders
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OpenApiDocument'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+        '405':
+          $ref: '#/components/responses/MethodNotAllowed'
+
+  /api/v1:
+    get:
+      operationId: getApiDiscovery
+      summary: Discover the Roadmap API
+      description: Returns the API name, version, and optional deployed revision.
+      tags:
+        - Health
+      security:
+        - {}
+      responses:
+        '200':
+          description: API discovery information
+          headers: *commonResponseHeaders
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiDiscovery'
+              example:
+                name: roadmap
+                version: v1
+                revision: 0123456789abcdef0123456789abcdef01234567
+        '405':
+          $ref: '#/components/responses/MethodNotAllowed'
+
+  /api/v1/auth/status:
+    get:
+      operationId: getAuthStatus
+      summary: Get authentication status
+      description: Public deployment status. `disabled` is intended only for development.
+      tags:
+        - Authentication
+      security:
+        - {}
+      responses:
+        '200':
+          description: Authentication mode and setup status
+          headers: *commonResponseHeaders
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AuthStatus'
+              examples:
+                localSetupRequired:
+                  value:
+                    mode: local
+                    configured: false
+                    setup_required: true
+                    authenticated: false
+                    actor: null
+                    user: null
+                localAuthenticated:
+                  value:
+                    mode: local
+                    configured: true
+                    setup_required: false
+                    authenticated: true
+                    actor:
+                      id: human_ada
+                      kind: human
+                      name: Ada Lovelace
+                      email: ada@example.com
+                      admin: true
+                      created_at: '2026-08-27T08:00:00Z'
+                      updated_at: '2026-08-27T10:00:00Z'
+                    user:
+                      id: human_ada
+                      kind: human
+                      name: Ada Lovelace
+                      email: ada@example.com
+                      admin: true
+                      created_at: '2026-08-27T08:00:00Z'
+                      updated_at: '2026-08-27T10:00:00Z'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+        '405':
+          $ref: '#/components/responses/MethodNotAllowed'
+
+  /api/v1/auth/setup:
+    post:
+      operationId: setupAuth
+      summary: Create the first local administrator
+      description: |
+        Initializes local authentication exactly once and returns the newly-created
+        administrator actor. `name` is optional and defaults to the local part of
+        the email. Sign in with the login route to establish a session. The
+        configured public Origin is required for this cookie-authentication
+        setup mutation. Missing, null, mistyped, malformed, or schema-invalid
+        fields return `400` (`invalid_request` or `invalid_json`).
+      tags:
+        - Authentication
+      security:
+        - {}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AuthSetupRequest'
+            example:
+              name: Ada Lovelace
+              email: ada@example.com
+              password: correct horse battery staple
+      responses:
+        '201':
+          description: Administrator created
+          headers: *commonResponseHeaders
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Actor'
+              examples:
+                actor:
+                  $ref: '#/components/examples/ActorExample'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '409':
+          description: Setup has already been completed
+          headers: *commonResponseHeaders
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              example:
+                error:
+                  code: setup_already_complete
+                  message: Authentication setup has already been completed
+                  details: {}
+        '413':
+          $ref: '#/components/responses/RequestTooLarge'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+
+  /api/v1/auth/login:
+    post:
+      operationId: login
+      summary: Sign in with a local account
+      description: |
+        Requires the configured public Origin; this route does not accept
+        Idempotency-Key. Missing, null, mistyped, malformed, or schema-invalid
+        fields return `400` (`invalid_request` or `invalid_json`). A syntactically
+        valid request with credentials that do not authenticate returns `401`
+        (`invalid_credentials`).
+      tags:
+        - Authentication
+      security:
+        - {}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/LoginRequest'
+            example:
+              email: ada@example.com
+              password: correct horse battery staple
+      responses:
+        '200':
+          description: Signed in
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/XRequestID'
+            X-Roadmap-Revision:
+              $ref: '#/components/headers/XRoadmapRevision'
+            Set-Cookie:
+              $ref: '#/components/headers/SetCookie'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Actor'
+              examples:
+                actor:
+                  $ref: '#/components/examples/ActorExample'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '401':
+          description: Credentials were not accepted
+          headers: *commonResponseHeaders
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              example:
+                error:
+                  code: invalid_credentials
+                  message: Email or password is incorrect
+                  details: {}
+        '413':
+          $ref: '#/components/responses/RequestTooLarge'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+
+  /api/v1/auth/logout:
+    post:
+      operationId: logout
+      summary: Sign out the current session
+      description: |
+        Clears the local session cookie. The route is intentionally callable
+        without a valid session, but cookie-authenticated callers must send
+        the configured public Origin. This route does not accept Idempotency-Key.
+      tags:
+        - Authentication
+      security:
+        - cookieAuth: []
+        - bearerAuth: []
+        - cloudflareAccess: []
+        - {}
+      responses:
+        '200':
+          description: Signed out
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/XRequestID'
+            X-Roadmap-Revision:
+              $ref: '#/components/headers/XRoadmapRevision'
+            Set-Cookie:
+              $ref: '#/components/headers/SetCookie'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OkResponse'
+              example:
+                ok: true
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '413':
+          $ref: '#/components/responses/RequestTooLarge'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+
+  /api/v1/auth/me:
+    get:
+      operationId: getCurrentActor
+      summary: Get the authenticated actor
+      tags:
+        - Authentication
+      responses:
+        '200':
+          description: Current human or agent actor
+          headers: *commonResponseHeaders
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Actor'
+              examples:
+                actor:
+                  $ref: '#/components/examples/ActorExample'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+
+  /api/v1/projects:
+    get:
+      operationId: listProjects
+      summary: List projects
+      tags:
+        - Projects
+      parameters:
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/Limit'
+        - name: archived
+          in: query
+          description: Include archived projects; defaults to false.
+          required: false
+          schema:
+            type: boolean
+            default: false
+        - name: favorite
+          in: query
+          description: Restrict results to favorite projects.
+          required: false
+          schema:
+            type: boolean
+      responses:
+        '200':
+          description: Cursor-paginated projects
+          headers: *commonResponseHeaders
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ProjectCollection'
+              examples:
+                projects:
+                  $ref: '#/components/examples/ProjectCollectionExample'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+    post:
+      operationId: createProject
+      summary: Create a project
+      tags:
+        - Projects
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ProjectCreateRequest'
+            example:
+              key: OPS
+              slug: operations
+              name: Operations
+              description: Work for the operations team.
+              color: '#2563EB'
+              favorite: true
+      responses:
+        '201':
+          description: |
+            Project created with the five default semantic columns. Humans and
+            bearer tokens with projects:read receive the full project; a
+            projects:write-only bearer receives only its id.
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/XRequestID'
+            X-Roadmap-Revision:
+              $ref: '#/components/headers/XRoadmapRevision'
+            Location:
+              $ref: '#/components/headers/Location'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ProjectMutationResponse'
+              examples:
+                project:
+                  $ref: '#/components/examples/ProjectExample'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '413':
+          $ref: '#/components/responses/RequestTooLarge'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '507':
+          $ref: '#/components/responses/InsufficientStorage'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+
+  /api/v1/projects/{project}:
+    parameters:
+      - $ref: '#/components/parameters/ProjectPath'
+    get:
+      operationId: getProject
+      summary: Get a project
+      tags:
+        - Projects
+      responses:
+        '200':
+          description: Project
+          headers: *commonResponseHeaders
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Project'
+              examples:
+                project:
+                  $ref: '#/components/examples/ProjectExample'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+    patch:
+      operationId: updateProject
+      summary: Update a project
+      description: |
+        An empty object or a body with no recognized project field returns 400.
+        Non-nullable properties reject explicit JSON `null`; string properties
+        enforce their declared length and format constraints.
+      tags:
+        - Projects
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ProjectPatchRequest'
+            example:
+              name: Platform Operations
+              favorite: true
+      responses:
+        '200':
+          description: |
+            Updated project. Humans and bearer tokens with projects:read
+            receive the full project; a projects:write-only bearer receives
+            only its id.
+          headers: *commonResponseHeaders
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ProjectMutationResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '413':
+          $ref: '#/components/responses/RequestTooLarge'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '507':
+          $ref: '#/components/responses/InsufficientStorage'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+
+  /api/v1/projects/{project}/columns:
+    parameters:
+      - $ref: '#/components/parameters/ProjectPath'
+    get:
+      operationId: listColumns
+      summary: List a project's ordered columns
+      tags:
+        - Columns
+      parameters:
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: Cursor-paginated columns in board order
+          headers: *commonResponseHeaders
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ColumnCollection'
+              example:
+                data:
+                  - id: col_backlog
+                    project_id: proj_ops
+                    name: Backlog
+                    semantic_state: backlog
+                    position: 0
+                    created_at: '2026-08-27T08:00:00Z'
+                    updated_at: '2026-08-27T08:00:00Z'
+                  - id: col_ready
+                    project_id: proj_ops
+                    name: Ready
+                    semantic_state: ready
+                    position: 1
+                    created_at: '2026-08-27T08:00:00Z'
+                    updated_at: '2026-08-27T08:00:00Z'
+                next_cursor: ''
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+    post:
+      operationId: createColumn
+      summary: Create a board column
+      description: Project creation creates the default columns; this route adds an additional ordered column.
+      tags:
+        - Columns
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ColumnCreateRequest'
+            example:
+              name: Review
+              semantic_state: active
+              position: 2
+      responses:
+        '201':
+          description: |
+            Column created. Humans and bearer tokens with projects:read
+            receive the full column; a projects:write-only bearer receives
+            only its id and project_id.
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/XRequestID'
+            X-Roadmap-Revision:
+              $ref: '#/components/headers/XRoadmapRevision'
+            Location:
+              $ref: '#/components/headers/Location'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ColumnMutationResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '413':
+          $ref: '#/components/responses/RequestTooLarge'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '507':
+          $ref: '#/components/responses/InsufficientStorage'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+
+  /api/v1/columns/{column}:
+    parameters:
+      - $ref: '#/components/parameters/ColumnPath'
+    patch:
+      operationId: updateColumn
+      summary: Update a board column
+      description: |
+        An empty object or a body with no recognized column field returns 400.
+        Non-nullable properties reject explicit JSON `null`; string properties
+        enforce their declared length and format constraints. A human
+        administrator may explicitly override an active task claim when
+        changing a column's semantic state; bearer tokens and ordinary human
+        actors cannot.
+      tags:
+        - Columns
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ColumnPatchRequest'
+            example:
+              name: In review
+              position: 2
+      responses:
+        '200':
+          description: |
+            Updated column. Humans and bearer tokens with projects:read
+            receive the full column; a projects:write-only bearer receives
+            only its id and project_id.
+          headers: *commonResponseHeaders
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ColumnMutationResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          description: |
+            The column cannot change semantic state while a task in it has an
+            active claim. Humans and bearer tokens with tasks:read retain
+            diagnostic claim details; bearer tokens without tasks:read receive
+            an empty details object.
+          headers: *commonResponseHeaders
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '413':
+          $ref: '#/components/responses/RequestTooLarge'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '507':
+          $ref: '#/components/responses/InsufficientStorage'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+    get:
+      operationId: getColumn
+      summary: Get a board column
+      tags:
+        - Columns
+      responses:
+        '200':
+          description: Board column
+          headers: *commonResponseHeaders
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Column'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+
+  /api/v1/projects/{project}/tasks:
+    parameters:
+      - $ref: '#/components/parameters/ProjectPath'
+    get:
+      operationId: listProjectTasks
+      summary: List tasks in a project
+      description: |
+        Results are ordered by column position and task position. `state`,
+        `column`, `priority`, `label`, `assignee`, `q`, and `updated_after`
+        can be combined. `state` filters by a column's semantic state. Supplied
+        scalar filters are single-valued; empty identifier/enum/timestamp values
+        and values outside their declared enum, format, or length are rejected
+        with `400`.
+      tags:
+        - Tasks
+      parameters:
+        - $ref: '#/components/parameters/TaskState'
+        - $ref: '#/components/parameters/ColumnFilter'
+        - $ref: '#/components/parameters/PriorityFilter'
+        - $ref: '#/components/parameters/LabelFilter'
+        - $ref: '#/components/parameters/AssigneeFilter'
+        - $ref: '#/components/parameters/SearchQuery'
+        - $ref: '#/components/parameters/UpdatedAfter'
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: Cursor-paginated tasks
+          headers: *commonResponseHeaders
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TaskCollection'
+              examples:
+                tasks:
+                  $ref: '#/components/examples/TaskCollectionExample'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+    post:
+      operationId: createTask
+      summary: Create a task
+      tags:
+        - Tasks
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/TaskCreateRequest'
+            example:
+              title: Add event polling
+              description: Implement incremental event polling for agents.
+              priority: high
+              column_id: col_ready
+              assignee_id: agent_ada
+              due_at: '2026-09-01T12:00:00Z'
+              label_ids:
+                - label_api
+      responses:
+        '201':
+          description: Task created; humans and bearer tokens with tasks:read receive the full task, while write-only bearer tokens receive only id/version metadata.
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/XRequestID'
+            X-Roadmap-Revision:
+              $ref: '#/components/headers/XRoadmapRevision'
+            Location:
+              $ref: '#/components/headers/Location'
+            ETag:
+              $ref: '#/components/headers/ETag'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TaskMutationResponse'
+              examples:
+                task:
+                  $ref: '#/components/examples/TaskExample'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '413':
+          $ref: '#/components/responses/RequestTooLarge'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '507':
+          $ref: '#/components/responses/InsufficientStorage'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+
+  /api/v1/tasks/{task}:
+    parameters:
+      - $ref: '#/components/parameters/TaskPath'
+    get:
+      operationId: getTask
+      summary: Get a task
+      tags:
+        - Tasks
+      responses:
+        '200':
+          description: Task with its current version
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/XRequestID'
+            X-Roadmap-Revision:
+              $ref: '#/components/headers/XRoadmapRevision'
+            ETag:
+              $ref: '#/components/headers/ETag'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Task'
+              examples:
+                task:
+                  $ref: '#/components/examples/TaskExample'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+    patch:
+      operationId: updateTask
+      summary: Update a task
+      description: |
+        Update one or more editable fields. Movement is represented by column_id
+        and position. An empty object or a body with no recognized task field
+        returns 400. Sending null for description, assignee (or assignee_id),
+        due_at, labels, or label_ids clears that nullable value; column_id,
+        column, position, title, and priority are non-null fields. A human
+        administrator may explicitly override an active claim for this
+        operation; bearer tokens and ordinary human actors cannot.
+      tags:
+        - Tasks
+      parameters:
+        - $ref: '#/components/parameters/IfMatch'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/TaskPatchRequest'
+            example:
+              priority: urgent
+              column_id: col_active
+              position: 0
+      responses:
+        '200':
+          description: Updated task; humans and bearer tokens with tasks:read receive the full task, while write-only bearer tokens receive only id/version metadata.
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/XRequestID'
+            X-Roadmap-Revision:
+              $ref: '#/components/headers/XRoadmapRevision'
+            ETag:
+              $ref: '#/components/headers/ETag'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TaskMutationResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/TaskMutationConflict'
+        '428':
+          $ref: '#/components/responses/PreconditionRequired'
+        '413':
+          $ref: '#/components/responses/RequestTooLarge'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '507':
+          $ref: '#/components/responses/InsufficientStorage'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+    delete:
+      operationId: deleteTask
+      summary: Delete a task
+      description: Human administrators may explicitly override an active claim; bearer tokens and ordinary human actors cannot.
+      tags:
+        - Tasks
+      parameters:
+        - $ref: '#/components/parameters/IfMatch'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      responses:
+        '204':
+          description: Task deleted
+          headers: *commonResponseHeaders
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/TaskMutationConflict'
+        '428':
+          $ref: '#/components/responses/PreconditionRequired'
+        '413':
+          $ref: '#/components/responses/RequestTooLarge'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '507':
+          $ref: '#/components/responses/InsufficientStorage'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+
+  /api/v1/tasks/{task}/comments:
+    parameters:
+      - $ref: '#/components/parameters/TaskPath'
+    get:
+      operationId: listTaskComments
+      summary: List comments on a task
+      tags:
+        - Tasks
+      parameters:
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: Chronological cursor-paginated comments
+          headers: *commonResponseHeaders
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CommentCollection'
+              example:
+                data:
+                  - id: comment_01
+                    task_id: task_42
+                    actor_id: human_ada
+                    body: Progress is now visible in the event feed.
+                    created_at: '2026-08-27T10:00:00Z'
+                    updated_at: '2026-08-27T10:00:00Z'
+                next_cursor: ''
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+    post:
+      operationId: createTaskComment
+      summary: Add a comment to a task
+      description: |
+        Supply body or its text alias. When body is empty or omitted, text is
+        used; when both are non-empty, body wins. At least one non-empty value
+        is required. The response contains the canonical body field.
+      tags:
+        - Tasks
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CommentCreateRequest'
+            example:
+              body: Progress is now visible in the event feed.
+      responses:
+        '201':
+          description: Comment created
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/XRequestID'
+            X-Roadmap-Revision:
+              $ref: '#/components/headers/XRoadmapRevision'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Comment'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '413':
+          $ref: '#/components/responses/RequestTooLarge'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '507':
+          $ref: '#/components/responses/InsufficientStorage'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+
+  /api/v1/tasks/{task}/claim:
+    parameters:
+      - $ref: '#/components/parameters/TaskPath'
+    post:
+      operationId: claimTask
+      summary: Claim a task
+      description: Atomically claim an unclaimed or expired task for the current actor.
+      tags:
+        - Tasks
+      parameters:
+        - $ref: '#/components/parameters/IfMatch'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ClaimRequest'
+            example:
+              lease_seconds: 1800
+      responses:
+        '200':
+          description: Task claimed by the current actor; humans and bearer tokens with tasks:read receive the full task, while claim-only bearer tokens receive only id/version metadata.
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/XRequestID'
+            X-Roadmap-Revision:
+              $ref: '#/components/headers/XRoadmapRevision'
+            ETag:
+              $ref: '#/components/headers/ETag'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TaskMutationResponse'
+              examples:
+                task:
+                  $ref: '#/components/examples/TaskClaimedExample'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '409':
+          description: |
+            The task is actively claimed by another actor or the supplied
+            version is stale. Humans and tokens with tasks:read may receive the
+            current task in error.details.current; write-only and claim-only
+            bearer tokens receive only id/version retry metadata.
+          headers: *commonResponseHeaders
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              example:
+                error:
+                  code: task_already_claimed
+                  message: Task is actively claimed by another actor
+                  details:
+                    current:
+                      id: task_42
+                      number: 42
+                      key: OPS-42
+                      project_id: proj_ops
+                      column_id: col_active
+                      title: Add event polling
+                      description: Implement incremental event polling for agents.
+                      priority: high
+                      position: 0
+                      assignee: agent_ada
+                      claimed_by: agent_other
+                      claim_expires_at: '2026-08-27T11:00:00Z'
+                      due_at: '2026-09-01T12:00:00Z'
+                      version: 7
+                      created_at: '2026-08-27T09:30:00Z'
+                      updated_at: '2026-08-27T10:30:00Z'
+                      labels: []
+                      comment_count: 1
+        '428':
+          $ref: '#/components/responses/PreconditionRequired'
+        '413':
+          $ref: '#/components/responses/RequestTooLarge'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '507':
+          $ref: '#/components/responses/InsufficientStorage'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+
+  /api/v1/tasks/{task}/renew:
+    parameters:
+      - $ref: '#/components/parameters/TaskPath'
+    post:
+      operationId: renewTaskClaim
+      summary: Renew a task claim
+      description: Only the current owner of an active lease may renew it.
+      tags:
+        - Tasks
+      parameters:
+        - $ref: '#/components/parameters/IfMatch'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ClaimRequest'
+            example:
+              lease_seconds: 1800
+      responses:
+        '200':
+          description: Claim renewed; humans and bearer tokens with tasks:read receive the full task, while claim-only bearer tokens receive only id/version metadata.
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/XRequestID'
+            X-Roadmap-Revision:
+              $ref: '#/components/headers/XRoadmapRevision'
+            ETag:
+              $ref: '#/components/headers/ETag'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TaskMutationResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '428':
+          $ref: '#/components/responses/PreconditionRequired'
+        '413':
+          $ref: '#/components/responses/RequestTooLarge'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '507':
+          $ref: '#/components/responses/InsufficientStorage'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+
+  /api/v1/tasks/{task}/release:
+    parameters:
+      - $ref: '#/components/parameters/TaskPath'
+    post:
+      operationId: releaseTaskClaim
+      summary: Release a task claim
+      description: Only the current owner may release an active lease.
+      tags:
+        - Tasks
+      parameters:
+        - $ref: '#/components/parameters/IfMatch'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      responses:
+        '200':
+          description: Claim released; humans and bearer tokens with tasks:read receive the full task, while claim-only bearer tokens receive only id/version metadata.
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/XRequestID'
+            X-Roadmap-Revision:
+              $ref: '#/components/headers/XRoadmapRevision'
+            ETag:
+              $ref: '#/components/headers/ETag'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TaskMutationResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '428':
+          $ref: '#/components/responses/PreconditionRequired'
+        '413':
+          $ref: '#/components/responses/RequestTooLarge'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '507':
+          $ref: '#/components/responses/InsufficientStorage'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+
+  /api/v1/tasks/{task}/complete:
+    parameters:
+      - $ref: '#/components/parameters/TaskPath'
+    post:
+      operationId: completeTask
+      summary: Complete a task
+      description: |
+        Moves the task to the project's completed semantic column. A human
+        administrator may explicitly override an active claim held by another
+        actor; bearer tokens and ordinary human actors cannot.
+      tags:
+        - Tasks
+      parameters:
+        - $ref: '#/components/parameters/IfMatch'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CompleteRequest'
+            example:
+              comment: Verified in production.
+      responses:
+        '200':
+          description: Completed task; humans and bearer tokens with tasks:read receive the full task, while claim-only bearer tokens receive only id/version metadata.
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/XRequestID'
+            X-Roadmap-Revision:
+              $ref: '#/components/headers/XRoadmapRevision'
+            ETag:
+              $ref: '#/components/headers/ETag'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TaskMutationResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '409':
+          $ref: '#/components/responses/StaleTask'
+        '428':
+          $ref: '#/components/responses/PreconditionRequired'
+        '413':
+          $ref: '#/components/responses/RequestTooLarge'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '507':
+          $ref: '#/components/responses/InsufficientStorage'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+
+  /api/v1/tasks/{task}/block:
+    parameters:
+      - $ref: '#/components/parameters/TaskPath'
+    post:
+      operationId: blockTask
+      summary: Block a task
+      description: |
+        Moves the task to the project's blocked semantic column. A human
+        administrator may explicitly override an active claim held by another
+        actor; bearer tokens and ordinary human actors cannot.
+      tags:
+        - Tasks
+      parameters:
+        - $ref: '#/components/parameters/IfMatch'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/BlockRequest'
+            example:
+              reason: Waiting for API credentials.
+      responses:
+        '200':
+          description: Blocked task; humans and bearer tokens with tasks:read receive the full task, while claim-only bearer tokens receive only id/version metadata.
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/XRequestID'
+            X-Roadmap-Revision:
+              $ref: '#/components/headers/XRoadmapRevision'
+            ETag:
+              $ref: '#/components/headers/ETag'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TaskMutationResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '409':
+          $ref: '#/components/responses/StaleTask'
+        '428':
+          $ref: '#/components/responses/PreconditionRequired'
+        '413':
+          $ref: '#/components/responses/RequestTooLarge'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '507':
+          $ref: '#/components/responses/InsufficientStorage'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+
+  /api/v1/projects/{project}/labels:
+    parameters:
+      - $ref: '#/components/parameters/ProjectPath'
+    get:
+      operationId: listLabels
+      summary: List project labels
+      tags:
+        - Labels
+      parameters:
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: Cursor-paginated labels
+          headers: *commonResponseHeaders
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/LabelCollection'
+              example:
+                data:
+                  - id: label_api
+                    project_id: proj_ops
+                    name: api
+                    color: '#2563EB'
+                    created_at: '2026-08-27T09:00:00Z'
+                    updated_at: '2026-08-27T09:00:00Z'
+                next_cursor: ''
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+    post:
+      operationId: createLabel
+      summary: Create a project label
+      tags:
+        - Labels
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/LabelCreateRequest'
+            example:
+              name: api
+              color: '#2563EB'
+      responses:
+        '201':
+          description: Label created
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/XRequestID'
+            X-Roadmap-Revision:
+              $ref: '#/components/headers/XRoadmapRevision'
+            Location:
+              $ref: '#/components/headers/Location'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Label'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '413':
+          $ref: '#/components/responses/RequestTooLarge'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '507':
+          $ref: '#/components/responses/InsufficientStorage'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+
+  /api/v1/labels/{label}:
+    parameters:
+      - $ref: '#/components/parameters/LabelPath'
+    delete:
+      operationId: deleteLabel
+      summary: Delete a project label
+      tags:
+        - Labels
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      responses:
+        '204':
+          description: Label deleted
+          headers: *commonResponseHeaders
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '413':
+          $ref: '#/components/responses/RequestTooLarge'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '507':
+          $ref: '#/components/responses/InsufficientStorage'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+
+  /api/v1/my-work:
+    get:
+      operationId: listMyWork
+      summary: List work assigned to the current actor
+      description: |
+        Returns tasks assigned to the authenticated actor across all projects,
+        or across the requested project. Results include assigned tasks and
+        tasks with an active claim owned by the actor. An unknown requested
+        project returns 404; a project-scoped token must name a project.
+      tags:
+        - My work
+      parameters:
+        - $ref: '#/components/parameters/TaskState'
+        - $ref: '#/components/parameters/PriorityFilter'
+        - $ref: '#/components/parameters/LabelFilter'
+        - $ref: '#/components/parameters/SearchQuery'
+        - $ref: '#/components/parameters/UpdatedAfter'
+        - name: project
+          in: query
+          description: Restrict work to a project ID, key, or slug.
+          required: false
+          schema:
+            $ref: '#/components/schemas/Identifier'
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: Cursor-paginated assigned tasks
+          headers: *commonResponseHeaders
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TaskCollection'
+              examples:
+                tasks:
+                  $ref: '#/components/examples/TaskCollectionExample'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+
+  /api/v1/roadmap:
+    get:
+      operationId: getRoadmap
+      summary: Get the global roadmap summary
+      description: |
+        Due-soon counts cover incomplete tasks due from now through the next
+        seven days. A project-scoped bearer token must supply the optional
+        `project` query parameter; without it this global aggregate returns 403.
+        Bearer tokens without tasks:read receive empty `upcoming` and
+        `upcoming_tasks` arrays; tokens without events:read receive an empty
+        `recent_activity` array. Project aggregates remain available with
+        projects:read.
+      tags:
+        - Roadmap
+      parameters:
+        - name: project
+          in: query
+          description: Optionally restrict the summary to a project ID, key, or slug.
+          required: false
+          schema:
+            $ref: '#/components/schemas/Identifier'
+      responses:
+        '200':
+          description: Progress across projects
+          headers: *commonResponseHeaders
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RoadmapResponse'
+              examples:
+                roadmap:
+                  $ref: '#/components/examples/GlobalRoadmapExample'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+
+  /api/v1/projects/{project}/roadmap:
+    parameters:
+      - $ref: '#/components/parameters/ProjectPath'
+    get:
+      operationId: getProjectRoadmap
+      summary: Get a project's roadmap summary
+      description: |
+        Due-soon counts cover incomplete tasks due from now through the next
+        seven days. Bearer tokens without tasks:read receive empty `upcoming`
+        and `upcoming_tasks` arrays; tokens without events:read receive an empty
+        `recent_activity` array. Project aggregates remain available with
+        projects:read.
+      tags:
+        - Roadmap
+      responses:
+        '200':
+          description: Project progress and activity
+          headers: *commonResponseHeaders
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RoadmapResponse'
+              examples:
+                roadmap:
+                  $ref: '#/components/examples/RoadmapExample'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+
+  /api/v1/events:
+    get:
+      operationId: listEvents
+      summary: Poll the append-only event feed
+      description: |
+        Supply `after` with the last integer cursor seen to receive subsequent
+        project, task, claim, comment, and completion events.
+      tags:
+        - Events
+      parameters:
+        - $ref: '#/components/parameters/AfterCursor'
+        - name: project
+          in: query
+          description: Restrict events to a project ID, key, or slug.
+          required: false
+          schema:
+            $ref: '#/components/schemas/Identifier'
+        - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: Events after the requested cursor
+          headers: *commonResponseHeaders
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/EventCollection'
+              examples:
+                events:
+                  $ref: '#/components/examples/EventCollectionExample'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+
+  /api/v1/agents:
+    get:
+      operationId: listAgents
+      summary: List agent actors
+      description: Human administrators only; bearer agent tokens are never accepted for administration.
+      tags:
+        - Agents
+      security:
+        - cookieAuth: []
+        - cloudflareAccess: []
+      parameters:
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/Limit'
+        - name: kind
+          in: query
+          description: Optional compatibility filter; only the agent kind is accepted for this route.
+          required: false
+          schema:
+            const: agent
+        - name: disabled
+          in: query
+          description: Include disabled agents; defaults to false.
+          required: false
+          schema:
+            type: boolean
+            default: false
+      responses:
+        '200':
+          description: Cursor-paginated agents
+          headers: *commonResponseHeaders
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AgentCollection'
+              examples:
+                agents:
+                  $ref: '#/components/examples/AgentCollectionExample'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+    post:
+      operationId: createAgent
+      summary: Create an agent actor
+      description: Agent actors have no email address; supply an optional description and project access ceiling.
+      tags:
+        - Agents
+      security:
+        - cookieAuth: []
+        - cloudflareAccess: []
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AgentCreateRequest'
+            example:
+              name: Build agent
+              project_ids:
+                - proj_ops
+      responses:
+        '201':
+          description: Agent created
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/XRequestID'
+            X-Roadmap-Revision:
+              $ref: '#/components/headers/XRoadmapRevision'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Agent'
+              examples:
+                agent:
+                  $ref: '#/components/examples/AgentExample'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '413':
+          $ref: '#/components/responses/RequestTooLarge'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+
+  /api/v1/agents/{agent}/tokens:
+    parameters:
+      - $ref: '#/components/parameters/AgentPath'
+    post:
+      operationId: createAgentToken
+      summary: Create a scoped agent token
+      description: |
+        The plaintext token is returned only in this response and is never
+        returned by later reads. This operation deliberately rejects an
+        Idempotency-Key because replay caching would retain the plaintext.
+      tags:
+        - Agents
+      security:
+        - cookieAuth: []
+        - cloudflareAccess: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/TokenCreateRequest'
+            example:
+              name: CI polling token
+              scopes:
+                - projects:read
+                - tasks:read
+                - tasks:claim
+                - events:read
+              project_ids:
+                - proj_ops
+              expires_at: '2027-01-01T00:00:00Z'
+      responses:
+        '201':
+          description: Token created; save the plaintext token now
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/XRequestID'
+            X-Roadmap-Revision:
+              $ref: '#/components/headers/XRoadmapRevision'
+            Location:
+              $ref: '#/components/headers/Location'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TokenCreated'
+              examples:
+                token:
+                  $ref: '#/components/examples/TokenCreatedExample'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '413':
+          $ref: '#/components/responses/RequestTooLarge'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+
+  /api/v1/tokens/{token}:
+    parameters:
+      - $ref: '#/components/parameters/TokenPath'
+    delete:
+      operationId: revokeToken
+      summary: Revoke an agent token
+      description: Human administrators only; bearer agent tokens are never accepted for administration.
+      tags:
+        - Agents
+      security:
+        - cookieAuth: []
+        - cloudflareAccess: []
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      responses:
+        '204':
+          description: Token revoked
+          headers: *commonResponseHeaders
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '413':
+          $ref: '#/components/responses/RequestTooLarge'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: opaque
+      description: 'Scoped agent token sent as `Authorization: Bearer <token>`. '
+      x-scopes:
+        - projects:read
+        - projects:write
+        - tasks:read
+        - tasks:write
+        - tasks:claim
+        - events:read
+    cookieAuth:
+      type: apiKey
+      in: cookie
+      name: roadmap_session
+      description: HttpOnly local human session cookie.
+    cloudflareAccess:
+      type: apiKey
+      in: header
+      name: Cf-Access-Jwt-Assertion
+      description: |
+        Compact RS256 JWT assertion injected by a protected Cloudflare Access
+        Tunnel. The server validates its signature, issuer, expiration, and
+        configured UI/API application audience before using its signed email
+        claim. Generic reverse-proxy identity headers are never accepted.
+  headers:
+    ETag:
+      description: Strong task version validator. Send this value as If-Match on the next mutation.
+      schema:
+        type: string
+        pattern: '^"v[1-9][0-9]*"$'
+      example: '"v7"'
+    Location:
+      description: URL of the newly-created resource.
+      schema:
+        type: string
+        format: uri-reference
+      example: /api/v1/tasks/task_42
+    SetCookie:
+      description: Session cookie update. Clients should honor its security attributes.
+      schema:
+        type: string
+      example: roadmap_session=opaque-session; Path=/; HttpOnly; SameSite=Lax
+    XRequestID:
+      description: Request correlation identifier generated by the server or accepted from the client.
+      schema:
+        type: string
+        minLength: 1
+        maxLength: 128
+      example: 5f4dcc3b5aa765d6
+    XRoadmapRevision:
+      description: Deployed Git revision, when the server was started with a release revision.
+      schema:
+        type: string
+        pattern: '^[0-9a-f]{40}$'
+      example: 0123456789abcdef0123456789abcdef01234567
+
+  parameters:
+    ProjectPath:
+      name: project
+      in: path
+      required: true
+      description: Project ID, key, or stable slug.
+      schema:
+        $ref: '#/components/schemas/Identifier'
+      example: operations
+    ColumnPath:
+      name: column
+      in: path
+      required: true
+      description: Opaque column ID.
+      schema:
+        $ref: '#/components/schemas/Identifier'
+      example: col_ready
+    TaskPath:
+      name: task
+      in: path
+      required: true
+      description: Opaque task ID or project-local task key such as OPS-42; task keys are matched case-insensitively.
+      schema:
+        $ref: '#/components/schemas/Identifier'
+      example: task_42
+    LabelPath:
+      name: label
+      in: path
+      required: true
+      description: Opaque label ID.
+      schema:
+        $ref: '#/components/schemas/Identifier'
+      example: label_api
+    AgentPath:
+      name: agent
+      in: path
+      required: true
+      description: Opaque agent actor ID.
+      schema:
+        $ref: '#/components/schemas/Identifier'
+      example: agent_ada
+    TokenPath:
+      name: token
+      in: path
+      required: true
+      description: Opaque API token ID.
+      schema:
+        $ref: '#/components/schemas/Identifier'
+      example: tok_01
+    Cursor:
+      name: cursor
+      in: query
+      required: false
+      description: |
+        Opaque cursor returned as next_cursor. Omit for the first page. For
+        collection routes this is a URL-safe base64 encoding of the next row
+        offset; a raw non-negative decimal offset is also accepted. An empty
+        next_cursor terminates pagination, but a supplied empty `cursor` is
+        invalid. Malformed, negative, or repeated values return 400. It is not
+        an event feed cursor.
+      schema:
+        type: string
+        minLength: 1
+      example: MjU
+    Limit:
+      name: limit
+      in: query
+      required: false
+      description: Number of records to return; defaults to 50, rejects non-positive values with 400, and values above 200 are capped at 200.
+      schema:
+        type: integer
+        minimum: 1
+        default: 50
+      example: 25
+    AfterCursor:
+      name: after
+      in: query
+      required: false
+      description: Return events with a monotonic cursor greater than this value; supplied empty, negative, malformed, or repeated values are invalid.
+      schema:
+        type: integer
+        format: int64
+        minimum: 0
+      example: 42
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: false
+      description: |
+        Client-generated key for safely retrying a mutation. Reusing the same
+        key with the same authenticated principal, method, path, and payload
+        replays the original response before mutable resource lookup, including
+        after the resource has been deleted or changed. Bearer-token retries
+        are isolated by token credential, even when tokens belong to the same
+        agent actor. Location and ETag from the original response are replayed;
+        using it for another request returns 409 Conflict. Authentication
+        setup, login, and logout do not accept this header, and secret token
+        issuance rejects it so plaintext cannot be replay-cached.
+      schema:
+        type: string
+        minLength: 1
+        maxLength: 255
+      example: 3d4f3b4c-3a14-4a84-a1f7-6a2d7ec5de8d
+    IfMatch:
+      name: If-Match
+      in: header
+      required: true
+      description: |
+        Exact last observed task ETag. The value must be quoted as "vN" with
+        N a positive decimal version. Missing If-Match returns 428, malformed
+        values return 400, and a stale version returns 409 with the current
+        task in error.details.current (reduced to id/version for bearer tokens
+        without tasks:read).
+      schema:
+        type: string
+        pattern: '^"v[1-9][0-9]*"$'
+      example: '"v7"'
+    TaskState:
+      name: state
+      in: query
+      required: false
+      description: Filter by the task column's semantic state.
+      schema:
+        $ref: '#/components/schemas/SemanticState'
+      example: ready
+    ColumnFilter:
+      name: column
+      in: query
+      required: false
+      description: Filter by column ID or case-insensitive column name.
+      schema:
+        $ref: '#/components/schemas/Identifier'
+      example: col_ready
+    PriorityFilter:
+      name: priority
+      in: query
+      required: false
+      description: Filter by task priority.
+      schema:
+        $ref: '#/components/schemas/Priority'
+      example: high
+    LabelFilter:
+      name: label
+      in: query
+      required: false
+      description: Filter by label ID or case-insensitive label name.
+      schema:
+        $ref: '#/components/schemas/Identifier'
+      example: label_api
+    AssigneeFilter:
+      name: assignee
+      in: query
+      required: false
+      description: Filter by assignee actor ID. Use `none` for unassigned tasks.
+      schema:
+        type: string
+        minLength: 1
+      example: agent_ada
+    SearchQuery:
+      name: q
+      in: query
+      required: false
+      description: Case-insensitive task title and description search; values longer than 200 characters are invalid.
+      schema:
+        type: string
+        maxLength: 200
+      example: event polling
+    UpdatedAfter:
+      name: updated_after
+      in: query
+      required: false
+      description: Return tasks updated after this UTC RFC 3339 timestamp.
+      schema:
+        $ref: '#/components/schemas/Timestamp'
+      example: '2026-08-27T00:00:00Z'
+
+  responses:
+    MethodNotAllowed:
+      description: HTTP method is not supported for this route
+      headers: *commonResponseHeaders
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          example:
+            error:
+              code: method_not_allowed
+              message: Method not allowed
+              details: {}
+    BadRequest:
+      description: Malformed request or unsupported parameter
+      headers: *commonResponseHeaders
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          examples:
+            badRequest:
+              $ref: '#/components/examples/BadRequestExample'
+    Unauthorized:
+      description: Authentication is required or credentials are invalid
+      headers: *commonResponseHeaders
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          examples:
+            unauthorized:
+              $ref: '#/components/examples/UnauthorizedExample'
+    Forbidden:
+      description: Authenticated actor lacks permission or token scope
+      headers: *commonResponseHeaders
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          examples:
+            forbidden:
+              $ref: '#/components/examples/ForbiddenExample'
+    NotFound:
+      description: Resource was not found
+      headers: *commonResponseHeaders
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          examples:
+            notFound:
+              $ref: '#/components/examples/NotFoundExample'
+    Conflict:
+      description: Request conflicts with current state or idempotency history
+      headers: *commonResponseHeaders
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          examples:
+            conflict:
+              $ref: '#/components/examples/ConflictExample'
+    StaleTask:
+      description: |
+        Task version is stale. Humans and tokens with tasks:read receive the
+        full current task in details.current; write-only and claim-only bearer
+        tokens receive only its id and version so read-protected fields are not
+        disclosed.
+      headers: *commonResponseHeaders
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/StaleTaskErrorResponse'
+          examples:
+            staleTask:
+              $ref: '#/components/examples/StaleTaskExample'
+    TaskMutationConflict:
+      description: |
+        Task mutation conflicts are either a stale task version, an active
+        claim held by another actor, or an idempotency key reused for a
+        different request. Human administrators may explicitly override an
+        active claim for task PATCH and DELETE; bearer tokens and ordinary
+        human actors cannot.
+      headers: *commonResponseHeaders
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/TaskMutationConflictErrorResponse'
+          examples:
+            staleTask:
+              $ref: '#/components/examples/StaleTaskExample'
+            taskAlreadyClaimed:
+              $ref: '#/components/examples/TaskAlreadyClaimedExample'
+            idempotencyKeyReused:
+              $ref: '#/components/examples/ConflictExample'
+    PreconditionRequired:
+      description: If-Match was missing from a task mutation (HTTP 428).
+      headers: *commonResponseHeaders
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          example:
+            error:
+              code: if_match_required
+              message: If-Match is required
+              details: {}
+    TooManyRequests:
+      description: |
+        Agent bearer rate limit exceeded. All bearer requests share an
+        actor-keyed bucket of 20 requests per second with a burst of 40;
+        mutations also share a 1 request per second bucket with a burst of 10.
+      headers:
+        X-Request-ID:
+          $ref: '#/components/headers/XRequestID'
+        X-Roadmap-Revision:
+          $ref: '#/components/headers/XRoadmapRevision'
+        Retry-After:
+          schema:
+            type: integer
+            minimum: 1
+          description: Number of seconds to wait before retrying.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          example:
+            error:
+              code: rate_limited
+              message: Too many requests
+              details:
+                retry_after_seconds: 30
+    InternalServerError:
+      description: Unexpected server error
+      headers: *commonResponseHeaders
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          examples:
+            internalError:
+              $ref: '#/components/examples/InternalErrorExample'
+    ServiceUnavailable:
+      description: Readiness failed or a bounded authentication/body admission pool is temporarily full.
+      headers:
+        X-Request-ID:
+          $ref: '#/components/headers/XRequestID'
+        X-Roadmap-Revision:
+          $ref: '#/components/headers/XRoadmapRevision'
+        Retry-After:
+          schema:
+            type: integer
+            minimum: 1
+          description: Present for temporary admission saturation.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          examples:
+            notReady:
+              value:
+                error:
+                  code: not_ready
+                  message: database unavailable
+                  details: {}
+            serverBusy:
+              value:
+                error:
+                  code: server_busy
+                  message: server is busy; retry later
+                  details: {}
+    RequestTooLarge:
+      description: Request body exceeded the 2 MiB server limit.
+      headers: *commonResponseHeaders
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          example:
+            error:
+              code: request_too_large
+              message: request body exceeds 2 MiB
+              details: {}
+    InsufficientStorage:
+      description: An agent's lifetime mutation resource budget is exhausted.
+      headers: *commonResponseHeaders
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          example:
+            error:
+              code: resource_limit
+              message: agent mutation resource budget exhausted
+              details:
+                operator_reset: ResetAgentMutationUsage
+
+  schemas:
+    Identifier:
+      type: string
+      minLength: 1
+      maxLength: 200
+      description: Opaque identifier. Clients must not infer its format.
+    Timestamp:
+      type: string
+      format: date-time
+      description: UTC RFC 3339 timestamp.
+      example: '2026-08-27T10:00:00Z'
+    NullableTimestamp:
+      type:
+        - string
+        - 'null'
+      format: date-time
+      description: UTC RFC 3339 timestamp, or null when not applicable.
+      example: null
+    AuthMode:
+      type: string
+      enum:
+        - local
+        - cloudflare
+        - disabled
+      description: Authentication mode configured by the deployment.
+    ActorKind:
+      type: string
+      enum:
+        - human
+        - agent
+    SemanticState:
+      type: string
+      enum:
+        - backlog
+        - ready
+        - active
+        - blocked
+        - completed
+    Priority:
+      type: string
+      enum:
+        - low
+        - normal
+        - high
+        - urgent
+    Color:
+      type: string
+      pattern: '^#[0-9A-Fa-f]{6}$'
+      description: Six-digit hexadecimal project or label color.
+      example: '#2563EB'
+    Scope:
+      type: string
+      enum:
+        - projects:read
+        - projects:write
+        - tasks:read
+        - tasks:write
+        - tasks:claim
+        - events:read
+
+    HealthStatus:
+      type: object
+      required:
+        - status
+      properties:
+        status:
+          type: string
+          enum:
+            - ok
+        service:
+          type: string
+          example: roadmap
+        revision:
+          type: string
+          pattern: '^[0-9a-f]{40}$'
+          description: Git commit deployed by the release pipeline, when supplied by the runtime.
+          example: 0123456789abcdef0123456789abcdef01234567
+      additionalProperties: false
+
+    ApiDiscovery:
+      type: object
+      required:
+        - name
+        - version
+      properties:
+        name:
+          const: roadmap
+        version:
+          const: v1
+        revision:
+          type: string
+          pattern: '^[0-9a-f]{40}$'
+          description: Git commit deployed by the release pipeline, when supplied by the runtime.
+      additionalProperties: false
+
+    OkResponse:
+      type: object
+      required:
+        - ok
+      properties:
+        ok:
+          const: true
+      additionalProperties: false
+
+    AuthStatus:
+      type: object
+      required:
+        - mode
+        - configured
+        - setup_required
+        - authenticated
+        - actor
+        - user
+      properties:
+        mode:
+          $ref: '#/components/schemas/AuthMode'
+        configured:
+          type: boolean
+          description: Whether an account is configured for the selected mode.
+        setup_required:
+          type: boolean
+        authenticated:
+          type: boolean
+        actor:
+          oneOf:
+            - $ref: '#/components/schemas/Actor'
+            - type: 'null'
+        user:
+          oneOf:
+            - $ref: '#/components/schemas/Actor'
+            - type: 'null'
+      additionalProperties: false
+
+    AuthSetupRequest:
+      type: object
+      required:
+        - email
+        - password
+      properties:
+        name:
+          type: string
+          minLength: 1
+          maxLength: 200
+        email:
+          type: string
+          format: email
+          maxLength: 320
+        password:
+          type: string
+          minLength: 12
+          writeOnly: true
+      additionalProperties: false
+
+    LoginRequest:
+      type: object
+      required:
+        - email
+        - password
+      properties:
+        email:
+          type: string
+          format: email
+          maxLength: 320
+        password:
+          type: string
+          minLength: 1
+          writeOnly: true
+      additionalProperties: false
+
+    Actor:
+      type: object
+      required:
+        - id
+        - kind
+        - name
+        - admin
+        - created_at
+        - updated_at
+      properties:
+        id:
+          $ref: '#/components/schemas/Identifier'
+        kind:
+          $ref: '#/components/schemas/ActorKind'
+        name:
+          type: string
+          minLength: 1
+          maxLength: 200
+        email:
+          type: string
+          format: email
+          maxLength: 320
+          description: Human account email; omitted for agent actors.
+        description:
+          type: string
+          maxLength: 10000
+          description: Optional actor description; omitted when empty.
+        admin:
+          type: boolean
+        disabled_at:
+          $ref: '#/components/schemas/Timestamp'
+        created_at:
+          $ref: '#/components/schemas/Timestamp'
+        updated_at:
+          $ref: '#/components/schemas/Timestamp'
+        project_ids:
+          type: array
+          uniqueItems: true
+          items:
+            $ref: '#/components/schemas/Identifier'
+          description: Project access ceiling for an agent actor; omitted when unrestricted.
+        tokens:
+          type: array
+          items:
+            $ref: '#/components/schemas/Token'
+          description: Token metadata for an agent actor; plaintext token values are never included here.
+      additionalProperties: false
+
+    Project:
+      type: object
+      required:
+        - id
+        - key
+        - slug
+        - name
+        - description
+        - color
+        - favorite
+        - created_at
+        - updated_at
+      properties:
+        id:
+          $ref: '#/components/schemas/Identifier'
+        key:
+          type: string
+          pattern: '^[A-Z][A-Z0-9_-]{0,15}$'
+          description: Short uppercase project key used in task references.
+          example: OPS
+        slug:
+          type: string
+          pattern: '^[a-z0-9][a-z0-9-]{0,63}$'
+          maxLength: 64
+          example: operations
+        name:
+          type: string
+          minLength: 1
+          maxLength: 200
+        description:
+          type: string
+          maxLength: 20000
+        color:
+          $ref: '#/components/schemas/Color'
+        favorite:
+          type: boolean
+        archived_at:
+          $ref: '#/components/schemas/Timestamp'
+        created_at:
+          $ref: '#/components/schemas/Timestamp'
+        updated_at:
+          $ref: '#/components/schemas/Timestamp'
+        task_count:
+          type: integer
+          minimum: 0
+        completed_task_count:
+          type: integer
+          minimum: 0
+        completed_count:
+          type: integer
+          minimum: 0
+        open_task_count:
+          type: integer
+          minimum: 0
+        overdue_task_count:
+          type: integer
+          minimum: 0
+        column_count:
+          type: integer
+          minimum: 0
+      additionalProperties: false
+
+    ProjectCreateRequest:
+      type: object
+      required:
+        - key
+        - name
+      properties:
+        key:
+          type: string
+          pattern: '^[A-Za-z][A-Za-z0-9_-]{0,15}$'
+          description: Normalized to uppercase by the runtime.
+          example: OPS
+        slug:
+          type: string
+          pattern: '^[A-Za-z0-9][A-Za-z0-9-]{0,63}$'
+          maxLength: 64
+          description: Optional stable URL slug; normalized to lowercase and generated from name when omitted.
+          example: operations
+        name:
+          type: string
+          minLength: 1
+          maxLength: 200
+        description:
+          type: string
+          maxLength: 20000
+          default: ''
+        color:
+          $ref: '#/components/schemas/Color'
+        favorite:
+          type: boolean
+          default: false
+      additionalProperties: false
+
+    ProjectPatchRequest:
+      type: object
+      minProperties: 1
+      properties:
+        name:
+          type: string
+          minLength: 1
+          maxLength: 200
+        description:
+          type: string
+          maxLength: 20000
+        key:
+          type: string
+          pattern: '^[A-Za-z][A-Za-z0-9_-]{0,15}$'
+          description: Normalized to uppercase by the runtime.
+        slug:
+          type: string
+          pattern: '^[A-Za-z0-9][A-Za-z0-9-]{0,63}$'
+          maxLength: 64
+          description: Normalized to lowercase by the runtime.
+        color:
+          $ref: '#/components/schemas/Color'
+        favorite:
+          type: boolean
+        archived:
+          type: boolean
+          description: Archive or restore the project.
+      additionalProperties: false
+
+    ProjectMutationSummary:
+      type: object
+      description: Reduced project mutation response for bearer tokens without projects:read.
+      required:
+        - id
+      properties:
+        id:
+          $ref: '#/components/schemas/Identifier'
+      additionalProperties: false
+
+    ProjectMutationResponse:
+      description: Full project for humans and projects:read tokens, or id-only metadata for projects:write-only bearer tokens.
+      oneOf:
+        - $ref: '#/components/schemas/Project'
+        - $ref: '#/components/schemas/ProjectMutationSummary'
+
+    Column:
+      type: object
+      required:
+        - id
+        - project_id
+        - name
+        - semantic_state
+        - position
+        - created_at
+        - updated_at
+      properties:
+        id:
+          $ref: '#/components/schemas/Identifier'
+        project_id:
+          $ref: '#/components/schemas/Identifier'
+        name:
+          type: string
+          minLength: 1
+          maxLength: 100
+        semantic_state:
+          $ref: '#/components/schemas/SemanticState'
+        position:
+          type: integer
+          minimum: 0
+        created_at:
+          $ref: '#/components/schemas/Timestamp'
+        updated_at:
+          $ref: '#/components/schemas/Timestamp'
+      additionalProperties: false
+
+    ColumnCreateRequest:
+      type: object
+      required:
+        - name
+        - semantic_state
+      properties:
+        name:
+          type: string
+          minLength: 1
+          maxLength: 100
+        semantic_state:
+          $ref: '#/components/schemas/SemanticState'
+        position:
+          type: integer
+          minimum: 0
+      additionalProperties: false
+
+    ColumnPatchRequest:
+      type: object
+      minProperties: 1
+      properties:
+        name:
+          type: string
+          minLength: 1
+          maxLength: 100
+        semantic_state:
+          $ref: '#/components/schemas/SemanticState'
+        position:
+          type: integer
+          minimum: 0
+      additionalProperties: false
+
+    ColumnMutationSummary:
+      type: object
+      description: Reduced column mutation response for bearer tokens without projects:read.
+      required:
+        - id
+        - project_id
+      properties:
+        id:
+          $ref: '#/components/schemas/Identifier'
+        project_id:
+          $ref: '#/components/schemas/Identifier'
+      additionalProperties: false
+
+    ColumnMutationResponse:
+      description: Full column for humans and projects:read tokens, or id/project_id metadata for projects:write-only bearer tokens.
+      oneOf:
+        - $ref: '#/components/schemas/Column'
+        - $ref: '#/components/schemas/ColumnMutationSummary'
+
+    Task:
+      type: object
+      required:
+        - id
+        - number
+        - key
+        - project_id
+        - column_id
+        - title
+        - description
+        - priority
+        - position
+        - version
+        - created_at
+        - updated_at
+        - labels
+        - comment_count
+      properties:
+        id:
+          $ref: '#/components/schemas/Identifier'
+        number:
+          type: integer
+          format: int64
+          minimum: 1
+          example: 42
+        key:
+          type: string
+          pattern: '^[A-Z][A-Z0-9_-]{0,15}-[1-9][0-9]*$'
+          example: OPS-42
+        project_id:
+          $ref: '#/components/schemas/Identifier'
+        column_id:
+          $ref: '#/components/schemas/Identifier'
+        title:
+          type: string
+          minLength: 1
+          maxLength: 500
+        description:
+          type: string
+          description: Markdown task description.
+          maxLength: 100000
+        priority:
+          $ref: '#/components/schemas/Priority'
+        position:
+          type: number
+          format: double
+          minimum: 0
+          maximum: 1000000000000
+        assignee:
+          $ref: '#/components/schemas/Identifier'
+          description: Assignee actor ID; omitted when unassigned.
+        claimed_by:
+          $ref: '#/components/schemas/Identifier'
+          description: Actor ID holding the current claim; omitted when unclaimed.
+        claim_expires_at:
+          $ref: '#/components/schemas/Timestamp'
+          description: Claim expiry; omitted when unclaimed.
+        due_at:
+          $ref: '#/components/schemas/Timestamp'
+          description: Due timestamp; omitted when no due date is set.
+        version:
+          type: integer
+          format: int64
+          minimum: 1
+          example: 7
+        created_at:
+          $ref: '#/components/schemas/Timestamp'
+        updated_at:
+          $ref: '#/components/schemas/Timestamp'
+        completed_at:
+          $ref: '#/components/schemas/Timestamp'
+          description: Completion timestamp; omitted until the task is completed.
+        labels:
+          type: array
+          items:
+            $ref: '#/components/schemas/Label'
+        comment_count:
+          type: integer
+          minimum: 0
+      additionalProperties: false
+
+    TaskMutationSummary:
+      type: object
+      description: Reduced task mutation response for bearer tokens without tasks:read.
+      required:
+        - id
+        - version
+      properties:
+        id:
+          $ref: '#/components/schemas/Identifier'
+        version:
+          type: integer
+          format: int64
+          minimum: 1
+      additionalProperties: false
+
+    TaskMutationResponse:
+      description: Full task for humans and tasks:read tokens, or id/version metadata for bearer tokens without tasks:read. The ETag remains the strong task version validator.
+      oneOf:
+        - $ref: '#/components/schemas/Task'
+        - $ref: '#/components/schemas/TaskMutationSummary'
+
+    TaskCreateRequest:
+      type: object
+      required:
+        - title
+      properties:
+        title:
+          type: string
+          minLength: 1
+          maxLength: 500
+        description:
+          type: string
+          maxLength: 100000
+          default: ''
+        column_id:
+          type: string
+          minLength: 1
+          description: Destination column; defaults to the project's backlog column.
+        column:
+          type: string
+          minLength: 1
+          description: Alias for column_id accepted by clients.
+        priority:
+          $ref: '#/components/schemas/Priority'
+          default: normal
+        position:
+          type: number
+          format: double
+          minimum: 0
+          maximum: 1000000000000
+        assignee_id:
+          type:
+            - string
+            - 'null'
+          minLength: 1
+        assignee:
+          type:
+            - string
+            - 'null'
+          minLength: 1
+        due_at:
+          $ref: '#/components/schemas/NullableTimestamp'
+        label_ids:
+          type:
+            - array
+            - 'null'
+          uniqueItems: true
+          items:
+            $ref: '#/components/schemas/Identifier'
+        labels:
+          type:
+            - array
+            - 'null'
+          uniqueItems: true
+          items:
+            $ref: '#/components/schemas/Identifier'
+      additionalProperties: false
+
+    TaskPatchRequest:
+      type: object
+      minProperties: 1
+      properties:
+        title:
+          type: string
+          minLength: 1
+          maxLength: 500
+        description:
+          type:
+            - string
+            - 'null'
+          maxLength: 100000
+          description: Markdown description; null clears it to an empty string.
+        column_id:
+          type: string
+          minLength: 1
+        column:
+          type: string
+          minLength: 1
+        position:
+          type: number
+          format: double
+          minimum: 0
+          maximum: 1000000000000
+        priority:
+          $ref: '#/components/schemas/Priority'
+        assignee_id:
+          type:
+            - string
+            - 'null'
+          minLength: 1
+          description: Assignee actor ID; null clears the assignee.
+        assignee:
+          type:
+            - string
+            - 'null'
+          minLength: 1
+          description: Alias for assignee_id; null clears the assignee.
+        due_at:
+          $ref: '#/components/schemas/NullableTimestamp'
+          description: Null clears the due timestamp.
+        label_ids:
+          type:
+            - array
+            - 'null'
+          uniqueItems: true
+          items:
+            $ref: '#/components/schemas/Identifier'
+        labels:
+          type:
+            - array
+            - 'null'
+          uniqueItems: true
+          items:
+            $ref: '#/components/schemas/Identifier'
+      additionalProperties: false
+
+    ClaimRequest:
+      type: object
+      description: Lease duration is optional; omitted duration defaults to 1800 seconds. Explicit values are inclusive from 30 through 604800 seconds.
+      properties:
+        lease_seconds:
+          type: integer
+          minimum: 30
+          maximum: 604800
+          default: 1800
+          description: Lease duration from the time the action is accepted.
+        duration_seconds:
+          type: integer
+          minimum: 30
+          maximum: 604800
+          description: Compatibility alias for lease_seconds.
+      additionalProperties: false
+
+    CompleteRequest:
+      type: object
+      properties:
+        comment:
+          type: string
+          maxLength: 10000
+          description: Optional Markdown completion note.
+      additionalProperties: false
+
+    BlockRequest:
+      type: object
+      properties:
+        reason:
+          type: string
+          maxLength: 10000
+          description: Optional Markdown explanation for blocking the task.
+      additionalProperties: false
+
+    Comment:
+      type: object
+      required:
+        - id
+        - task_id
+        - actor_id
+        - body
+        - created_at
+        - updated_at
+      properties:
+        id:
+          $ref: '#/components/schemas/Identifier'
+        task_id:
+          $ref: '#/components/schemas/Identifier'
+        actor_id:
+          $ref: '#/components/schemas/Identifier'
+        body:
+          type: string
+          minLength: 1
+          maxLength: 20000
+          description: Markdown comment body.
+        created_at:
+          $ref: '#/components/schemas/Timestamp'
+        updated_at:
+          $ref: '#/components/schemas/Timestamp'
+      additionalProperties: false
+
+    CommentCreateRequest:
+      type: object
+      description: |
+        Either body or text must contain a non-empty value. If both are
+        supplied and non-empty, body wins; an empty body falls back to text.
+      properties:
+        body:
+          type:
+            - string
+            - 'null'
+          maxLength: 20000
+          description: Markdown comment body.
+        text:
+          type:
+            - string
+            - 'null'
+          maxLength: 20000
+          description: Compatibility alias used when body is empty or omitted.
+      anyOf:
+        - required:
+            - body
+          properties:
+            body:
+              type: string
+              minLength: 1
+        - required:
+            - text
+          properties:
+            text:
+              type: string
+              minLength: 1
+      additionalProperties: false
+
+    Label:
+      type: object
+      required:
+        - id
+        - project_id
+        - name
+        - color
+        - created_at
+        - updated_at
+      properties:
+        id:
+          $ref: '#/components/schemas/Identifier'
+        project_id:
+          $ref: '#/components/schemas/Identifier'
+        name:
+          type: string
+          minLength: 1
+          maxLength: 100
+        color:
+          $ref: '#/components/schemas/Color'
+        created_at:
+          $ref: '#/components/schemas/Timestamp'
+        updated_at:
+          $ref: '#/components/schemas/Timestamp'
+      additionalProperties: false
+
+    LabelCreateRequest:
+      type: object
+      required:
+        - name
+      properties:
+        name:
+          type: string
+          minLength: 1
+          maxLength: 100
+        color:
+          oneOf:
+            - $ref: '#/components/schemas/Color'
+            - type: 'null'
+          default: '#94a3b8'
+          description: 'Optional label color; omitted or null uses #94a3b8.'
+      additionalProperties: false
+
+    Agent:
+      type: object
+      required:
+        - id
+        - kind
+        - name
+        - admin
+        - created_at
+        - updated_at
+      properties:
+        id:
+          $ref: '#/components/schemas/Identifier'
+        kind:
+          const: agent
+        name:
+          type: string
+          minLength: 1
+          maxLength: 200
+        admin:
+          type: boolean
+          const: false
+        disabled_at:
+          $ref: '#/components/schemas/Timestamp'
+        project_ids:
+          type: array
+          uniqueItems: true
+          items:
+            $ref: '#/components/schemas/Identifier'
+        created_at:
+          $ref: '#/components/schemas/Timestamp'
+        updated_at:
+          $ref: '#/components/schemas/Timestamp'
+        description:
+          type: string
+          maxLength: 10000
+        tokens:
+          type: array
+          items:
+            $ref: '#/components/schemas/Token'
+      additionalProperties: false
+
+    AgentCreateRequest:
+      type: object
+      required:
+        - name
+      properties:
+        name:
+          type: string
+          minLength: 1
+          maxLength: 200
+        description:
+          type: string
+          maxLength: 10000
+        project_ids:
+          type: array
+          uniqueItems: true
+          items:
+            $ref: '#/components/schemas/Identifier'
+          description: Non-empty project access ceiling for this agent; empty means any project.
+      additionalProperties: false
+
+    Token:
+      type: object
+      required:
+        - id
+        - agent_id
+        - actor_id
+        - name
+        - scopes
+        - project_ids
+        - created_at
+      properties:
+        id:
+          $ref: '#/components/schemas/Identifier'
+        agent_id:
+          $ref: '#/components/schemas/Identifier'
+        actor_id:
+          $ref: '#/components/schemas/Identifier'
+        name:
+          type: string
+          minLength: 1
+          maxLength: 200
+        scopes:
+          type: array
+          minItems: 1
+          uniqueItems: true
+          items:
+            $ref: '#/components/schemas/Scope'
+        project_ids:
+          type: array
+          uniqueItems: true
+          items:
+            $ref: '#/components/schemas/Identifier'
+        expires_at:
+          $ref: '#/components/schemas/NullableTimestamp'
+        created_at:
+          $ref: '#/components/schemas/Timestamp'
+        last_used_at:
+          $ref: '#/components/schemas/NullableTimestamp'
+
+    TokenCreateRequest:
+      type: object
+      required:
+        - name
+        - scopes
+      properties:
+        name:
+          type: string
+          minLength: 1
+          maxLength: 200
+        scopes:
+          type: array
+          minItems: 1
+          uniqueItems: true
+          items:
+            $ref: '#/components/schemas/Scope'
+        project_ids:
+          type: array
+          uniqueItems: true
+          items:
+            $ref: '#/components/schemas/Identifier'
+          description: Optional project restriction for this token.
+        expires_at:
+          $ref: '#/components/schemas/NullableTimestamp'
+      additionalProperties: false
+
+    TokenCreated:
+      allOf:
+        - $ref: '#/components/schemas/Token'
+        - type: object
+          required:
+            - token
+          properties:
+            token:
+              type: string
+              minLength: 1
+              description: Plaintext bearer token. Returned only once.
+
+    Event:
+      type: object
+      required:
+        - cursor
+        - id
+        - type
+        - created_at
+        - payload
+      properties:
+        cursor:
+          type: integer
+          format: int64
+          minimum: 1
+          description: Monotonic feed cursor.
+          example: 43
+        id:
+          $ref: '#/components/schemas/Identifier'
+        type:
+          type: string
+          minLength: 1
+          description: Event type, for example task.claimed or task.completed.
+          example: task.claimed
+        actor_id:
+          $ref: '#/components/schemas/Identifier'
+        project_id:
+          $ref: '#/components/schemas/Identifier'
+        task_id:
+          $ref: '#/components/schemas/Identifier'
+        created_at:
+          $ref: '#/components/schemas/Timestamp'
+        payload:
+          type: object
+          additionalProperties: true
+      additionalProperties: false
+
+    RoadmapStateCounts:
+      type: object
+      required:
+        - backlog
+        - ready
+        - active
+        - blocked
+        - completed
+      properties:
+        backlog:
+          type: integer
+          minimum: 0
+        ready:
+          type: integer
+          minimum: 0
+        active:
+          type: integer
+          minimum: 0
+        blocked:
+          type: integer
+          minimum: 0
+        completed:
+          type: integer
+          minimum: 0
+      additionalProperties: false
+
+    Roadmap:
+      type: object
+      required:
+        - task_total
+        - completed
+        - completion_percent
+        - state_counts
+        - overdue
+        - due_soon
+        - upcoming
+        - upcoming_tasks
+        - recent_activity
+      properties:
+        project:
+          $ref: '#/components/schemas/Project'
+          description: Project for a project-scoped roadmap; omitted for the global summary.
+        projects:
+          type: array
+          description: Per-project summaries included in a global roadmap.
+          items:
+            $ref: '#/components/schemas/RoadmapProject'
+        task_total:
+          type: integer
+          minimum: 0
+        completed:
+          type: integer
+          minimum: 0
+        completion_percent:
+          type: number
+          format: double
+          minimum: 0
+          maximum: 100
+        total_tasks:
+          type: integer
+          minimum: 0
+        completed_tasks:
+          type: integer
+          minimum: 0
+        completion_percentage:
+          type: number
+          format: double
+          minimum: 0
+          maximum: 100
+        state_counts:
+          $ref: '#/components/schemas/RoadmapStateCounts'
+          description: State counts for the requested scope.
+        overdue:
+          type: integer
+          minimum: 0
+        due_soon:
+          type: integer
+          minimum: 0
+        overdue_count:
+          type: integer
+          minimum: 0
+        due_soon_count:
+          type: integer
+          minimum: 0
+        upcoming:
+          type: array
+          description: Empty for bearer tokens without tasks:read.
+          items:
+            $ref: '#/components/schemas/Task'
+        upcoming_tasks:
+          type: array
+          description: Alias of upcoming; empty for bearer tokens without tasks:read.
+          items:
+            $ref: '#/components/schemas/Task'
+        recent_activity:
+          type: array
+          description: Empty for bearer tokens without events:read.
+          items:
+            $ref: '#/components/schemas/Event'
+      additionalProperties: false
+
+    RoadmapProject:
+      type: object
+      required:
+        - project
+        - total_tasks
+        - completed_tasks
+        - completion_percentage
+      properties:
+        project:
+          $ref: '#/components/schemas/Project'
+        total_tasks:
+          type: integer
+          minimum: 0
+        completed_tasks:
+          type: integer
+          minimum: 0
+        completion_percentage:
+          type: number
+          format: double
+          minimum: 0
+          maximum: 100
+        state_counts:
+          $ref: '#/components/schemas/RoadmapStateCounts'
+          description: Optional per-project state counts; current global roadmap entries omit this field.
+      additionalProperties: false
+
+    RoadmapResponse:
+      $ref: '#/components/schemas/Roadmap'
+
+    Error:
+      type: object
+      required:
+        - code
+        - message
+        - details
+      properties:
+        code:
+          type: string
+          minLength: 1
+          example: invalid_request
+        message:
+          type: string
+          minLength: 1
+          example: Request is invalid
+        details:
+          type: object
+          additionalProperties: true
+      additionalProperties: false
+
+    ErrorResponse:
+      type: object
+      required:
+        - error
+      properties:
+        error:
+          $ref: '#/components/schemas/Error'
+      additionalProperties: false
+
+    StaleTaskErrorResponse:
+      type: object
+      required:
+        - error
+      properties:
+        error:
+          type: object
+          required:
+            - code
+            - message
+            - details
+          properties:
+            code:
+              const: stale_task
+            message:
+              type: string
+            details:
+              $ref: '#/components/schemas/StaleTaskDetails'
+          additionalProperties: false
+      additionalProperties: false
+
+    TaskClaimUnavailableErrorResponse:
+      type: object
+      required:
+        - error
+      properties:
+        error:
+          type: object
+          required:
+            - code
+            - message
+            - details
+          properties:
+            code:
+              const: task_already_claimed
+            message:
+              type: string
+              minLength: 1
+            details:
+              $ref: '#/components/schemas/TaskClaimUnavailableDetails'
+          additionalProperties: false
+      additionalProperties: false
+
+    IdempotencyConflictErrorResponse:
+      type: object
+      required:
+        - error
+      properties:
+        error:
+          type: object
+          required:
+            - code
+            - message
+            - details
+          properties:
+            code:
+              const: idempotency_key_reused
+            message:
+              type: string
+              minLength: 1
+            details:
+              type: object
+              additionalProperties: true
+          additionalProperties: false
+      additionalProperties: false
+
+    TaskMutationConflictErrorResponse:
+      oneOf:
+        - $ref: '#/components/schemas/StaleTaskErrorResponse'
+        - $ref: '#/components/schemas/TaskClaimUnavailableErrorResponse'
+        - $ref: '#/components/schemas/IdempotencyConflictErrorResponse'
+
+    TaskClaimUnavailableDetails:
+      description: |
+        Humans and bearer tokens with tasks:read may receive the full current
+        task or active-claim diagnostics. Bearer tokens without tasks:read
+        receive only id/version retry metadata for a task conflict, or an
+        empty object for a column active-claim conflict.
+      oneOf:
+        - type: object
+          required:
+            - current
+          properties:
+            current:
+              oneOf:
+                - $ref: '#/components/schemas/Task'
+                - $ref: '#/components/schemas/TaskConflictCurrent'
+          additionalProperties: true
+        - type: object
+          required:
+            - claimed_by
+            - claim_expires_at
+          properties:
+            task_id:
+              $ref: '#/components/schemas/Identifier'
+            column_id:
+              $ref: '#/components/schemas/Identifier'
+            claimed_by:
+              $ref: '#/components/schemas/Identifier'
+            claim_expires_at:
+              $ref: '#/components/schemas/Timestamp'
+          additionalProperties: false
+        - type: object
+          additionalProperties: false
+
+    TaskConflictCurrent:
+      type: object
+      required:
+        - id
+        - version
+      properties:
+        id:
+          $ref: '#/components/schemas/Identifier'
+        version:
+          type: integer
+          format: int64
+          minimum: 1
+      additionalProperties: false
+
+    StaleTaskDetails:
+      type: object
+      required:
+        - current
+      properties:
+        current:
+          description: Full task for humans and tasks:read tokens; reduced id/version metadata for write-only or claim-only tokens.
+          oneOf:
+            - $ref: '#/components/schemas/Task'
+            - $ref: '#/components/schemas/TaskConflictCurrent'
+      additionalProperties: true
+
+    ProjectCollection:
+      type: object
+      required:
+        - data
+        - next_cursor
+      properties:
+        data:
+          type: array
+          items:
+            $ref: '#/components/schemas/Project'
+        next_cursor:
+          type: string
+          description: Empty string when there is no next page.
+      additionalProperties: false
+    ColumnCollection:
+      type: object
+      required:
+        - data
+        - next_cursor
+      properties:
+        data:
+          type: array
+          items:
+            $ref: '#/components/schemas/Column'
+        next_cursor:
+          type: string
+          description: Empty string when there is no next page.
+      additionalProperties: false
+    TaskCollection:
+      type: object
+      required:
+        - data
+        - next_cursor
+      properties:
+        data:
+          type: array
+          items:
+            $ref: '#/components/schemas/Task'
+        next_cursor:
+          type: string
+          description: Empty string when there is no next page.
+      additionalProperties: false
+    CommentCollection:
+      type: object
+      required:
+        - data
+        - next_cursor
+      properties:
+        data:
+          type: array
+          items:
+            $ref: '#/components/schemas/Comment'
+        next_cursor:
+          type: string
+          description: Empty string when there is no next page.
+      additionalProperties: false
+    LabelCollection:
+      type: object
+      required:
+        - data
+        - next_cursor
+      properties:
+        data:
+          type: array
+          items:
+            $ref: '#/components/schemas/Label'
+        next_cursor:
+          type: string
+          description: Empty string when there is no next page.
+      additionalProperties: false
+    AgentCollection:
+      type: object
+      required:
+        - data
+        - next_cursor
+      properties:
+        data:
+          type: array
+          items:
+            $ref: '#/components/schemas/Agent'
+        next_cursor:
+          type: string
+          description: Empty string when there is no next page.
+      additionalProperties: false
+    EventCollection:
+      type: object
+      required:
+        - data
+        - next_cursor
+      properties:
+        data:
+          type: array
+          items:
+            $ref: '#/components/schemas/Event'
+        next_cursor:
+          type: string
+          description: Empty string when there is no next page.
+      additionalProperties: false
+
+    OpenApiDocument:
+      type: object
+      description: OpenAPI 3.1 document served at /openapi.json.
+      required:
+        - openapi
+        - info
+        - paths
+      properties:
+        openapi:
+          type: string
+          const: 3.1.0
+        info:
+          type: object
+          additionalProperties: true
+        paths:
+          type: object
+          additionalProperties: true
+      additionalProperties: true
+
+  examples:
+    ActorExample:
+      summary: Human actor
+      value:
+        id: human_ada
+        kind: human
+        name: Ada Lovelace
+        email: ada@example.com
+        admin: true
+        created_at: '2026-08-27T08:00:00Z'
+        updated_at: '2026-08-27T10:00:00Z'
+    AgentExample:
+      summary: Agent actor
+      value:
+        id: agent_ada
+        kind: agent
+        name: Build agent
+        admin: false
+        project_ids:
+          - proj_ops
+        created_at: '2026-08-27T09:00:00Z'
+        updated_at: '2026-08-27T09:00:00Z'
+    ProjectExample:
+      summary: Operations project
+      value:
+        id: proj_ops
+        key: OPS
+        slug: operations
+        name: Operations
+        description: Work for the operations team.
+        color: '#2563EB'
+        favorite: true
+        created_at: '2026-08-27T08:00:00Z'
+        updated_at: '2026-08-27T10:00:00Z'
+        task_count: 42
+        completed_task_count: 18
+        open_task_count: 24
+        overdue_task_count: 2
+        column_count: 5
+    TaskExample:
+      summary: Ready task
+      value:
+        id: task_42
+        number: 42
+        key: OPS-42
+        project_id: proj_ops
+        column_id: col_ready
+        title: Add event polling
+        description: Implement incremental event polling for agents.
+        priority: high
+        position: 0
+        assignee: agent_ada
+        due_at: '2026-09-01T12:00:00Z'
+        version: 7
+        created_at: '2026-08-27T09:30:00Z'
+        updated_at: '2026-08-27T10:00:00Z'
+        labels:
+          - id: label_api
+            project_id: proj_ops
+            name: api
+            color: '#2563EB'
+            created_at: '2026-08-27T09:00:00Z'
+            updated_at: '2026-08-27T09:00:00Z'
+        comment_count: 1
+    TaskClaimedExample:
+      summary: Claimed task
+      value:
+        id: task_42
+        number: 42
+        key: OPS-42
+        project_id: proj_ops
+        column_id: col_active
+        title: Add event polling
+        description: Implement incremental event polling for agents.
+        priority: high
+        position: 0
+        assignee: agent_ada
+        claimed_by: agent_ada
+        claim_expires_at: '2026-08-27T11:00:00Z'
+        due_at: '2026-09-01T12:00:00Z'
+        version: 8
+        created_at: '2026-08-27T09:30:00Z'
+        updated_at: '2026-08-27T10:30:00Z'
+        labels: []
+        comment_count: 1
+    RoadmapExample:
+      summary: Project roadmap
+      value:
+        project:
+          id: proj_ops
+          key: OPS
+          slug: operations
+          name: Operations
+          description: Work for the operations team.
+          color: '#2563EB'
+          favorite: true
+          created_at: '2026-08-27T08:00:00Z'
+          updated_at: '2026-08-27T10:00:00Z'
+        task_total: 42
+        completed: 18
+        completion_percent: 42.86
+        state_counts:
+          backlog: 10
+          ready: 8
+          active: 4
+          blocked: 2
+          completed: 18
+        overdue: 2
+        due_soon: 3
+        upcoming:
+          - id: task_42
+            number: 42
+            key: OPS-42
+            project_id: proj_ops
+            column_id: col_ready
+            title: Add event polling
+            description: Implement incremental event polling for agents.
+            priority: high
+            position: 0
+            assignee: agent_ada
+            due_at: '2026-09-01T12:00:00Z'
+            version: 7
+            created_at: '2026-08-27T09:30:00Z'
+            updated_at: '2026-08-27T10:00:00Z'
+            labels: []
+            comment_count: 1
+        upcoming_tasks:
+          - id: task_42
+            number: 42
+            key: OPS-42
+            project_id: proj_ops
+            column_id: col_ready
+            title: Add event polling
+            description: Implement incremental event polling for agents.
+            priority: high
+            position: 0
+            assignee: agent_ada
+            due_at: '2026-09-01T12:00:00Z'
+            version: 7
+            created_at: '2026-08-27T09:30:00Z'
+            updated_at: '2026-08-27T10:00:00Z'
+            labels: []
+            comment_count: 1
+        recent_activity:
+          - cursor: 43
+            id: event_43
+            type: task.claimed
+            actor_id: agent_ada
+            project_id: proj_ops
+            task_id: task_42
+            created_at: '2026-08-27T10:30:00Z'
+            payload:
+              version: 8
+              claim_expires_at: '2026-08-27T11:00:00Z'
+    GlobalRoadmapExample:
+      summary: Global roadmap
+      value:
+        projects:
+          - project:
+              id: proj_ops
+              key: OPS
+              slug: operations
+              name: Operations
+              description: Work for the operations team.
+              color: '#2563EB'
+              favorite: true
+              created_at: '2026-08-27T08:00:00Z'
+              updated_at: '2026-08-27T10:00:00Z'
+            total_tasks: 42
+            completed_tasks: 18
+            completion_percentage: 42.86
+        task_total: 42
+        completed: 18
+        completion_percent: 42.86
+        state_counts:
+          backlog: 10
+          ready: 8
+          active: 4
+          blocked: 2
+          completed: 18
+        overdue: 2
+        due_soon: 3
+        upcoming: []
+        upcoming_tasks: []
+        recent_activity: []
+    TokenCreatedExample:
+      summary: Newly-created token
+      value:
+        id: tok_01
+        agent_id: agent_ada
+        actor_id: agent_ada
+        name: CI polling token
+        token: rmap_live_example_plaintext_only_once
+        scopes:
+          - projects:read
+          - tasks:read
+          - tasks:claim
+          - events:read
+        project_ids:
+          - proj_ops
+        expires_at: '2027-01-01T00:00:00Z'
+        created_at: '2026-08-27T10:30:00Z'
+    ProjectCollectionExample:
+      summary: Project collection
+      value:
+        data:
+          - id: proj_ops
+            key: OPS
+            slug: operations
+            name: Operations
+            description: Work for the operations team.
+            color: '#2563EB'
+            favorite: true
+            created_at: '2026-08-27T08:00:00Z'
+            updated_at: '2026-08-27T10:00:00Z'
+            task_count: 42
+            completed_count: 18
+        next_cursor: ''
+    TaskCollectionExample:
+      summary: Task collection
+      value:
+        data:
+          - id: task_42
+            number: 42
+            key: OPS-42
+            project_id: proj_ops
+            column_id: col_ready
+            title: Add event polling
+            description: Implement incremental event polling for agents.
+            priority: high
+            position: 0
+            assignee: agent_ada
+            due_at: '2026-09-01T12:00:00Z'
+            version: 7
+            created_at: '2026-08-27T09:30:00Z'
+            updated_at: '2026-08-27T10:00:00Z'
+            labels: []
+            comment_count: 1
+        next_cursor: ''
+    EventCollectionExample:
+      summary: Event collection
+      value:
+        data:
+          - cursor: 43
+            id: event_43
+            type: task.claimed
+            actor_id: agent_ada
+            project_id: proj_ops
+            task_id: task_42
+            created_at: '2026-08-27T10:30:00Z'
+            payload:
+              version: 8
+              claim_expires_at: '2026-08-27T11:00:00Z'
+        next_cursor: '43'
+    AgentCollectionExample:
+      summary: Agent collection
+      value:
+        data:
+          - id: agent_ada
+            kind: agent
+            name: Build agent
+            admin: false
+            created_at: '2026-08-27T09:00:00Z'
+            updated_at: '2026-08-27T09:00:00Z'
+        next_cursor: ''
+    BadRequestExample:
+      value:
+        error:
+          code: bad_request
+          message: Request body is not valid JSON
+          details: {}
+    UnauthorizedExample:
+      value:
+        error:
+          code: unauthorized
+          message: Authentication is required
+          details: {}
+    ForbiddenExample:
+      value:
+        error:
+          code: insufficient_scope
+          message: Token does not have the required scope
+          details:
+            required_scope: tasks:write
+    NotFoundExample:
+      value:
+        error:
+          code: not_found
+          message: Task was not found
+          details:
+            resource: task
+            id: task_missing
+    ConflictExample:
+      value:
+        error:
+          code: idempotency_key_reused
+          message: Idempotency-Key was already used for a different request
+          details: {}
+    TaskAlreadyClaimedExample:
+      summary: Active claim held by another actor
+      value:
+        error:
+          code: task_already_claimed
+          message: Task is actively claimed by another actor
+          details:
+            claimed_by: agent_other
+            claim_expires_at: '2026-08-27T11:00:00Z'
+    StaleTaskExample:
+      value:
+        error:
+          code: stale_task
+          message: Task was changed by another actor
+          details:
+            current:
+              id: task_42
+              number: 42
+              key: OPS-42
+              project_id: proj_ops
+              column_id: col_active
+              title: Add event polling
+              description: Implement incremental event polling for agents.
+              priority: high
+              position: 0
+              assignee: agent_ada
+              claimed_by: agent_ada
+              claim_expires_at: '2026-08-27T11:00:00Z'
+              due_at: '2026-09-01T12:00:00Z'
+              version: 8
+              created_at: '2026-08-27T09:30:00Z'
+              updated_at: '2026-08-27T10:30:00Z'
+              labels: []
+              comment_count: 1
+    InternalErrorExample:
+      value:
+        error:
+          code: internal_error
+          message: An unexpected error occurred
+          details: {}

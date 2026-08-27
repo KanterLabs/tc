@@ -1,0 +1,38 @@
+# Build output
+/dist/
+/bin/
+/coverage/
+/web/dist/
+/web/node_modules/
+/internal/webassets/dist/*
+!/internal/webassets/dist/index.html
+/internal/frontend/dist/*
+!/internal/frontend/dist/index.html
+
+# Runtime data and local deployment state
+*.db
+*.db-shm
+*.db-wal
+/.env
+/.tc-deploy.env
+/.cloudflare-tunnel-token
+/.deploy-key
+/.deploy-key.pub
+/roadmap-deploy-key
+/roadmap-deploy-key.pub
+/roadmap-release-signing-private.pem
+/roadmap-release-signing-public.pem
+/roadmap-access-token.env
+/*.pem
+/*.key
+/*-key
+/*-key.pub
+
+# Test and editor artifacts
+/playwright-report/
+/test-results/
+/web/playwright-report/
+/web/test-results/
+/.DS_Store
+/.idea/
+/.vscode/

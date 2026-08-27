@@ -1,0 +1,16 @@
+[Unit]
+Description=Verified Roadmap SQLite backup
+After=roadmap.service
+RequiresMountsFor=/var/lib/roadmap/data /var/lib/roadmap/backups
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/roadmap-backup daily
+User=root
+Group=root
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateDevices=true
+ReadWritePaths=/var/lib/roadmap/data /var/lib/roadmap/backups

@@ -1,0 +1,29 @@
+[Unit]
+Description=Cloudflare Tunnel for Roadmap
+After=network-online.target roadmap.service
+Wants=network-online.target
+Requires=roadmap.service
+
+[Service]
+Type=notify
+User=cloudflared
+Group=cloudflared
+ExecStart=/usr/local/bin/cloudflared tunnel --no-autoupdate --loglevel info run --token-file /etc/roadmap/cloudflared.token
+Restart=on-failure
+RestartSec=5s
+# Keep a failed tunnel start from holding deployment recovery indefinitely.
+TimeoutStartSec=30s
+NoNewPrivileges=true
+CapabilityBoundingSet=
+AmbientCapabilities=
+RestrictSUIDSGID=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictRealtime=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+MemoryMax=256M
+TasksMax=128
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

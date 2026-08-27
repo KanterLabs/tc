@@ -1,0 +1,471 @@
+#!/usr/bin/env bash
+# Root-only Proxmox gateway. The SSH deploy account reaches this file only
+# through the forced sudo command and cannot run pct, inspect other guests, or
+# obtain a shell.
+set -Eeuo pipefail
+
+DEPLOY_ROOT=/var/lib/roadmap-deploy
+STAGING_DIR="$DEPLOY_ROOT/staging"
+CTID=106
+CT_NAME=roadmap
+CT_IP=10.0.0.38
+TEMPLATE=local:vztmpl/debian-12-standard_12.12-1_amd64.tar.zst
+CT_ARCH=amd64
+CT_CORES=1
+CT_MEMORY_MB=2048
+CT_SWAP_MB=512
+CT_ROOTFS_STORAGE=local-lvm
+CT_ROOTFS_SIZE=16G
+CT_NET_NAME=eth0
+CT_NET_BRIDGE=vmbr0
+CT_NET_GATEWAY=10.0.0.1
+CT_NET_TYPE=veth
+ARCHIVE_MAX_BYTES=536870912
+ARCHIVE_INGEST_TIMEOUT=120
+SIGNING_PUBLIC_KEY=/etc/roadmap-deploy/release-signing-public.pem
+VERIFY_SCRIPT=/usr/local/sbin/roadmap-verify-release
+CT_CONFIG_ERROR=''
+
+log() { printf '[roadmap-gateway] %s\n' "$*" >&2; }
+fail() { log "$*"; exit 1; }
+
+ct_config_field() {
+	local config=$1 key=$2 line count=0 value=''
+	while IFS= read -r line; do
+		if [[ "$line" == "$key: "* ]]; then
+			count=$((count + 1))
+			value=${line#"$key: "}
+		fi
+	done <<<"$config"
+	[[ $count -eq 1 ]] || return 1
+	printf '%s\n' "$value"
+}
+
+ct_option_matches() {
+	local spec=$1 expected_key=$2 expected_value=$3
+	awk -F',' -v expected_key="$expected_key" -v expected_value="$expected_value" '
+		BEGIN { count = 0; valid = 1 }
+		{
+			for (i = 1; i <= NF; i++) {
+				token = $i
+				sub(/^[[:space:]]+/, "", token)
+				sub(/[[:space:]]+$/, "", token)
+				eq = index(token, "=")
+				if (eq == 0) {
+					continue
+				}
+				key = substr(token, 1, eq - 1)
+				value = substr(token, eq + 1)
+				if (key == expected_key) {
+					count++
+					if (value != expected_value) {
+						valid = 0
+					}
+				}
+			}
+		}
+		END { exit !(count == 1 && valid) }
+	' <<<"$spec"
+}
+
+ct_net0_is_exact() {
+	local spec=$1
+	awk -F',' '
+		BEGIN { valid = 1; total = 0 }
+		{
+			for (i = 1; i <= NF; i++) {
+				token = $i
+				sub(/^[[:space:]]+/, "", token)
+				sub(/[[:space:]]+$/, "", token)
+				eq = index(token, "=")
+				if (eq == 0) { valid = 0; continue }
+				key = substr(token, 1, eq - 1)
+				value = substr(token, eq + 1)
+				if (key != "name" && key != "bridge" && key != "gw" && key != "ip" && key != "type" && key != "hwaddr") valid = 0
+				seen[key]++
+				total++
+				if (key == "hwaddr" && value !~ /^([0-9A-Fa-f][0-9A-Fa-f]:){5}[0-9A-Fa-f][0-9A-Fa-f]$/) valid = 0
+			}
+		}
+		END {
+			if (total != 6) valid = 0
+			for (key in seen) if (seen[key] != 1) valid = 0
+			exit !valid
+		}
+	' <<<"$spec"
+}
+
+ct_rootfs_is_exact() {
+	local spec=$1
+	awk -F',' -v storage="$CT_ROOTFS_STORAGE" -v expected_size="$CT_ROOTFS_SIZE" '
+		BEGIN { valid = 1; volume_count = 0; size_count = 0; total = 0 }
+		{
+			for (i = 1; i <= NF; i++) {
+				token = $i
+				sub(/^[[:space:]]+/, "", token)
+				sub(/[[:space:]]+$/, "", token)
+				eq = index(token, "=")
+				if (eq == 0) {
+					if (index(token, storage ":") != 1 || length(token) <= length(storage) + 1) valid = 0
+					volume_count++
+				} else {
+					key = substr(token, 1, eq - 1)
+					value = substr(token, eq + 1)
+					if (key == "volume") {
+						if (index(value, storage ":") != 1 || length(value) <= length(storage) + 1) valid = 0
+						volume_count++
+					} else if (key == "size") {
+						if (value != expected_size) valid = 0
+						size_count++
+					} else valid = 0
+				}
+				total++
+			}
+		}
+		END { exit !(valid && total == 2 && volume_count == 1 && size_count == 1) }
+	' <<<"$spec"
+}
+
+ct_tags_are_exact() {
+	local tags=$1
+	awk -F';' '
+		{
+			for (i = 1; i <= NF; i++) {
+				if ($i != "lan" && $i != "roadmap" && $i != "service") exit 1
+				seen[$i]++
+			}
+		}
+		END { exit !(NF == 3 && seen["lan"] == 1 && seen["roadmap"] == 1 && seen["service"] == 1) }
+	' <<<"$tags"
+}
+
+# This predicate must never call fail: cleanup uses it as a guard while the
+# normal status/rollback/deploy paths turn its diagnostic into a hard failure.
+ct_config_matches_roadmap() {
+	local config=$1 line key existing_name unprivileged arch onboot ostype cores memory swap net0 rootfs
+	local nameserver searchdomain startup tags
+	CT_CONFIG_ERROR=''
+
+	# Fail closed on every unexpected Proxmox option. In particular, mount,
+	# device, feature, hookscript, and raw lxc.* additions must not inherit the
+	# trusted Roadmap identity merely because hostname/network still match.
+	while IFS= read -r line; do
+		[[ -n "$line" ]] || continue
+		[[ "$line" == *': '* ]] || {
+			CT_CONFIG_ERROR='Roadmap CT configuration contains a malformed option'
+			return 1
+		}
+		key=${line%%:*}
+		case "$key" in
+			arch|cores|hostname|memory|nameserver|net0|onboot|ostype|rootfs|searchdomain|startup|swap|tags|unprivileged) ;;
+			*)
+				CT_CONFIG_ERROR="Roadmap CT has an unreviewed option: $key"
+				return 1 ;;
+		esac
+	done <<<"$config"
+
+	if ! existing_name=$(ct_config_field "$config" hostname); then
+		CT_CONFIG_ERROR="CT $CTID belongs to a different workload"
+		return 1
+	fi
+	if [[ "$existing_name" != "$CT_NAME" ]]; then
+		CT_CONFIG_ERROR="CT $CTID belongs to a different workload"
+		return 1
+	fi
+
+	if ! unprivileged=$(ct_config_field "$config" unprivileged); then
+		CT_CONFIG_ERROR='Roadmap CT is not unprivileged'
+		return 1
+	fi
+	if [[ "$unprivileged" != 1 ]]; then
+		CT_CONFIG_ERROR='Roadmap CT is not unprivileged'
+		return 1
+	fi
+	if ! net0=$(ct_config_field "$config" net0); then
+		CT_CONFIG_ERROR='Roadmap CT has no reviewed network configuration'
+		return 1
+	fi
+	if ! ct_option_matches "$net0" name "$CT_NET_NAME" \
+		|| ! ct_option_matches "$net0" bridge "$CT_NET_BRIDGE" \
+		|| ! ct_option_matches "$net0" gw "$CT_NET_GATEWAY" \
+		|| ! ct_option_matches "$net0" ip "${CT_IP}/24" \
+		|| ! ct_option_matches "$net0" type "$CT_NET_TYPE" \
+		|| ! ct_net0_is_exact "$net0"; then
+		CT_CONFIG_ERROR='Roadmap CT has an unexpected network configuration'
+		return 1
+	fi
+	if grep -Eq '^net[1-9][0-9]*: ' <<<"$config"; then
+		CT_CONFIG_ERROR='Roadmap CT has unexpected network interfaces'
+		return 1
+	fi
+
+	if ! arch=$(ct_config_field "$config" arch) || [[ "$arch" != "$CT_ARCH" ]]; then
+		CT_CONFIG_ERROR='Roadmap CT has an unexpected architecture'
+		return 1
+	fi
+	if ! onboot=$(ct_config_field "$config" onboot); then
+		CT_CONFIG_ERROR='Roadmap CT is not configured to start on boot'
+		return 1
+	fi
+	if [[ "$onboot" != 1 ]]; then
+		CT_CONFIG_ERROR='Roadmap CT is not configured to start on boot'
+		return 1
+	fi
+	if ! ostype=$(ct_config_field "$config" ostype); then
+		CT_CONFIG_ERROR='Roadmap CT has an unexpected operating system type'
+		return 1
+	fi
+	if [[ "$ostype" != debian ]]; then
+		CT_CONFIG_ERROR='Roadmap CT has an unexpected operating system type'
+		return 1
+	fi
+
+	if ! cores=$(ct_config_field "$config" cores) || [[ "$cores" != "$CT_CORES" ]] \
+		|| ! memory=$(ct_config_field "$config" memory) || [[ "$memory" != "$CT_MEMORY_MB" ]] \
+		|| ! swap=$(ct_config_field "$config" swap) || [[ "$swap" != "$CT_SWAP_MB" ]]; then
+		CT_CONFIG_ERROR='Roadmap CT has unexpected resource limits'
+		return 1
+	fi
+	if ! rootfs=$(ct_config_field "$config" rootfs); then
+		CT_CONFIG_ERROR='Roadmap CT has no reviewed root filesystem'
+		return 1
+	fi
+	if ! ct_rootfs_is_exact "$rootfs"; then
+		CT_CONFIG_ERROR='Roadmap CT has an unexpected root filesystem'
+		return 1
+	fi
+	if ! nameserver=$(ct_config_field "$config" nameserver) || [[ "$nameserver" != '10.0.0.1 1.1.1.1' ]] \
+		|| ! searchdomain=$(ct_config_field "$config" searchdomain) || [[ "$searchdomain" != lan ]] \
+		|| ! startup=$(ct_config_field "$config" startup) \
+		|| ! ct_option_matches "$startup" order 5 \
+		|| ! ct_option_matches "$startup" up 10 \
+		|| ! ct_option_matches "$startup" down 30 \
+		|| [[ $(awk -F',' '{ print NF }' <<<"$startup") -ne 3 ]] \
+		|| ! tags=$(ct_config_field "$config" tags) \
+		|| ! ct_tags_are_exact "$tags"; then
+		CT_CONFIG_ERROR='Roadmap CT has unexpected deployment metadata or resolver settings'
+		return 1
+	fi
+
+	return 0
+}
+
+validate_ct_config() {
+	local config=$1
+	ct_config_matches_roadmap "$config" || fail "$CT_CONFIG_ERROR"
+}
+
+[[ "$(id -u)" -eq 0 ]] || fail 'gateway must run as root'
+
+# sshd supplies SSH_ORIGINAL_COMMAND for the forced command. sudo is allowed
+# to preserve that one variable in bootstrap-proxmox.sh. Local argv is kept
+# only for an explicit root-side test invocation (`ROADMAP_GATEWAY_LOCAL_TEST=1`);
+# an SSH request can never replace its original command with argv supplied
+# after sudo.
+if [[ ${SSH_ORIGINAL_COMMAND+x} ]]; then
+	[[ $# -eq 0 ]] || fail 'SSH gateway does not accept command-line arguments'
+	REQUEST=${SSH_ORIGINAL_COMMAND:-}
+else
+	[[ ${ROADMAP_GATEWAY_LOCAL_TEST:-} = 1 && -z ${SSH_CONNECTION+x} ]] \
+		|| fail 'SSH request is missing SSH_ORIGINAL_COMMAND'
+	REQUEST=$*
+fi
+[[ -n "$REQUEST" && "$REQUEST" != *$'\n'* && "$REQUEST" != *$'\r'* ]] \
+	|| fail 'a deploy command is required'
+case "$REQUEST" in
+	*';'*|*'&'*|*'|'*|*'$'*|*'`'*|*'<'*|*'>'*|*'('*|*')'*|*'\\'*)
+		fail 'command contains shell metacharacters' ;;
+esac
+read -r -a args <<< "$REQUEST"
+[[ ${#args[@]} -ge 1 ]] || fail 'empty command'
+ACTION=${args[0]}
+SHA=${args[1]:-}
+
+case "$ACTION" in
+	deploy|rollback)
+		[[ ${#args[@]} -eq 2 && "$SHA" =~ ^[0-9a-f]{40}$ ]] \
+			|| fail "$ACTION requires a 40-character git SHA" ;;
+	status)
+		[[ ${#args[@]} -eq 1 ]] || fail 'status takes no arguments' ;;
+	*) fail "unsupported command: $ACTION" ;;
+esac
+
+# Serialize all gateway requests, including status and rollback. This keeps a
+# deploy-key holder from opening parallel 512 MiB staging files or racing an
+# install/rollback transaction.
+[[ -d "$DEPLOY_ROOT" && ! -L "$DEPLOY_ROOT" ]] || fail 'root deployment directory is invalid'
+[[ "$(stat -c '%U:%G' -- "$DEPLOY_ROOT")" = root:root ]] || fail 'root deployment directory owner is invalid'
+[[ "$(stat -c '%a' -- "$DEPLOY_ROOT")" = 700 ]] || fail 'root deployment directory mode is invalid'
+exec 8>"$DEPLOY_ROOT/deploy.lock"
+chmod 0600 "$DEPLOY_ROOT/deploy.lock"
+flock -x 8
+
+if [[ "$ACTION" = status ]]; then
+	if ! config=$(pct config "$CTID" 2>/dev/null); then
+		printf 'current_sha=none\n'
+		exit 0
+	fi
+	validate_ct_config "$config"
+	pct status "$CTID"
+	current_sha=$(pct exec "$CTID" -- bash -c '
+		if [[ -L /var/lib/roadmap/current ]]; then
+			target=$(readlink -- /var/lib/roadmap/current)
+			[[ "$target" = /var/lib/roadmap/releases/* && -d "$target" ]] || exit 1
+			printf "%s" "${target##*/}"
+		else
+			printf none
+		fi
+	') || fail 'could not determine the current guest release'
+	[[ "$current_sha" = none || "$current_sha" =~ ^[0-9a-f]{40}$ ]] || fail 'guest current release is invalid'
+	if [[ "$current_sha" != none ]]; then
+		pct exec "$CTID" -- systemctl is-active roadmap.service cloudflared.service
+	fi
+	printf 'current_sha=%s\n' "$current_sha"
+	exit 0
+fi
+
+if [[ "$ACTION" = rollback ]]; then
+	config=$(pct config "$CTID" 2>/dev/null) || fail "CT $CTID does not exist"
+	validate_ct_config "$config"
+	pct start "$CTID" >/dev/null 2>&1 || true
+	pct exec "$CTID" -- /usr/local/sbin/roadmap-rollback "$SHA"
+	pct exec "$CTID" -- curl --fail --silent --show-error http://127.0.0.1:8080/healthz >/dev/null
+	log "rolled back to $SHA"
+	exit 0
+fi
+
+[[ -d "$STAGING_DIR" && ! -L "$STAGING_DIR" ]] || fail 'root deployment staging directory is invalid'
+[[ "$(stat -c '%U:%G' -- "$STAGING_DIR")" = root:root ]] || fail 'deployment staging directory owner is invalid'
+[[ "$(stat -c '%a' -- "$STAGING_DIR")" = 700 ]] || fail 'deployment staging directory mode is invalid'
+
+ARCHIVE=$(mktemp "$STAGING_DIR/archive.XXXXXX")
+chmod 0600 "$ARCHIVE"
+chown root:root "$ARCHIVE"
+created=0
+healthy=0
+cleanup_archive() {
+	local status=$?
+	rm -f -- "$ARCHIVE"
+	exit "$status"
+}
+trap cleanup_archive EXIT
+
+command -v head >/dev/null 2>&1 || fail 'head is required'
+command -v timeout >/dev/null 2>&1 || fail 'timeout is required'
+[[ -x "$VERIFY_SCRIPT" && ! -L "$VERIFY_SCRIPT" ]] || fail 'release verifier is unavailable'
+[[ "$(stat -c '%U:%G' -- "$VERIFY_SCRIPT")" = root:root ]] || fail 'release verifier owner is invalid'
+[[ "$(stat -c '%a' -- "$VERIFY_SCRIPT")" = 755 ]] || fail 'release verifier mode is invalid'
+[[ -f "$SIGNING_PUBLIC_KEY" && ! -L "$SIGNING_PUBLIC_KEY" ]] || fail 'release-signing public key is unavailable'
+[[ "$(stat -c '%U:%G' -- "$SIGNING_PUBLIC_KEY")" = root:root ]] || fail 'release-signing public key owner is invalid'
+[[ "$(stat -c '%a' -- "$SIGNING_PUBLIC_KEY")" = 644 ]] || fail 'release-signing public key mode is invalid'
+
+# Read one byte past the cap. This bounds root-owned staging and gives a
+# deterministic rejection for a 512 MiB + 1 byte payload before validation.
+timeout --foreground "$ARCHIVE_INGEST_TIMEOUT" \
+	head -c "$((ARCHIVE_MAX_BYTES + 1))" > "$ARCHIVE" || fail 'could not read deployment archive before the ingest deadline'
+size=$(stat -c '%s' -- "$ARCHIVE")
+[[ "$size" =~ ^[0-9]+$ && "$size" -le "$ARCHIVE_MAX_BYTES" ]] || fail 'deployment archive is too large'
+
+# The verifier is a root-owned host helper, never an archive member. It checks
+# the detached Ed25519 signature and the canonical manifest before this script
+# invokes pct or extracts anything into the guest.
+verified=$("$VERIFY_SCRIPT" "$ARCHIVE" "$SHA" "$SIGNING_PUBLIC_KEY") \
+	|| fail 'release provenance verification failed'
+[[ "$verified" = "release_verified_sha=$SHA" ]] || fail 'release verifier returned an unexpected result'
+
+cleanup_deploy() {
+	local status=$? cleanup_config
+	# Never leave the tunnel token in the PVE staging area. The install script
+	# copies it into /etc/roadmap inside the guest before this cleanup runs.
+	if cleanup_config=$(pct config "$CTID" 2>/dev/null) \
+		&& ct_config_matches_roadmap "$cleanup_config"; then
+		pct exec "$CTID" -- bash -c 'rm -f -- /root/roadmap-release.tar.gz; rm -rf -- /root/roadmap-release' >/dev/null 2>&1 || true
+	fi
+	rm -f -- "$ARCHIVE"
+	if [[ $status -ne 0 && $created -eq 1 && $healthy -eq 0 ]]; then
+		# Re-read and verify ownership at cleanup time. A failed create or a
+		# concurrent CT replacement must never turn this into an unrelated
+		# guest destroy (or an exec into that guest).
+		if cleanup_config=$(pct config "$CTID" 2>/dev/null) \
+			&& ct_config_matches_roadmap "$cleanup_config"; then
+			log "destroying newly-created failed CT $CTID"
+			pct stop "$CTID" --skiplock 1 >/dev/null 2>&1 || true
+			if cleanup_config=$(pct config "$CTID" 2>/dev/null) \
+				&& ct_config_matches_roadmap "$cleanup_config"; then
+				pct destroy "$CTID" --purge 1 >/dev/null 2>&1 || true
+			else
+				log "refusing to destroy CT $CTID after its configuration changed"
+			fi
+		else
+			log "refusing to destroy CT $CTID because Roadmap ownership was not verified"
+		fi
+	fi
+	exit "$status"
+}
+trap cleanup_deploy EXIT
+
+if ! pct config "$CTID" >/dev/null 2>&1; then
+	if ping -c 2 -W 1 "$CT_IP" >/dev/null 2>&1; then
+		fail "planned Roadmap address $CT_IP is already in use"
+	fi
+	if grep -R --include='*.conf' -F "ip=${CT_IP}/" /etc/pve/lxc /etc/pve/qemu-server >/dev/null 2>&1; then
+		fail "planned Roadmap address $CT_IP is assigned to another guest"
+	fi
+	pveam list local | awk '{print $1}' | grep -Fx "$TEMPLATE" >/dev/null \
+		|| fail "reviewed Debian template is unavailable: $TEMPLATE"
+	if pct create "$CTID" "$TEMPLATE" \
+		--hostname "$CT_NAME" \
+		--arch "$CT_ARCH" \
+		--cores "$CT_CORES" \
+		--memory "$CT_MEMORY_MB" \
+		--swap "$CT_SWAP_MB" \
+		--rootfs "$CT_ROOTFS_STORAGE:16" \
+		--net0 "name=$CT_NET_NAME,bridge=$CT_NET_BRIDGE,gw=$CT_NET_GATEWAY,ip=${CT_IP}/24,type=$CT_NET_TYPE" \
+		--nameserver '10.0.0.1 1.1.1.1' \
+		--searchdomain lan \
+		--unprivileged 1 \
+		--onboot 1 \
+		--ostype debian \
+		--startup 'order=5,up=10,down=30' \
+		--tags 'roadmap;service;lan' \
+		--start 1; then
+		# A non-zero pct create may leave a partial config. Keep created=0
+		# until pct has reported success so cleanup cannot destroy a CT that
+		# was not proven to be created by this transaction.
+		created=1
+	else
+		fail 'Roadmap CT creation failed'
+	fi
+	config=$(pct config "$CTID") || fail 'newly-created Roadmap CT has no readable configuration'
+	validate_ct_config "$config"
+else
+	config=$(pct config "$CTID")
+	validate_ct_config "$config"
+	pct start "$CTID" >/dev/null 2>&1 || true
+fi
+
+for _ in $(seq 1 45); do
+	if pct exec "$CTID" -- true >/dev/null 2>&1; then
+		break
+	fi
+	sleep 1
+done
+pct exec "$CTID" -- true || fail 'Roadmap CT did not become ready'
+
+pct push "$CTID" "$ARCHIVE" /root/roadmap-release.tar.gz --perms 0600
+pct exec "$CTID" -- bash -c '
+	set -Eeuo pipefail
+	rm -rf -- /root/roadmap-release
+	install -d -m 0700 /root/roadmap-release
+	tar -xzf /root/roadmap-release.tar.gz -C /root/roadmap-release --no-same-owner --no-same-permissions
+	bash /root/roadmap-release/install-inside-lxc.sh /root/roadmap-release
+	rm -f -- /root/roadmap-release.tar.gz
+	rm -rf -- /root/roadmap-release
+'
+
+pct exec "$CTID" -- curl --fail --silent --show-error http://127.0.0.1:8080/healthz >/dev/null
+pct exec "$CTID" -- systemctl is-active --quiet roadmap.service
+pct exec "$CTID" -- systemctl is-active --quiet cloudflared.service
+healthy=1
+log "deployed release $SHA to CT $CTID"
+printf 'deployed_sha=%s\n' "$SHA"

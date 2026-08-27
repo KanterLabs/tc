@@ -1,0 +1,33 @@
+{
+  "name": "roadmap-web",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "check": "svelte-check --tsconfig ./tsconfig.json",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "e2e": "playwright test",
+    "e2e:install": "playwright install chromium",
+    "openapi:generate": "node scripts/generate-openapi.mjs",
+    "openapi:check": "node scripts/generate-openapi.mjs --check"
+  },
+  "devDependencies": {
+    "@playwright/test": "1.62.1",
+    "@sveltejs/vite-plugin-svelte": "7.3.0",
+    "@types/node": "22.20.1",
+    "jsdom": "25.0.1",
+    "svelte": "5.56.10",
+    "svelte-check": "4.7.6",
+    "typescript": "5.7.3",
+    "vite": "8.2.2",
+    "vitest": "4.1.11",
+    "yaml": "2.9.0"
+  },
+  "dependencies": {
+    "@fontsource/dm-sans": "5.3.0",
+    "@fontsource/manrope": "5.3.0"
+  }
+}
