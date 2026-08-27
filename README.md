@@ -155,6 +155,21 @@ npm run check
 npm test
 ```
 
+## Codex Roadmap skill
+
+The installable [`tc-roadmap`](skills/tc-roadmap/SKILL.md) skill makes TC the
+durable work record for coding agents. It creates or resumes one task for a
+substantive workstream, records the goal and checkpoints, posts meaningful
+progress, and completes or blocks the task with the same optimistic-concurrency
+and claim semantics as any other API client.
+
+Install it from the public repository with Codex's skill installer using the
+GitHub path `KanterLabs/tc/tree/main/skills/tc-roadmap`. The installed
+`scripts/update_skill.py` command refreshes the skill atomically from `main`.
+Agent and optional Cloudflare Access credentials stay in environment variables
+or a mode-`0600` local file; see
+[`skills/tc-roadmap/references/authentication.md`](skills/tc-roadmap/references/authentication.md).
+
 The Playwright suite (`npm run e2e`) expects an already-running server at
 `http://127.0.0.1:18080` by default; install its browser once with
 `npm run e2e:install`. CI shows the complete disposable-server setup in

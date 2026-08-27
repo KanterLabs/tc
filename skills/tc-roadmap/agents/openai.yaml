@@ -1,0 +1,7 @@
+interface:
+  display_name: "TC Roadmap"
+  short_description: "Track agent work, progress, and goals in TC"
+  default_prompt: "Use $tc-roadmap to track this work and keep its progress current."
+
+policy:
+  allow_implicit_invocation: true
