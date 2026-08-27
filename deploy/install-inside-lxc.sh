@@ -257,6 +257,57 @@ loopback_listener() {
 	ss -ltn | grep -Eq '^[[:space:]]*LISTEN[[:space:]]+[^[:space:]]+[[:space:]]+[^[:space:]]+[[:space:]]+(127\.0\.0\.1:8080|\[::1\]:8080)([[:space:]]|$)'
 }
 
+# Roadmap does not provide mail delivery. Disable and mask the Debian Postfix
+# aggregate, template, and default instance units independently so an absent
+# or already-masked unit cannot make install fail and package actions cannot
+# reactivate this unused local SMTP service.
+disable_unused_postfix() {
+	local unit state enabled_state
+	for unit in postfix.service postfix@-.service; do
+		state=$(unit_state "$unit")
+		case "$state" in
+			active|activating|deactivating)
+				stop_unit "$unit" || fail "could not stop $unit and verify it is inactive"
+				;;
+			inactive|failed|dead|unknown|not-found)
+				;;
+			*)
+				fail "unexpected $unit active state: $state"
+				;;
+		esac
+	done
+
+	for unit in postfix.service postfix@.service postfix@-.service; do
+		enabled_state=$(systemctl is-enabled "$unit" 2>/dev/null || true)
+		case "$enabled_state" in
+			enabled|enabled-runtime|linked|linked-runtime|alias)
+				systemctl disable "$unit" 2>/dev/null || fail "could not disable $unit"
+				;;
+			disabled|static|generated|transient|indirect|masked|not-found)
+				;;
+			*)
+				fail "unexpected $unit enablement state: ${enabled_state:-unknown}"
+				;;
+		esac
+		systemctl mask "$unit" || fail "could not mask $unit"
+	done
+
+	for unit in postfix.service postfix@.service postfix@-.service; do
+		enabled_state=$(systemctl is-enabled "$unit" 2>/dev/null || true)
+		[[ "$enabled_state" = masked ]] || fail "$unit is not masked"
+	done
+	for unit in postfix.service postfix@-.service; do
+		state=$(unit_state "$unit")
+		case "$state" in
+			inactive|failed|dead|unknown|not-found)
+				;;
+			*)
+				fail "$unit remains active after it was masked"
+				;;
+		esac
+	done
+}
+
 restore_previous() {
 	[[ -n "$previous_target" ]] || return 1
 	stop_unit cloudflared.service || return 1
@@ -341,6 +392,7 @@ mv -T -- /usr/local/bin/cloudflared.new /usr/local/bin/cloudflared
 
 systemctl disable --now ssh.service ssh.socket sshd.service 2>/dev/null || true
 systemctl mask ssh.service ssh.socket sshd.service 2>/dev/null || true
+disable_unused_postfix
 
 nft -c -f /etc/nftables.conf
 atomic_switch "$release_target" || fail 'could not switch to requested release'

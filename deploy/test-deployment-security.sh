@@ -145,6 +145,115 @@ contains 'stop_unit roadmap.service' "$INSTALL"
 not_contains 'systemctl stop cloudflared.service 2>/dev/null || true' "$INSTALL"
 not_contains 'systemctl stop roadmap.service 2>/dev/null || true' "$INSTALL"
 
+# Postfix is not used by Roadmap. Keep the aggregate, template, and generated
+# default instance names explicit so the active postfix@-.service unit is
+# stopped and future package actions cannot reactivate any of them.
+contains 'disable_unused_postfix()' "$INSTALL"
+contains 'for unit in postfix.service postfix@-.service; do' "$INSTALL"
+contains 'for unit in postfix.service postfix@.service postfix@-.service; do' "$INSTALL"
+contains 'systemctl disable "$unit"' "$INSTALL"
+contains 'systemctl mask "$unit"' "$INSTALL"
+contains 'systemctl is-enabled "$unit"' "$INSTALL"
+not_contains 'systemctl stop postfix*' "$INSTALL"
+not_contains 'systemctl disable postfix*' "$INSTALL"
+not_contains 'systemctl mask postfix*' "$INSTALL"
+not_contains 'apt-get purge postfix' "$INSTALL"
+
+# Exercise the exact-unit handling with an active default instance, an
+# indirect template, and a second idempotent invocation. The template does
+# not have an instantiated state to inspect, so this mock fails if the
+# implementation tries to query it with `systemctl show`.
+source <(awk '/^unit_state\(\)/,/^}/' "$INSTALL")
+SERVICE_STOP_TIMEOUT=30
+source <(awk '/^stop_unit\(\)/,/^}/' "$INSTALL")
+source <(awk '/^disable_unused_postfix\(\)/,/^}/' "$INSTALL")
+postfix_call_log="$fixture/postfix.calls"
+postfix_service_state=active
+postfix_instance_state=active
+postfix_mock_absent=0
+postfix_template_show_attempt=0
+declare -A postfix_masked=()
+: > "$postfix_call_log"
+postfix_mock_systemctl() {
+	local action=${1:-} unit=${2:-} state
+	case "$action" in
+		show)
+			case "$unit" in
+				postfix.service|postfix@-.service) printf 'loaded\n' ;;
+				postfix@.service) postfix_template_show_attempt=1; return 1 ;;
+				*) return 1 ;;
+			esac
+			;;
+		is-active)
+			case "$unit" in
+				postfix.service) state=$postfix_service_state ;;
+				postfix@-.service) state=$postfix_instance_state ;;
+				*) state=unknown ;;
+			esac
+			printf '%s\n' "$state"
+			;;
+		stop)
+			printf 'stop %s\n' "$unit" >> "$postfix_call_log"
+			case "$unit" in
+				postfix.service) postfix_service_state=inactive ;;
+				postfix@-.service) postfix_instance_state=inactive ;;
+				*) return 1 ;;
+			esac
+			;;
+		is-enabled)
+			if [[ "${postfix_masked[$unit]:-0}" = 1 ]]; then
+				printf 'masked\n'
+				return 1
+			fi
+			if (( postfix_mock_absent )); then
+				printf 'not-found\n'
+				return 1
+			fi
+			case "$unit" in
+				postfix.service) printf 'enabled\n' ;;
+				postfix@.service) printf 'indirect\n' ;;
+				postfix@-.service) printf 'enabled-runtime\n' ;;
+				*) return 1 ;;
+			esac
+			;;
+		disable)
+			printf 'disable %s\n' "$unit" >> "$postfix_call_log"
+			;;
+		mask)
+			printf 'mask %s\n' "$unit" >> "$postfix_call_log"
+			postfix_masked[$unit]=1
+			;;
+		*) return 1 ;;
+	esac
+}
+systemctl() { postfix_mock_systemctl "$@"; }
+postfix_expected_first=$'stop postfix.service\nstop postfix@-.service\ndisable postfix.service\nmask postfix.service\nmask postfix@.service\ndisable postfix@-.service\nmask postfix@-.service'
+disable_unused_postfix || fail 'postfix hardening rejected an active default instance'
+[[ "$postfix_template_show_attempt" = 0 ]] || fail 'postfix hardening queried the uninstantiated template state'
+[[ "$(sed -n '1,7p' "$postfix_call_log")" = "$postfix_expected_first" ]] \
+	|| fail 'postfix hardening did not stop, disable, and mask the exact units'
+[[ "$postfix_service_state" = inactive && "$postfix_instance_state" = inactive ]] \
+	|| fail 'postfix hardening left an active service or default instance'
+disable_unused_postfix || fail 'postfix hardening was not idempotent'
+[[ "$(sed -n '8,10p' "$postfix_call_log")" = $'mask postfix.service\nmask postfix@.service\nmask postfix@-.service' ]] \
+	|| fail 'postfix hardening repeated more than the exact mask operations'
+
+# A postfix-free image has no service/default instance state; all three masks
+# must still be created and verified so a later package installation cannot
+# enable the service.
+postfix_mock_absent=1
+postfix_service_state=unknown
+postfix_instance_state=unknown
+postfix_masked=()
+: > "$postfix_call_log"
+disable_unused_postfix || fail 'postfix-free image was not handled idempotently'
+[[ "$(<"$postfix_call_log")" = $'mask postfix.service\nmask postfix@.service\nmask postfix@-.service' ]] \
+	|| fail 'postfix-free image did not receive all three exact masks'
+unset -f systemctl postfix_mock_systemctl
+unset postfix_service_state postfix_instance_state postfix_mock_absent postfix_template_show_attempt
+unset postfix_call_log postfix_masked
+printf 'postfix_hardening_runtime_tests=ok\n'
+
 # The listener check must recognize only an exact loopback local-address field
 # in ss output. It must reject non-loopback listeners, port-prefix matches,
 # loopback peers, and an ss command failure.
@@ -603,6 +712,124 @@ contains '.result.service_auth_401_redirect // false) == $service401' "$VALIDATE
 contains '$ingress[0].originRequest.access.teamName == $team' "$VALIDATE"
 contains '! -L "$ROADMAP_SSH_CONFIG"' "$DEPLOY_CI"
 contains 'ROADMAP_SSH_CONFIG must be owned by the invoking user and mode 0600 or stricter' "$DEPLOY_CI"
+
+# A freshly-published DNS record can briefly return resolver/connect failures
+# or a non-Access status. Exercise the bounded retry loop with a curl sequence
+# mock and a no-op sleep, so these regressions never use the network or wait.
+source <(awk '/^access_probe_backoff\(\)/,/^}/' "$VALIDATE")
+source <(awk '/^access_status\(\)/,/^}/' "$VALIDATE")
+source <(awk '/^expect_access\(\)/,/^}/' "$VALIDATE")
+PUBLIC_URL=https://tc.shanekanterman.dev
+ACCESS_PROBE_MAX_ATTEMPTS=3
+ACCESS_PROBE_INITIAL_DELAY_SECONDS=1
+ACCESS_PROBE_MAX_DELAY_SECONDS=30
+probe_curl() {
+	local call event output_file=header_file= arg
+	call=$(wc -l < "$PROBE_CALL_LOG")
+	call=$((call + 1))
+	printf '%s\n' "$call" >> "$PROBE_CALL_LOG"
+	event=$(sed -n "${call}p" "$PROBE_RESPONSES")
+	if [[ "$PROBE_KIND" = service ]]; then
+		while [[ $# -gt 0 ]]; do
+			arg=$1
+			case "$arg" in
+				--output|--dump-header)
+					if [[ "$arg" = --output ]]; then
+						output_file=$2
+					else
+						header_file=$2
+					fi
+					shift 2
+					;;
+				--write-out) shift 2 ;;
+				*) shift ;;
+			esac
+		done
+	fi
+	case "$event" in
+		dns) return 6 ;;
+		connect) return 7 ;;
+		302|303|401|500)
+			if [[ "$PROBE_KIND" = service ]]; then
+				printf 'HTTP/1.1 %s Fixture\r\nContent-Type: application/json\r\nX-Request-ID: roadmap-service-auth-probe\r\n\r\n' \
+					"$event" > "$header_file"
+				printf '%s' '{"error":{"code":"unauthorized","message":"fixture"}}' > "$output_file"
+			fi
+			printf '%s' "$event"
+			;;
+		*) return 1 ;;
+	esac
+}
+sleep() { printf '%s\n' "$1" >> "$PROBE_SLEEP_LOG"; }
+curl() { probe_curl "$@"; }
+run_access_probe_case() {
+	local name=$1 sequence=$2 expected=$3 case_dir="$fixture/live-probe-$1" output status
+	install -d -m 0700 "$case_dir"
+	printf '%s\n' "$sequence" > "$case_dir/responses"
+	: > "$case_dir/calls"
+	: > "$case_dir/sleeps"
+	PROBE_KIND=access PROBE_RESPONSES="$case_dir/responses" PROBE_CALL_LOG="$case_dir/calls" \
+		PROBE_SLEEP_LOG="$case_dir/sleeps"
+	if output=$(expect_access /healthz 2>"$case_dir/error"); then
+		status=0
+	else
+		status=$?
+	fi
+	if [[ "$expected" = success ]]; then
+		[[ "$status" = 0 && "$output" = 'access_healthz=302' ]] \
+			|| fail "live Access retry $name did not recover to the expected status"
+	else
+		[[ "$status" -ne 0 ]] || fail "live Access retry $name unexpectedly succeeded"
+		contains 'after 3 attempts' "$case_dir/error"
+		contains 'HTTP 500' "$case_dir/error"
+	fi
+	[[ "$(wc -l < "$case_dir/calls")" = 3 ]] || fail "live Access retry $name did not honor its attempt bound"
+	[[ "$(<"$case_dir/sleeps")" = $'1\n2' ]] || fail "live Access retry $name did not use bounded exponential backoff"
+}
+run_access_probe_case transient-success $'dns\n500\n302' success
+run_access_probe_case eventual-failure $'dns\nconnect\n500' failure
+
+# Service Auth runs after the unauthenticated probes but can hit the same
+# propagation window. It gets the same bounded retry treatment while retaining
+# exact status, header, and JSON assertions on the successful attempt.
+source <(awk '/^service_auth_probe\(\)/,/^}/' "$VALIDATE")
+ACCESS_PROBE_MAX_ATTEMPTS=2
+CF_ACCESS_CLIENT_ID=fixture-client-id
+CF_ACCESS_CLIENT_SECRET=fixture-client-secret
+run_service_probe_case() {
+	local name=$1 sequence=$2 expected=$3 case_dir="$fixture/service-probe-$1" output status
+	install -d -m 0700 "$case_dir"
+	printf '%s\n' "$sequence" > "$case_dir/responses"
+	: > "$case_dir/calls"
+	: > "$case_dir/sleeps"
+	PROBE_KIND=service PROBE_RESPONSES="$case_dir/responses" PROBE_CALL_LOG="$case_dir/calls" \
+		PROBE_SLEEP_LOG="$case_dir/sleeps"
+	CF_SERVICE_HEADER_FILE=
+	CF_SERVICE_RESPONSE_HEADERS=
+	CF_SERVICE_RESPONSE_BODY=
+	if service_auth_probe >"$case_dir/output" 2>"$case_dir/error"; then
+		status=0
+	else
+		status=$?
+	fi
+	rm -f -- "$CF_SERVICE_HEADER_FILE" "$CF_SERVICE_RESPONSE_HEADERS" "$CF_SERVICE_RESPONSE_BODY"
+	if [[ "$expected" = success ]]; then
+		[[ "$status" = 0 ]] || fail "Service Auth retry $name did not recover"
+		contains 'service_auth_probe=ok' "$case_dir/output"
+	else
+		[[ "$status" -ne 0 ]] || fail "Service Auth retry $name unexpectedly succeeded"
+		contains 'after 2 attempts' "$case_dir/error"
+		contains 'curl exit 7' "$case_dir/error"
+	fi
+	[[ "$(wc -l < "$case_dir/calls")" = 2 ]] || fail "Service Auth retry $name did not honor its attempt bound"
+	[[ "$(<"$case_dir/sleeps")" = 1 ]] || fail "Service Auth retry $name did not back off once"
+	not_contains 'fixture-client-secret' "$case_dir/output"
+	not_contains 'fixture-client-secret' "$case_dir/error"
+}
+run_service_probe_case transient-success $'dns\n401' success
+run_service_probe_case eventual-failure $'dns\nconnect' failure
+unset -f curl sleep probe_curl
+unset CF_ACCESS_CLIENT_ID CF_ACCESS_CLIENT_SECRET PROBE_KIND PROBE_RESPONSES PROBE_CALL_LOG PROBE_SLEEP_LOG
 
 # Exercise Cloudflare's exact origin, ingress, and DNS predicates with mocked
 # API responses. The production functions reject alternate loopback, host,

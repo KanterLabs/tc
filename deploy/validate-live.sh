@@ -13,6 +13,28 @@ REQUIRE_SERVICE_AUTH_PROBE=${ROADMAP_REQUIRE_SERVICE_AUTH_PROBE:-0}
 	printf 'ROADMAP_REQUIRE_SERVICE_AUTH_PROBE must be 0 or 1\n' >&2
 	exit 1
 }
+# A newly-published proxied DNS record can briefly produce resolver/connect
+# errors (or a non-Access response) before the route is live. Keep retries
+# finite and cap the delay so live validation never becomes an unbounded wait.
+ACCESS_PROBE_MAX_ATTEMPTS=${ROADMAP_ACCESS_PROBE_MAX_ATTEMPTS:-6}
+ACCESS_PROBE_INITIAL_DELAY_SECONDS=${ROADMAP_ACCESS_PROBE_INITIAL_DELAY_SECONDS:-1}
+[[ "$ACCESS_PROBE_MAX_ATTEMPTS" =~ ^[1-9][0-9]*$ ]] || {
+	printf 'ROADMAP_ACCESS_PROBE_MAX_ATTEMPTS must be a positive integer\n' >&2
+	exit 1
+}
+(( ACCESS_PROBE_MAX_ATTEMPTS <= 10 )) || {
+	printf 'ROADMAP_ACCESS_PROBE_MAX_ATTEMPTS must not exceed 10\n' >&2
+	exit 1
+}
+[[ "$ACCESS_PROBE_INITIAL_DELAY_SECONDS" =~ ^[0-9]+$ ]] || {
+	printf 'ROADMAP_ACCESS_PROBE_INITIAL_DELAY_SECONDS must be a non-negative integer\n' >&2
+	exit 1
+}
+(( ACCESS_PROBE_INITIAL_DELAY_SECONDS <= 30 )) || {
+	printf 'ROADMAP_ACCESS_PROBE_INITIAL_DELAY_SECONDS must not exceed 30 seconds\n' >&2
+	exit 1
+}
+ACCESS_PROBE_MAX_DELAY_SECONDS=30
 if [[ -n "$CF_ACCESS_CLIENT_ID" || -n "$CF_ACCESS_CLIENT_SECRET" || "$REQUIRE_SERVICE_AUTH_PROBE" = 1 ]]; then
 	[[ -n "$CF_ACCESS_CLIENT_ID" && -n "$CF_ACCESS_CLIENT_SECRET" ]] || {
 		printf 'CF_ACCESS_CLIENT_ID and CF_ACCESS_CLIENT_SECRET are required for the Service Auth probe\n' >&2
@@ -128,20 +150,58 @@ validate_access_app() {
 	printf '%s' "$audience"
 }
 
+access_probe_backoff() {
+	local delay=$1
+	if (( delay > 0 )); then
+		sleep "$delay"
+	fi
+}
+
 access_status() {
-	local path=$1
-	curl --silent --show-error --output /dev/null --max-time 10 --write-out '%{http_code}' \
-		"$PUBLIC_URL$path"
+	local path=$1 status
+	if status=$(curl --silent --show-error --output /dev/null --max-time 10 --write-out '%{http_code}' \
+		"$PUBLIC_URL$path"); then
+		ACCESS_STATUS_CURL_RC=0
+		ACCESS_STATUS_HTTP_CODE=${status:-000}
+	else
+		ACCESS_STATUS_CURL_RC=$?
+		ACCESS_STATUS_HTTP_CODE=000
+	fi
+	printf '%s' "$ACCESS_STATUS_HTTP_CODE"
 }
 
 expect_access() {
-	local path=$1 status
-	status=$(access_status "$path")
-	case "$status" in
-		302|303|401) ;;
-		*) printf 'expected Cloudflare Access response for %s, got HTTP %s\n' "$path" "$status" >&2; return 1 ;;
-	esac
-	printf 'access_%s=%s\n' "${path#/}" "$status"
+	local path=$1 status curl_status attempt delay=$ACCESS_PROBE_INITIAL_DELAY_SECONDS
+	for ((attempt = 1; attempt <= ACCESS_PROBE_MAX_ATTEMPTS; attempt++)); do
+		# Keep the curl exit status separate from the HTTP code: curl reports
+		# DNS/connect failures without an HTTP response, which must be retried.
+		access_status "$path" >/dev/null
+		status=$ACCESS_STATUS_HTTP_CODE
+		curl_status=$ACCESS_STATUS_CURL_RC
+		case "$status" in
+			302|303|401)
+				printf 'access_%s=%s\n' "${path#/}" "$status"
+				return 0
+				;;
+		esac
+		if (( attempt < ACCESS_PROBE_MAX_ATTEMPTS )); then
+			access_probe_backoff "$delay"
+			if (( delay < ACCESS_PROBE_MAX_DELAY_SECONDS )); then
+				delay=$((delay * 2))
+				if (( delay > ACCESS_PROBE_MAX_DELAY_SECONDS )); then
+					delay=$ACCESS_PROBE_MAX_DELAY_SECONDS
+				fi
+			fi
+		fi
+	done
+	if (( curl_status != 0 )); then
+		printf 'expected Cloudflare Access response for %s after %s attempts; last request failed with curl exit %s (HTTP %s)\n' \
+			"$path" "$ACCESS_PROBE_MAX_ATTEMPTS" "$curl_status" "$status" >&2
+	else
+		printf 'expected Cloudflare Access response for %s after %s attempts, got HTTP %s\n' \
+			"$path" "$ACCESS_PROBE_MAX_ATTEMPTS" "$status" >&2
+	fi
+	return 1
 }
 
 service_auth_probe() {
@@ -158,34 +218,54 @@ service_auth_probe() {
 	printf 'CF-Access-Client-Id: %s\nCF-Access-Client-Secret: %s\n' \
 		"$CF_ACCESS_CLIENT_ID" "$CF_ACCESS_CLIENT_SECRET" > "$CF_SERVICE_HEADER_FILE"
 	local status content_type request_id expected_request_id=roadmap-service-auth-probe
-	status=$(curl --silent --show-error --proto '=https' --tlsv1.2 \
-		--output "$CF_SERVICE_RESPONSE_BODY" --dump-header "$CF_SERVICE_RESPONSE_HEADERS" \
-		--max-time 15 --write-out '%{http_code}' --header '@'"$CF_SERVICE_HEADER_FILE" \
-		--header 'Accept: application/json' --header "X-Request-ID: $expected_request_id" \
-		"$PUBLIC_URL/api/v1/roadmap") || {
-		printf 'Cloudflare Service Auth probe request failed\n' >&2
-		return 1
-	}
-	content_type=$(awk 'tolower($0) ~ /^content-type:/ { sub(/^[^:]*:[[:space:]]*/, ""); sub(/\r$/, ""); print; exit }' "$CF_SERVICE_RESPONSE_HEADERS")
-	request_id=$(awk 'tolower($0) ~ /^x-request-id:/ { sub(/^[^:]*:[[:space:]]*/, ""); sub(/\r$/, ""); print; exit }' "$CF_SERVICE_RESPONSE_HEADERS")
-	[[ "$status" = 401 ]] || {
-		printf 'Service Auth probe expected Roadmap HTTP 401, got %s\n' "$status" >&2
-		return 1
-	}
-	[[ "$content_type" = application/json* ]] || {
-		printf 'Service Auth probe did not receive a JSON response from Roadmap\n' >&2
-		return 1
-	}
-	[[ "$request_id" = "$expected_request_id" ]] || {
-		printf 'Service Auth probe response did not preserve the Roadmap X-Request-ID\n' >&2
-		return 1
-	}
-	jq -e '(.error.code == "unauthorized") and (.error.message | type == "string")' \
-		"$CF_SERVICE_RESPONSE_BODY" >/dev/null || {
-		printf 'Service Auth probe response is not Roadmap JSON unauthorized\n' >&2
-		return 1
-	}
-	printf 'service_auth_probe=ok\n'
+	local curl_status attempt delay=$ACCESS_PROBE_INITIAL_DELAY_SECONDS failure_reason='unknown failure'
+	for ((attempt = 1; attempt <= ACCESS_PROBE_MAX_ATTEMPTS; attempt++)); do
+		: > "$CF_SERVICE_RESPONSE_HEADERS"
+		: > "$CF_SERVICE_RESPONSE_BODY"
+		if status=$(curl --silent --show-error --proto '=https' --tlsv1.2 \
+			--output "$CF_SERVICE_RESPONSE_BODY" --dump-header "$CF_SERVICE_RESPONSE_HEADERS" \
+			--max-time 15 --write-out '%{http_code}' --header '@'"$CF_SERVICE_HEADER_FILE" \
+			--header 'Accept: application/json' --header "X-Request-ID: $expected_request_id" \
+			"$PUBLIC_URL/api/v1/roadmap"); then
+			curl_status=0
+		else
+			curl_status=$?
+			status=000
+		fi
+
+		if (( curl_status != 0 )); then
+			failure_reason="curl exit $curl_status (HTTP $status)"
+		else
+			content_type=$(awk 'tolower($0) ~ /^content-type:/ { sub(/^[^:]*:[[:space:]]*/, ""); sub(/\r$/, ""); print; exit }' "$CF_SERVICE_RESPONSE_HEADERS")
+			request_id=$(awk 'tolower($0) ~ /^x-request-id:/ { sub(/^[^:]*:[[:space:]]*/, ""); sub(/\r$/, ""); print; exit }' "$CF_SERVICE_RESPONSE_HEADERS")
+			if [[ "$status" != 401 ]]; then
+				failure_reason="expected Roadmap HTTP 401, got $status"
+			elif [[ "$content_type" != application/json* ]]; then
+				failure_reason='response was not JSON'
+			elif [[ "$request_id" != "$expected_request_id" ]]; then
+				failure_reason='response did not preserve the Roadmap X-Request-ID'
+			elif jq -e '(.error.code == "unauthorized") and (.error.message | type == "string")' \
+				"$CF_SERVICE_RESPONSE_BODY" >/dev/null; then
+				printf 'service_auth_probe=ok\n'
+				return 0
+			else
+				failure_reason='response was not Roadmap JSON unauthorized'
+			fi
+		fi
+
+		if (( attempt < ACCESS_PROBE_MAX_ATTEMPTS )); then
+			access_probe_backoff "$delay"
+			if (( delay < ACCESS_PROBE_MAX_DELAY_SECONDS )); then
+				delay=$((delay * 2))
+				if (( delay > ACCESS_PROBE_MAX_DELAY_SECONDS )); then
+					delay=$ACCESS_PROBE_MAX_DELAY_SECONDS
+				fi
+			fi
+		fi
+	done
+	printf 'Cloudflare Service Auth probe failed after %s attempts: %s\n' \
+		"$ACCESS_PROBE_MAX_ATTEMPTS" "$failure_reason" >&2
+	return 1
 }
 
 apps=$(cf_request GET "/accounts/$ACCOUNT_ID/access/apps?per_page=100")
