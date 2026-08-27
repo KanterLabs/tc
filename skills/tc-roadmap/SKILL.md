@@ -80,6 +80,22 @@ measurable checkpoints, not an invented percentage or ETA. Keep the message to
 the result or decision and `--next` to the next concrete action. Use plain
 `--message` for backward compatibility when structured context is unavailable.
 
+## Protect persistent data
+
+When work changes storage, schemas, migrations, backup/restore, or deployment,
+make data preservation an explicit goal and checkpoint. Inspect the existing
+upgrade and recovery path before editing it. Do not reset, recreate, replace,
+or restore over user data as a normal upgrade strategy.
+
+Prefer transactional, retry-safe, additive migrations that remain compatible
+with every retained rollback binary. Verify the change against a populated
+database, including integrity, relationships, stable identifiers, and expected
+row counts. Confirm a verified pre-upgrade backup exists before production
+migration and that rollback does not silently restore an older database or
+discard writes. Treat a database restore as a separate destructive recovery
+operation requiring explicit authorization, an exact backup target, and a
+pre-restore snapshot.
+
 ## Finish
 
 Complete the task only after the requested outcome and proportionate verification are finished:
