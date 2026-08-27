@@ -253,6 +253,10 @@ healthy_revision() {
 	return 1
 }
 
+loopback_listener() {
+	ss -ltn | grep -Eq '^[[:space:]]*LISTEN[[:space:]]+[^[:space:]]+[[:space:]]+[^[:space:]]+[[:space:]]+(127\.0\.0\.1:8080|\[::1\]:8080)([[:space:]]|$)'
+}
+
 restore_previous() {
 	[[ -n "$previous_target" ]] || return 1
 	stop_unit cloudflared.service || return 1
@@ -369,7 +373,7 @@ if ! systemctl is-active --quiet cloudflared.service; then
 fi
 
 if command -v ss >/dev/null 2>&1; then
-	ss -ltn | grep -Eq '127\\.0\\.0\\.1:8080|\\[::1\\]:8080' || fail 'Roadmap is not listening on loopback port 8080'
+	loopback_listener || fail 'Roadmap is not listening on loopback port 8080'
 fi
 
 # Retain the active release plus the newest previous releases.  Do not prune

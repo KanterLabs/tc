@@ -137,11 +137,36 @@ contains 'ROADMAP_DEPLOY_LOCK_HELD=1' "$INSTALL"
 contains 'healthy_revision()' "$INSTALL"
 contains 'validate_release_env()' "$INSTALL"
 contains 'X-Roadmap-Revision' "$INSTALL"
+contains 'loopback_listener()' "$INSTALL"
+contains '127\.0\.0\.1:8080|\[::1\]:8080' "$INSTALL"
 contains 'install -m 0640 -o root -g root "$RELEASE_DIR/roadmap.env" "$new_target/roadmap.env"' "$INSTALL"
 contains 'stop_unit cloudflared.service' "$INSTALL"
 contains 'stop_unit roadmap.service' "$INSTALL"
 not_contains 'systemctl stop cloudflared.service 2>/dev/null || true' "$INSTALL"
 not_contains 'systemctl stop roadmap.service 2>/dev/null || true' "$INSTALL"
+
+# The listener check must recognize only an exact loopback local-address field
+# in ss output. It must reject non-loopback listeners, port-prefix matches,
+# loopback peers, and an ss command failure.
+source <(awk '/^loopback_listener\(\)/,/^}/' "$INSTALL")
+loopback_ss_output=$'State  Recv-Q Send-Q Local Address:Port  Peer Address:Port\nLISTEN 0 128 127.0.0.1:8080 0.0.0.0:*\nLISTEN 0 128 [::1]:8080 [::]:*'
+ss() { [[ "$1" = -ltn ]] && printf '%s\n' "$loopback_ss_output"; }
+loopback_listener || fail 'listener check rejected canonical IPv4/IPv6 loopback output'
+for loopback_bad_ss_output in \
+	$'State  Recv-Q Send-Q Local Address:Port  Peer Address:Port\nLISTEN 0 128 10.0.0.38:8080 0.0.0.0:*' \
+	$'State  Recv-Q Send-Q Local Address:Port  Peer Address:Port\nLISTEN 0 128 127.0.0.1:80801 0.0.0.0:*' \
+	$'State  Recv-Q Send-Q Local Address:Port  Peer Address:Port\nLISTEN 0 128 0.0.0.0:1234 127.0.0.1:8080'; do
+	loopback_ss_output=$loopback_bad_ss_output
+	if loopback_listener; then
+		fail "listener check accepted invalid ss output: $loopback_bad_ss_output"
+	fi
+done
+ss() { return 1; }
+if loopback_listener; then
+	fail 'listener check accepted an ss command failure'
+fi
+unset -f ss
+printf 'loopback_listener_runtime_tests=ok\n'
 
 # The service ExecStart resolves through the current release link. Switch it
 # before systemd verifies the unit and before starting the new application so
