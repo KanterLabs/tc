@@ -339,6 +339,7 @@ systemctl disable --now ssh.service ssh.socket sshd.service 2>/dev/null || true
 systemctl mask ssh.service ssh.socket sshd.service 2>/dev/null || true
 
 nft -c -f /etc/nftables.conf
+atomic_switch "$release_target" || fail 'could not switch to requested release'
 systemctl daemon-reload
 systemd-analyze verify /etc/systemd/system/roadmap.service /etc/systemd/system/cloudflared.service /etc/systemd/system/roadmap-backup.service /etc/systemd/system/roadmap-backup.timer
 systemctl enable nftables.service
@@ -346,7 +347,6 @@ systemctl restart nftables.service
 systemctl enable roadmap.service cloudflared.service
 systemctl enable --now roadmap-backup.timer
 
-atomic_switch "$release_target" || fail 'could not switch to requested release'
 systemctl start roadmap.service
 if ! healthy_revision "$SHA"; then
 	log 'new release failed the local health check; attempting automatic rollback'

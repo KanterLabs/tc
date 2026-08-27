@@ -142,6 +142,19 @@ contains 'stop_unit cloudflared.service' "$INSTALL"
 contains 'stop_unit roadmap.service' "$INSTALL"
 not_contains 'systemctl stop cloudflared.service 2>/dev/null || true' "$INSTALL"
 not_contains 'systemctl stop roadmap.service 2>/dev/null || true' "$INSTALL"
+
+# The service ExecStart resolves through the current release link. Switch it
+# before systemd verifies the unit and before starting the new application so
+# a clean install cannot fail verification on a missing executable.
+install_switch_line=$(grep -n '^atomic_switch "\$release_target"' "$INSTALL" | cut -d: -f1 || true)
+install_verify_line=$(grep -n '^systemd-analyze verify ' "$INSTALL" | cut -d: -f1 || true)
+install_roadmap_start_line=$(grep -n '^systemctl start roadmap\.service$' "$INSTALL" | cut -d: -f1 || true)
+[[ -n "$install_switch_line" && -n "$install_verify_line" && -n "$install_roadmap_start_line" ]] \
+	|| fail 'install ordering regression checks could not find the release switch, unit verification, and roadmap start'
+[[ "$install_switch_line" -lt "$install_verify_line" ]] \
+	|| fail 'install switches the current release after systemd unit verification'
+[[ "$install_switch_line" -lt "$install_roadmap_start_line" ]] \
+	|| fail 'install starts roadmap before switching the current release'
 contains 'WorkingDirectory=/var/lib/roadmap/data' "$SERVICE"
 contains 'ReadWritePaths=/var/lib/roadmap/data' "$SERVICE"
 not_contains 'ReadWritePaths=/var/lib/roadmap ' "$SERVICE"
