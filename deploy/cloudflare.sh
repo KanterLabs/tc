@@ -127,15 +127,65 @@ owner_email() {
 }
 
 identity_provider_id() {
-	local providers id
+	local providers candidates candidate_count id body response
 	if ! providers=$(cf_request GET "/accounts/$ACCOUNT_ID/access/identity_providers"); then
 		return 1
 	fi
-	if ! id=$(jq -r '[.result[] | select(.type == "onetimepin")] | if length == 1 then .[0].id else empty end' <<<"$providers"); then
+	if ! jq -e '.result | type == "array"' <<<"$providers" >/dev/null; then
 		printf 'Cloudflare identity-provider response was invalid\n' >&2
 		return 1
 	fi
-	[[ -n "$id" ]] || { printf 'Cloudflare one-time PIN identity provider is missing or ambiguous\n' >&2; return 1; }
+	if ! candidates=$(jq -c '[.result[] | select(.type == "cloudflare")]' <<<"$providers"); then
+		printf 'Cloudflare identity-provider response was invalid\n' >&2
+		return 1
+	fi
+	if ! candidate_count=$(jq -r 'length' <<<"$candidates"); then
+		printf 'Cloudflare identity-provider response was invalid\n' >&2
+		return 1
+	fi
+	if ! id=$(jq -r '
+		[.[] | select(
+			.type == "cloudflare" and
+			(.config | type == "object") and
+			.config.restrict_to_account_members == true
+		)]
+		| if length == 1 and (.[0].id | type == "string" and length > 0) then .[0].id else empty end
+	' <<<"$candidates"); then
+		printf 'Cloudflare identity-provider response was invalid\n' >&2
+		return 1
+	fi
+	if [[ "$candidate_count" = 1 && -n "$id" && "$id" != null ]]; then
+		printf '%s' "$id"
+		return 0
+	fi
+	if (( candidate_count > 0 )); then
+		printf 'Cloudflare identity providers are ambiguous or nonconforming\n' >&2
+		return 1
+	fi
+
+	if ! body=$(jq -cn '{name:"Cloudflare",type:"cloudflare",config:{restrict_to_account_members:true}}'); then
+		printf 'could not construct Cloudflare identity-provider request\n' >&2
+		return 1
+	fi
+	if ! response=$(cf_request POST "/accounts/$ACCOUNT_ID/access/identity_providers" "$body"); then
+		printf 'Cloudflare identity-provider creation failed\n' >&2
+		return 1
+	fi
+	if ! id=$(jq -r '
+		.result
+		| select(type == "object")
+		| select(.type == "cloudflare")
+		| select((.config | type == "object") and .config.restrict_to_account_members == true)
+		| select(.id | type == "string" and length > 0)
+		| .id
+	' <<<"$response"); then
+		printf 'Cloudflare identity-provider response was invalid\n' >&2
+		return 1
+	fi
+	[[ -n "$id" && "$id" != null ]] || {
+		printf 'Cloudflare identity-provider creation returned a nonconforming provider\n' >&2
+		return 1
+	}
 	printf '%s' "$id"
 }
 

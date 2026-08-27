@@ -706,6 +706,12 @@ contains 'JSON unauthorized' "$VALIDATE"
 contains 'validate_access_app()' "$VALIDATE"
 contains 'identity_provider_id()' "$VALIDATE"
 contains 'access_team_name()' "$VALIDATE"
+contains 'restrict_to_account_members' "$CLOUDFLARE"
+contains 'restrict_to_account_members' "$VALIDATE"
+contains 'identity providers are ambiguous or nonconforming' "$CLOUDFLARE"
+contains 'identity provider is missing, ambiguous, or nonconforming' "$VALIDATE"
+not_contains 'onetimepin' "$CLOUDFLARE"
+not_contains 'onetimepin' "$VALIDATE"
 contains '.result.session_duration == "168h"' "$VALIDATE"
 contains '.result.allowed_idps // []) == [$idp]' "$VALIDATE"
 contains '.result.service_auth_401_redirect // false) == $service401' "$VALIDATE"
@@ -938,7 +944,8 @@ done
 # created; the EXIT trap must issue exactly one DELETE and remove any captured
 # output even when prepare fails in a later API or local-output step.
 cloudflare_prepare_curl() {
-	local method=GET path= data=arg
+	local method=GET path= data=arg idp_fixture=idp-fixture
+	[[ "${CF_MOCK_IDP_MODE:-reuse}" = create ]] && idp_fixture=idp-created-fixture
 	while [[ $# -gt 0 ]]; do
 		arg=$1
 		case "$arg" in
@@ -957,7 +964,16 @@ cloudflare_prepare_curl() {
 	if [[ "$method" = DELETE ]]; then
 		printf '{"success":true,"result":{}}'
 	elif [[ "$method" = GET && "$path" = "$base/access/identity_providers" ]]; then
-		printf '{"success":true,"result":[{"id":"idp-fixture","type":"onetimepin"}]}'
+		case "${CF_MOCK_IDP_MODE:-reuse}" in
+			create) printf '{"success":true,"result":[]}' ;;
+			ambiguous) printf '{"success":true,"result":[{"id":"idp-fixture-a","type":"cloudflare","config":{"restrict_to_account_members":true}},{"id":"idp-fixture-b","type":"cloudflare","config":{"restrict_to_account_members":true}}]}' ;;
+			nonconforming) printf '{"success":true,"result":[{"id":"idp-fixture","type":"cloudflare","config":{"restrict_to_account_members":false}}]}' ;;
+			*) printf '{"success":true,"result":[{"id":"otp-fixture","name":"Cloudflare","type":"onetimepin"},{"id":"idp-fixture","name":"Account SSO","type":"cloudflare","config":{"restrict_to_account_members":true}}]}' ;;
+		esac
+	elif [[ "$method" = POST && "$path" = "$base/access/identity_providers" ]]; then
+		[[ "${CF_MOCK_IDP_MODE:-}" = create ]] || return 1
+		[[ "$data" = '{"name":"Cloudflare","type":"cloudflare","config":{"restrict_to_account_members":true}}' ]] || return 1
+		printf '{"success":true,"result":{"id":"idp-created-fixture","name":"Cloudflare","type":"cloudflare","config":{"restrict_to_account_members":true}}}'
 	elif [[ "$method" = GET && "$path" = "$base/access/organizations" ]]; then
 		printf '{"success":true,"result":{"auth_domain":"team.cloudflareaccess.com"}}'
 	elif [[ "$method" = GET && "$path" = "$base/access/service_tokens?per_page=100" ]]; then
@@ -973,9 +989,9 @@ cloudflare_prepare_curl() {
 			printf '{"success":true,"result":{"id":"ui-app-fixture"}}'
 		fi
 	elif [[ "$method" = GET && "$path" = "$base/access/apps/ui-app-fixture" ]]; then
-		printf '%s' '{"success":true,"result":{"name":"Roadmap owner UI","domain":"tc.shanekanterman.dev","type":"self_hosted","session_duration":"168h","auto_redirect_to_identity":true,"allowed_idps":["idp-fixture"],"app_launcher_visible":false,"service_auth_401_redirect":false,"aud":"ui-audience"}'
+		printf '{"success":true,"result":{"name":"Roadmap owner UI","domain":"tc.shanekanterman.dev","type":"self_hosted","session_duration":"168h","auto_redirect_to_identity":true,"allowed_idps":["%s"],"app_launcher_visible":false,"service_auth_401_redirect":false,"aud":"ui-audience"}}' "$idp_fixture"
 	elif [[ "$method" = GET && "$path" = "$base/access/apps/api-app-fixture" ]]; then
-		printf '%s' '{"success":true,"result":{"name":"Roadmap agents API","domain":"tc.shanekanterman.dev/api/v1/*","type":"self_hosted","session_duration":"168h","auto_redirect_to_identity":true,"allowed_idps":["idp-fixture"],"app_launcher_visible":false,"service_auth_401_redirect":true,"aud":"api-audience"}'
+		printf '{"success":true,"result":{"name":"Roadmap agents API","domain":"tc.shanekanterman.dev/api/v1/*","type":"self_hosted","session_duration":"168h","auto_redirect_to_identity":true,"allowed_idps":["%s"],"app_launcher_visible":false,"service_auth_401_redirect":true,"aud":"api-audience"}}' "$idp_fixture"
 	elif [[ "$method" = GET && "$path" = "$base/access/apps/ui-app-fixture/policies" ]]; then
 		printf '%s' '{"success":true,"result":[{"id":"ui-owner-policy","name":"Roadmap owner only","decision":"allow","precedence":1,"include":[{"email":{"email":"owner@example.com"}}]}]}'
 	elif [[ "$method" = GET && "$path" = "$base/access/apps/api-app-fixture/policies" ]]; then
@@ -994,6 +1010,47 @@ cloudflare_prepare_curl() {
 		return 1
 	fi
 }
+
+cloudflare_prepare_provider_case() {
+	local name=$1 mode=$2 expected_status=$3 case_dir="$fixture/cloudflare-provider-$1"
+	local output="$case_dir/output.log" status expected_idp_calls=1
+	[[ "$mode" = create ]] && expected_idp_calls=2
+	/usr/bin/install -d -m 0700 "$case_dir"
+	CF_MOCK_LOG="$case_dir/api.calls"
+	CF_MOCK_FAIL=
+	CF_MOCK_EXPIRY=$(date -u -d '+30 days' +%Y-%m-%dT%H:%M:%SZ)
+	CF_MOCK_IDP_MODE=$mode
+	export CF_MOCK_LOG CF_MOCK_FAIL CF_MOCK_EXPIRY CF_MOCK_IDP_MODE
+	set +e
+	(
+		export CLOUDFLARE_API_TOKEN=fixture-token ROADMAP_ADMIN_EMAIL=owner@example.com
+		export ROADMAP_REQUIRE_DURABLE_SERVICE_TOKEN_CAPTURE=0
+		unset ROADMAP_PUBLIC_ORIGIN
+		export -f cloudflare_prepare_curl
+		curl() { cloudflare_prepare_curl "$@"; }
+		export -f curl
+		"$CLOUDFLARE" prepare "$case_dir/tunnel.token" "$case_dir/owner.env" "$case_dir/service.env"
+	) >"$output" 2>&1
+	status=$?
+	set -e
+	if [[ "$expected_status" = success ]]; then
+		[[ "$status" = 0 ]] || fail "Cloudflare provider $name unexpectedly failed"
+		contains 'cloudflare_prepare=ok' "$output"
+	else
+		[[ "$status" -ne 0 ]] || fail "Cloudflare provider $name unexpectedly succeeded"
+		[[ "$(grep -Fc -- 'POST /accounts/090ae73dce25f4eca9a53ee396fdc916/access/service_tokens' "$CF_MOCK_LOG" || true)" = 0 ]] \
+			|| fail "Cloudflare provider $name continued into service-token creation"
+	fi
+	[[ "$(grep -Fc -- '/access/identity_providers' "$CF_MOCK_LOG" || true)" = "$expected_idp_calls" ]] \
+		|| fail "Cloudflare provider $name performed an unexpected number of IdP requests"
+}
+
+cloudflare_prepare_provider_case reuse reuse success
+cloudflare_prepare_provider_case create create success
+cloudflare_prepare_provider_case ambiguous ambiguous failure
+cloudflare_prepare_provider_case nonconforming nonconforming failure
+CF_MOCK_IDP_MODE=reuse
+export CF_MOCK_IDP_MODE
 
 cloudflare_prepare_failure_case() {
 	local name=$1 failure=$2 output_mode=${3:-file} case_dir="$fixture/cloudflare-prepare-$1"

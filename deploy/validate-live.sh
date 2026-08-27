@@ -110,11 +110,35 @@ owner_email() {
 }
 
 identity_provider_id() {
-	local providers id
-	providers=$(cf_request GET "/accounts/$ACCOUNT_ID/access/identity_providers")
-	id=$(jq -r '[.result[] | select(.type == "onetimepin")] | if length == 1 then .[0].id else empty end' <<<"$providers")
-	[[ -n "$id" ]] || {
-		printf 'Cloudflare one-time PIN identity provider is missing or ambiguous\n' >&2
+	local providers candidates candidate_count id
+	if ! providers=$(cf_request GET "/accounts/$ACCOUNT_ID/access/identity_providers"); then
+		return 1
+	fi
+	if ! jq -e '.result | type == "array"' <<<"$providers" >/dev/null; then
+		printf 'Cloudflare identity-provider response was invalid\n' >&2
+		return 1
+	fi
+	if ! candidates=$(jq -c '[.result[] | select(.type == "cloudflare")]' <<<"$providers"); then
+		printf 'Cloudflare identity-provider response was invalid\n' >&2
+		return 1
+	fi
+	if ! candidate_count=$(jq -r 'length' <<<"$candidates"); then
+		printf 'Cloudflare identity-provider response was invalid\n' >&2
+		return 1
+	fi
+	if ! id=$(jq -r '
+		[.[] | select(
+			.type == "cloudflare" and
+			(.config | type == "object") and
+			.config.restrict_to_account_members == true
+		)]
+		| if length == 1 and (.[0].id | type == "string" and length > 0) then .[0].id else empty end
+	' <<<"$candidates"); then
+		printf 'Cloudflare identity-provider response was invalid\n' >&2
+		return 1
+	fi
+	[[ "$candidate_count" = 1 && -n "$id" && "$id" != null ]] || {
+		printf 'Cloudflare identity provider is missing, ambiguous, or nonconforming\n' >&2
 		return 1
 	}
 	printf '%s' "$id"

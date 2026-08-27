@@ -104,13 +104,17 @@ and the `tc.shanekanterman.dev` DNS record. Set it as the GitHub secret
 The first `prepare` call, before DNS publication, creates or verifies all of
 these resources:
 
+* a Cloudflare Access identity provider named `Cloudflare` with
+  `type: "cloudflare"` and `config.restrict_to_account_members: true`; an
+  existing provider is reused only when exactly one provider of that type has
+  that restriction, otherwise the bootstrap fails closed;
 * a self-hosted owner UI application for exactly
   `tc.shanekanterman.dev`;
 * a separate self-hosted API application for exactly
   `tc.shanekanterman.dev/api/v1/*` (path applications do not inherit the UI
   policy);
-* an exact-owner Allow policy on each application using the one-time PIN
-  identity provider;
+* an exact-owner Allow policy on each application using the restricted
+  Cloudflare identity provider;
 * a `Roadmap agents` service token (with a future expiry no longer than one
   year) and a
   `Roadmap agents Service Auth` (`non_identity`) policy on the API application;
@@ -162,6 +166,12 @@ team issuer and both application audience tags (`ROADMAP_CF_ACCESS_AUDIENCES`):
 the owner UI application and the `/api/v1/*` application. Roadmap validates
 the RS256 `Cf-Access-Jwt-Assertion` against the team's `/cdn-cgi/access/certs`
 endpoint and does not authorize from ordinary identity headers.
+
+`prepare` never removes an existing one-time-PIN provider. Such providers may
+remain in the account for other applications, but Roadmap's applications are
+bound only to the restricted Cloudflare provider. A missing provider is
+created with the exact API shape above; duplicate or nonconforming Cloudflare
+providers stop the bootstrap instead of being guessed at or silently changed.
 
 After a successful deploy, create the proxied CNAME and validate it:
 
