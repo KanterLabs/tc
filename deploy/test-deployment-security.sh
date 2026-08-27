@@ -185,10 +185,12 @@ source <(awk '/^ct_option_matches\(\)/,/^}/' "$GATEWAY")
 source <(awk '/^ct_net0_is_exact\(\)/,/^}/' "$GATEWAY")
 source <(awk '/^ct_rootfs_is_exact\(\)/,/^}/' "$GATEWAY")
 source <(awk '/^ct_tags_are_exact\(\)/,/^}/' "$GATEWAY")
+source <(awk '/^target_vmid_state\(\)/,/^}/' "$GATEWAY")
+source <(awk '/^target_vmid_is_lxc_for_cleanup\(\)/,/^}/' "$GATEWAY")
 source <(awk '/^ct_config_matches_roadmap\(\)/,/^}/' "$GATEWAY")
 source <(awk '/^cleanup_deploy\(\)/,/^}/' "$GATEWAY")
 log() { printf '[gateway-fixture] %s\n' "$*" >&2; }
-CTID=106
+CTID=103
 CT_NAME=roadmap
 CT_IP=10.0.0.38
 CT_ARCH=amd64
@@ -201,7 +203,43 @@ CT_NET_NAME=eth0
 CT_NET_BRIDGE=vmbr0
 CT_NET_GATEWAY=10.0.0.1
 CT_NET_TYPE=veth
-gateway_canonical_config=$'hostname: roadmap\nunprivileged: 1\nnet0: name=eth0,bridge=vmbr0,gw=10.0.0.1,hwaddr=BC:24:11:12:34:56,ip=10.0.0.38/24,type=veth\narch: amd64\nonboot: 1\nostype: debian\ncores: 1\nmemory: 2048\nswap: 512\nrootfs: local-lvm:vm-106-disk-0,size=16G\nnameserver: 10.0.0.1 1.1.1.1\nsearchdomain: lan\nstartup: order=5,up=10,down=30\ntags: lan;roadmap;service'
+qm() {
+	printf "Configuration file 'nodes/pve/qemu-server/%s.conf' does not exist\n" "$CTID" >&2
+	return 1
+}
+gateway_canonical_config=$'hostname: roadmap\nunprivileged: 1\nnet0: name=eth0,bridge=vmbr0,gw=10.0.0.1,hwaddr=BC:24:11:12:34:56,ip=10.0.0.38/24,type=veth\narch: amd64\nonboot: 1\nostype: debian\ncores: 1\nmemory: 2048\nswap: 512\nrootfs: local-lvm:vm-103-disk-0,size=16G\nnameserver: 10.0.0.1 1.1.1.1\nsearchdomain: lan\nstartup: order=5,up=10,down=30\ntags: lan;roadmap;service'
+
+# A QEMU guest occupying the reviewed VMID must fail status before pct is
+# consulted; otherwise pct config would report "not found" and status would
+# incorrectly return current_sha=none for the user's VM.
+gateway_status_script="$fixture/roadmap-gateway-status-test.sh"
+sed -e '/must run as root/d' -e '/root deployment directory owner is invalid/d' \
+	-e "s|DEPLOY_ROOT=/var/lib/roadmap-deploy|DEPLOY_ROOT=$fixture/gateway-status-deploy|" \
+	"$GATEWAY" > "$gateway_status_script"
+chmod 0755 "$gateway_status_script"
+gateway_status_calls="$fixture/gateway-status.calls"
+gateway_status_output="$fixture/gateway-status.out"
+: > "$gateway_status_calls"
+mkdir -m 0700 "$fixture/gateway-status-deploy"
+gateway_status_qm() { printf 'name: ubuntu-gaming\n'; }
+gateway_status_pct() {
+	printf '%s\n' "$*" >> "$GATEWAY_STATUS_CALLS"
+	return 1
+}
+if (
+	export GATEWAY_STATUS_CALLS="$gateway_status_calls"
+	qm() { gateway_status_qm "$@"; }
+	pct() { gateway_status_pct "$@"; }
+	export -f qm pct gateway_status_qm gateway_status_pct
+	ROADMAP_GATEWAY_LOCAL_TEST=1 "$gateway_status_script" status
+) >"$gateway_status_output" 2>&1; then
+	fail 'gateway status accepted a QEMU VMID collision'
+fi
+contains 'VMID 103 is assigned to a QEMU VM' "$gateway_status_output"
+not_contains 'current_sha=none' "$gateway_status_output"
+[[ ! -s "$gateway_status_calls" ]] || fail 'gateway status touched pct during a QEMU VMID collision'
+printf 'gateway_qemu_vmid_collision_test=ok\n'
+
 gateway_drift_config=${gateway_canonical_config/hostname: roadmap/hostname: unrelated}
 gateway_extra_option_config="$gateway_canonical_config"$'\nfeatures: nesting=1'
 gateway_extra_net_config=${gateway_canonical_config/type=veth/type=veth,rate=100}
@@ -274,7 +312,7 @@ grep -Eq '^stop ' "$gateway_pct_calls" \
 	|| fail 'configuration-drift cleanup did not stop the CT before rechecking it'
 ! grep -Eq '^destroy ' "$gateway_pct_calls" \
 	|| fail 'configuration-drift cleanup destroyed a changed CT'
-contains 'refusing to destroy CT 106 after its configuration changed' "$fixture/gateway-drift.out"
+contains 'refusing to destroy CT 103 after its configuration changed' "$fixture/gateway-drift.out"
 
 # Rollback is transactional across both units: an app health failure and a
 # connector start/active failure restore the previous link, restart the prior

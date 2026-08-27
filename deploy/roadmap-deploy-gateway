@@ -6,7 +6,7 @@ set -Eeuo pipefail
 
 DEPLOY_ROOT=/var/lib/roadmap-deploy
 STAGING_DIR="$DEPLOY_ROOT/staging"
-CTID=106
+CTID=103
 CT_NAME=roadmap
 CT_IP=10.0.0.38
 TEMPLATE=local:vztmpl/debian-12-standard_12.12-1_amd64.tar.zst
@@ -28,6 +28,34 @@ CT_CONFIG_ERROR=''
 
 log() { printf '[roadmap-gateway] %s\n' "$*" >&2; }
 fail() { log "$*"; exit 1; }
+
+target_vmid_state() {
+	local qm_output
+	command -v qm >/dev/null 2>&1 || return 2
+	if qm_output=$(LC_ALL=C qm config "$CTID" 2>&1); then
+		return 0
+	fi
+	case "$qm_output" in
+		*'does not exist'*|*'not found'*|*'unable to find'*|*'no such file'*) return 1 ;;
+		*) return 2 ;;
+	esac
+}
+
+assert_target_vmid_is_lxc() {
+	local state=0
+	target_vmid_state || state=$?
+	case "$state" in
+		0) fail "VMID $CTID is assigned to a QEMU VM; refusing Roadmap LXC operations" ;;
+		1) return 0 ;;
+		*) fail "could not verify VMID $CTID is free of a QEMU VM" ;;
+	esac
+}
+
+target_vmid_is_lxc_for_cleanup() {
+	local state=0
+	target_vmid_state || state=$?
+	[[ "$state" -eq 1 ]]
+}
 
 ct_config_field() {
 	local config=$1 key=$2 line count=0 value=''
@@ -299,6 +327,7 @@ esac
 exec 8>"$DEPLOY_ROOT/deploy.lock"
 chmod 0600 "$DEPLOY_ROOT/deploy.lock"
 flock -x 8
+assert_target_vmid_is_lxc
 
 if [[ "$ACTION" = status ]]; then
 	if ! config=$(pct config "$CTID" 2>/dev/null); then
@@ -377,7 +406,8 @@ cleanup_deploy() {
 	local status=$? cleanup_config
 	# Never leave the tunnel token in the PVE staging area. The install script
 	# copies it into /etc/roadmap inside the guest before this cleanup runs.
-	if cleanup_config=$(pct config "$CTID" 2>/dev/null) \
+	if target_vmid_is_lxc_for_cleanup \
+		&& cleanup_config=$(pct config "$CTID" 2>/dev/null) \
 		&& ct_config_matches_roadmap "$cleanup_config"; then
 		pct exec "$CTID" -- bash -c 'rm -f -- /root/roadmap-release.tar.gz; rm -rf -- /root/roadmap-release' >/dev/null 2>&1 || true
 	fi
@@ -386,11 +416,13 @@ cleanup_deploy() {
 		# Re-read and verify ownership at cleanup time. A failed create or a
 		# concurrent CT replacement must never turn this into an unrelated
 		# guest destroy (or an exec into that guest).
-		if cleanup_config=$(pct config "$CTID" 2>/dev/null) \
+		if target_vmid_is_lxc_for_cleanup \
+			&& cleanup_config=$(pct config "$CTID" 2>/dev/null) \
 			&& ct_config_matches_roadmap "$cleanup_config"; then
 			log "destroying newly-created failed CT $CTID"
 			pct stop "$CTID" --skiplock 1 >/dev/null 2>&1 || true
-			if cleanup_config=$(pct config "$CTID" 2>/dev/null) \
+			if target_vmid_is_lxc_for_cleanup \
+				&& cleanup_config=$(pct config "$CTID" 2>/dev/null) \
 				&& ct_config_matches_roadmap "$cleanup_config"; then
 				pct destroy "$CTID" --purge 1 >/dev/null 2>&1 || true
 			else

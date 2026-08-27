@@ -12,7 +12,7 @@ Cloudflare Access (owner UI or agent service token)
   -> /var/lib/roadmap/data/roadmap.db
 ```
 
-The target is the unprivileged Debian 12 LXC `roadmap` (CTID 106) on
+The target is the unprivileged Debian 12 LXC `roadmap` (CTID 103) on
 `10.0.0.20`, address `10.0.0.38/24`, one CPU, 2048 MiB RAM, and a 16 GiB
 `local-lvm` root disk. The guest has no inbound application or SSH port. Its
 nftables input policy is default-drop; both the application and cloudflared
@@ -62,7 +62,7 @@ only `sudo -n /usr/local/sbin/roadmap-deploy-gateway`, with no agent, X11,
 port, PTY, or user-rc forwarding. Its only sudo rule permits that exact
 root-owned command (and preserves only the SSH original-command variables).
 The gateway accepts only a deployment, rollback, or status request with a
-validated SHA and only operates on CTID 106. Do not add this account to
+validated SHA and only operates on CTID 103. Do not add this account to
 `docker`, `sudo`, or another supplementary group. Keep the private key in the GitHub secret
 `ROADMAP_DEPLOY_SSH_KEY`, never in the repository. The separate Ed25519
 release-signing private key must never be installed on PVE or included in a
@@ -75,9 +75,13 @@ then replace the GitHub secret and test one signed release.
 Before the first run, inspect the existing guest and template on the PVE host:
 
 ```sh
-pct config 106
+pct config 103
 pveam list local
 ```
+
+The gateway checks the QEMU VMID namespace before every status, deploy, or
+rollback request. A QEMU guest at VMID 103 is a hard collision: the request
+fails closed instead of treating the missing LXC config as `current_sha=none`.
 
 The gateway refuses to reuse a CTID with a different hostname, address, or
 privilege mode. Deploy CI sends the validated release bundle only on standard
@@ -223,7 +227,7 @@ To make an explicit backup (for example before an operator migration):
 ssh roadmap-deploy@10.0.0.20 \
   'status'
 # Run from a PVE console or approved pct wrapper:
-pct exec 106 -- /usr/local/sbin/roadmap-backup manual
+pct exec 103 -- /usr/local/sbin/roadmap-backup manual
 ```
 
 To roll back to a retained release from CI or an approved operator shell:
@@ -245,7 +249,7 @@ For a manual database restore, use only the root-owned helper with one
 explicit retained backup path:
 
 ```sh
-pct exec 106 -- /usr/local/sbin/roadmap-restore \
+pct exec 103 -- /usr/local/sbin/roadmap-restore \
   /var/lib/roadmap/backups/roadmap-20260827T120000Z-<sha-or-manual>.db
 ```
 
@@ -267,11 +271,11 @@ SQLite file or bypass this helper.
 Useful read-only checks from the PVE host are:
 
 ```sh
-pct status 106
-pct exec 106 -- systemctl is-active roadmap.service cloudflared.service
-pct exec 106 -- ss -ltn
-pct exec 106 -- curl --fail http://127.0.0.1:8080/healthz
-pct exec 106 -- nft list ruleset
+pct status 103
+pct exec 103 -- systemctl is-active roadmap.service cloudflared.service
+pct exec 103 -- ss -ltn
+pct exec 103 -- curl --fail http://127.0.0.1:8080/healthz
+pct exec 103 -- nft list ruleset
 ```
 
 The expected listener is only `127.0.0.1:8080`; guest SSH units are masked.
