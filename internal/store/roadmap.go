@@ -195,7 +195,7 @@ func (s *Store) Roadmap(ctx context.Context, projectID string) (Roadmap, error) 
 	roadmap.OverdueCount = roadmap.Overdue
 	roadmap.DueSoonCount = roadmap.DueSoon
 	for i := range roadmap.Upcoming {
-		if err := s.enrichTask(ctx, &roadmap.Upcoming[i]); err != nil {
+		if err := s.enrichTaskAt(ctx, &roadmap.Upcoming[i], nowTime); err != nil {
 			return roadmap, err
 		}
 	}
@@ -267,9 +267,20 @@ func (s *Store) listMyWorkFiltered(ctx context.Context, actorID string, projectI
 	if limit > maxLimit {
 		limit = maxLimit
 	}
-	timestamp := now()
-	query := `SELECT ` + taskColumns + ` FROM tasks t JOIN columns c ON c.id=t.column_id WHERE t.deleted_at IS NULL AND (t.assignee_id=? OR (t.claimed_by=? AND t.claim_expires_at IS NOT NULL AND julianday(t.claim_expires_at) > julianday(?)))`
-	args := []any{actorID, actorID, timestamp}
+	readAt := time.Now().UTC()
+	timestamp := readAt.Format(time.RFC3339Nano)
+	query := `SELECT ` + taskColumns + ` FROM tasks t JOIN columns c ON c.id=t.column_id`
+	args := []any{}
+	if filter.LiveWork {
+		// Live work is a workspace pulse view rather than an actor-assignment
+		// view: every unfinished task with a pulse in an active project is
+		// eligible, subject to the caller's project allow-list.
+		query += ` JOIN task_agent_work aw ON aw.task_id=t.id JOIN projects p ON p.id=t.project_id WHERE t.deleted_at IS NULL AND t.completed_at IS NULL AND p.archived_at IS NULL`
+	} else {
+		query += ` WHERE t.deleted_at IS NULL AND (t.assignee_id=? OR (t.claimed_by=? AND t.claim_expires_at IS NOT NULL AND julianday(t.claim_expires_at) > julianday(?)))`
+		args = append(args, actorID, actorID, timestamp)
+	}
+	staleCutoff := agentWorkStaleCutoff(readAt)
 	if projectIDs != nil && len(projectIDs) == 0 {
 		query += ` AND 1=0`
 	}
@@ -284,6 +295,39 @@ func (s *Store) listMyWorkFiltered(ctx context.Context, actorID string, projectI
 	if filter.State != "" {
 		query += ` AND c.semantic_state=?`
 		args = append(args, filter.State)
+	}
+	if filter.AgentState != "" {
+		switch filter.AgentState {
+		case "missing":
+			if filter.LiveWork {
+				// The live view's inner join already excludes missing pulses.
+				query += ` AND 1=0`
+			} else {
+				query += ` AND NOT EXISTS (SELECT 1 FROM task_agent_work aw WHERE aw.task_id=t.id)`
+			}
+		case "stale":
+			if filter.LiveWork {
+				query += ` AND julianday(aw.updated_at) <= julianday(?)`
+			} else {
+				query += ` AND EXISTS (SELECT 1 FROM task_agent_work aw WHERE aw.task_id=t.id AND julianday(aw.updated_at) <= julianday(?))`
+			}
+			args = append(args, staleCutoff)
+		default:
+			if filter.LiveWork {
+				query += ` AND aw.state=?`
+			} else {
+				query += ` AND EXISTS (SELECT 1 FROM task_agent_work aw WHERE aw.task_id=t.id AND aw.state=?)`
+			}
+			args = append(args, filter.AgentState)
+		}
+	}
+	if filter.ActionNeeded {
+		if filter.LiveWork {
+			query += ` AND (aw.state IN ('waiting', 'handoff') OR julianday(aw.updated_at) <= julianday(?))`
+		} else {
+			query += ` AND EXISTS (SELECT 1 FROM task_agent_work aw WHERE aw.task_id=t.id AND (aw.state IN ('waiting', 'handoff') OR julianday(aw.updated_at) <= julianday(?)))`
+		}
+		args = append(args, staleCutoff)
 	}
 	if filter.Priority != "" {
 		query += ` AND t.priority=?`
@@ -302,10 +346,15 @@ func (s *Store) listMyWorkFiltered(ctx context.Context, actorID string, projectI
 		query += ` AND t.updated_at > ?`
 		args = append(args, filter.UpdatedAfter.UTC().Format(time.RFC3339Nano))
 	}
-	// Cursor is an opaque offset. The ordering prioritizes claimed work and
-	// board position, so task numbers cannot safely act as a seek key here.
-	query += ` ORDER BY CASE WHEN t.claimed_by=? AND t.claim_expires_at IS NOT NULL AND julianday(t.claim_expires_at) > julianday(?) THEN 0 ELSE 1 END, c.position, t.position, t.updated_at DESC, t.id LIMIT ? OFFSET ?`
-	args = append(args, actorID, timestamp, limit+1, filter.Cursor)
+	// Cursor is an opaque offset. Live work prioritizes actionable pulses and
+	// then the newest pulse; the legacy view retains its claimed/board order.
+	if filter.LiveWork {
+		query += ` ORDER BY CASE WHEN aw.state IN ('waiting', 'handoff') OR julianday(aw.updated_at) <= julianday(?) THEN 0 ELSE 1 END, aw.updated_at DESC, t.updated_at DESC, t.id LIMIT ? OFFSET ?`
+		args = append(args, staleCutoff, limit+1, filter.Cursor)
+	} else {
+		query += ` ORDER BY CASE WHEN t.claimed_by=? AND t.claim_expires_at IS NOT NULL AND julianday(t.claim_expires_at) > julianday(?) THEN 0 ELSE 1 END, c.position, t.position, t.updated_at DESC, t.id LIMIT ? OFFSET ?`
+		args = append(args, actorID, timestamp, limit+1, filter.Cursor)
+	}
 	rows, err := s.DB.QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, false, err
@@ -327,7 +376,7 @@ func (s *Store) listMyWorkFiltered(ctx context.Context, actorID string, projectI
 		result = result[:limit]
 	}
 	for i := range result {
-		if err := s.enrichTask(ctx, &result[i]); err != nil {
+		if err := s.enrichTaskAt(ctx, &result[i], readAt); err != nil {
 			return nil, false, err
 		}
 	}

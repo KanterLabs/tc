@@ -68,6 +68,9 @@ python3 scripts/tc_roadmap.py progress \
   --total 3 \
   --message "Skill validation passed; installing the session updater next" \
   --next "Verify a no-op update" \
+  --checkpoint-ref "skills/tc-roadmap/SKILL.md" \
+  --checkpoint-ref "skills/tc-roadmap/scripts/tc_roadmap.py" \
+  --checkpoint-ref "skills/tc-roadmap/scripts/test_tc_roadmap.py" \
   --operation-id "stable-session-local-id"
 ```
 
@@ -75,10 +78,14 @@ Do not post narration, secrets, raw logs, customer data, tokens, local credentia
 
 Use the structured options when they are known so the in-progress experience
 can show a concise agent pulse without forcing Shane to read the full activity
-log. States are `working`, `waiting`, `verifying`, and `handoff`. Counts must be
-measurable checkpoints, not an invented percentage or ETA. Keep the message to
+log. Structured progress is sent as a claimed, version-checked task update;
+when `--state` is omitted, it defaults to `working`. States are `working`,
+`waiting`, `verifying`, and `handoff`. Counts must be measurable checkpoints,
+not an invented percentage or ETA, and `--checkpoint-ref` can be repeated for
+relevant files, tests, or other safe evidence references. Keep the message to
 the result or decision and `--next` to the next concrete action. Use plain
-`--message` for backward compatibility when structured context is unavailable.
+`--message` for backward compatibility when structured context is unavailable;
+that form remains a task comment.
 
 ## Protect persistent data
 

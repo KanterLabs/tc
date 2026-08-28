@@ -1,6 +1,7 @@
 package httpapi
 
 import (
+	"encoding/json"
 	"net/http"
 	"strconv"
 
@@ -78,6 +79,8 @@ func redactRoadmapForIdentity(identity auth.Identity, roadmap store.Roadmap) sto
 	}
 	if !identity.HasScope("events:read") {
 		roadmap.RecentActivity = []store.Event{}
+	} else {
+		roadmap.RecentActivity = redactEventsForIdentity(identity, roadmap.RecentActivity)
 	}
 	return roadmap
 }
@@ -118,6 +121,11 @@ func (s *Server) myWork(w http.ResponseWriter, r *http.Request, identity auth.Id
 		s.writeError(w, http.StatusForbidden, "forbidden", "a project is required for a scoped token", nil)
 		return
 	}
+	view, err := parseOptionalEnum(r, "view", map[string]struct{}{"assigned": {}, "live": {}})
+	if err != nil {
+		s.writeError(w, http.StatusBadRequest, "invalid_request", err.Error(), nil)
+		return
+	}
 	limit, offset, paginationErr := parsePagination(r, 50)
 	if paginationErr != nil {
 		s.writeError(w, http.StatusBadRequest, "invalid_request", paginationErr.Error(), nil)
@@ -138,6 +146,16 @@ func (s *Server) myWork(w http.ResponseWriter, r *http.Request, identity auth.Id
 		s.writeError(w, http.StatusBadRequest, "invalid_request", err.Error(), nil)
 		return
 	}
+	agentState, err := parseOptionalEnum(r, "agent_state", agentWorkStates)
+	if err != nil {
+		s.writeError(w, http.StatusBadRequest, "invalid_request", err.Error(), nil)
+		return
+	}
+	actionNeeded, err := parseOptionalStrictBool(r, "action_needed")
+	if err != nil {
+		s.writeError(w, http.StatusBadRequest, "invalid_request", err.Error(), nil)
+		return
+	}
 	query, err := parseOptionalSearch(r)
 	if err != nil {
 		s.writeError(w, http.StatusBadRequest, "invalid_request", err.Error(), nil)
@@ -148,7 +166,7 @@ func (s *Server) myWork(w http.ResponseWriter, r *http.Request, identity auth.Id
 		s.writeError(w, http.StatusBadRequest, "invalid_request", err.Error(), nil)
 		return
 	}
-	filter := store.TaskFilter{State: state, Priority: priority, Label: label, Query: query, Cursor: offset, Limit: limit, UpdatedAfter: updatedAfter}
+	filter := store.TaskFilter{State: state, Priority: priority, Label: label, AgentState: agentState, ActionNeeded: actionNeeded, LiveWork: view == "live", Query: query, Cursor: offset, Limit: limit, UpdatedAfter: updatedAfter}
 	tasks, more, err := s.Store.ListMyWorkFilteredWithExtra(r.Context(), identity.Actor.ID, projectIDs, filter)
 	if err != nil {
 		s.writeInternal(w, err)
@@ -210,5 +228,48 @@ func (s *Server) events(w http.ResponseWriter, r *http.Request, identity auth.Id
 	if more && len(events) > 0 {
 		next = strconv.FormatInt(events[len(events)-1].Cursor, 10)
 	}
+	events = redactEventsForIdentity(identity, events)
 	s.writeCollection(w, events, next)
+}
+
+// redactEventsForIdentity prevents an events:read-only bearer token from
+// using task.progressed events as a side channel for task narrative. The
+// progress event intentionally retains machine-readable state and checkpoint
+// counts so polling clients can drive coordination without tasks:read.
+func redactEventsForIdentity(identity auth.Identity, events []store.Event) []store.Event {
+	if !identity.IsToken || identity.HasScope("tasks:read") {
+		return events
+	}
+	result := make([]store.Event, len(events))
+	copy(result, events)
+	for i := range result {
+		if result[i].Type != "task.progressed" || len(result[i].Payload) == 0 {
+			continue
+		}
+		var payload map[string]any
+		if err := json.Unmarshal(result[i].Payload, &payload); err != nil || payload == nil {
+			continue
+		}
+		if !redactAgentWorkNarrative(payload) {
+			continue
+		}
+		if encoded, err := json.Marshal(payload); err == nil {
+			result[i].Payload = encoded
+		}
+	}
+	return result
+}
+
+func redactAgentWorkNarrative(payload map[string]any) bool {
+	changed := false
+	for _, field := range []string{"summary", "phase", "next_action", "checkpoint_refs"} {
+		if _, ok := payload[field]; ok {
+			delete(payload, field)
+			changed = true
+		}
+	}
+	if nested, ok := payload["agent_work"].(map[string]any); ok {
+		changed = redactAgentWorkNarrative(nested) || changed
+	}
+	return changed
 }

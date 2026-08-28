@@ -109,27 +109,60 @@ type Label struct {
 }
 
 type Task struct {
-	ID             string  `json:"id"`
-	Number         int     `json:"number"`
-	Key            string  `json:"key"`
-	ProjectID      string  `json:"project_id"`
-	Kind           string  `json:"kind"`
-	ColumnID       string  `json:"column_id"`
-	Title          string  `json:"title"`
-	Description    string  `json:"description"`
-	Priority       string  `json:"priority"`
-	Position       float64 `json:"position"`
-	Assignee       *string `json:"assignee,omitempty"`
-	ClaimedBy      *string `json:"claimed_by,omitempty"`
-	ClaimExpiresAt *string `json:"claim_expires_at,omitempty"`
-	DueAt          *string `json:"due_at,omitempty"`
-	Version        int64   `json:"version"`
-	CompletedAt    *string `json:"completed_at,omitempty"`
-	CreatedAt      string  `json:"created_at"`
-	UpdatedAt      string  `json:"updated_at"`
-	Labels         []Label `json:"labels"`
-	CommentCount   int     `json:"comment_count"`
-	Bug            *Bug    `json:"bug,omitempty"`
+	ID             string     `json:"id"`
+	Number         int        `json:"number"`
+	Key            string     `json:"key"`
+	ProjectID      string     `json:"project_id"`
+	Kind           string     `json:"kind"`
+	ColumnID       string     `json:"column_id"`
+	Title          string     `json:"title"`
+	Description    string     `json:"description"`
+	Priority       string     `json:"priority"`
+	Position       float64    `json:"position"`
+	Assignee       *string    `json:"assignee,omitempty"`
+	ClaimedBy      *string    `json:"claimed_by,omitempty"`
+	ClaimExpiresAt *string    `json:"claim_expires_at,omitempty"`
+	DueAt          *string    `json:"due_at,omitempty"`
+	Version        int64      `json:"version"`
+	CompletedAt    *string    `json:"completed_at,omitempty"`
+	CreatedAt      string     `json:"created_at"`
+	UpdatedAt      string     `json:"updated_at"`
+	Labels         []Label    `json:"labels"`
+	CommentCount   int        `json:"comment_count"`
+	Bug            *Bug       `json:"bug,omitempty"`
+	AgentWork      *AgentWork `json:"agent_work,omitempty"`
+}
+
+// AgentWork is the latest progress pulse published for a task. Stale and
+// action-needed are derived at read time so clients do not have to infer the
+// liveness of a server-owned timestamp.
+type AgentWork struct {
+	OperationID         string   `json:"operation_id"`
+	ActorID             string   `json:"actor_id"`
+	State               string   `json:"state"`
+	Phase               string   `json:"phase"`
+	Summary             string   `json:"summary"`
+	NextAction          string   `json:"next_action"`
+	CheckpointRefs      []string `json:"checkpoint_refs"`
+	CheckpointCompleted *int     `json:"checkpoint_completed,omitempty"`
+	CheckpointTotal     *int     `json:"checkpoint_total,omitempty"`
+	StartedAt           string   `json:"started_at"`
+	UpdatedAt           string   `json:"updated_at"`
+	Stale               bool     `json:"stale"`
+	ActionNeeded        bool     `json:"action_needed"`
+}
+
+// AgentWorkInput is a complete replacement snapshot. Omitted optional text,
+// refs, and checkpoint counts clear the corresponding prior values.
+type AgentWorkInput struct {
+	OperationID         string   `json:"operation_id"`
+	State               string   `json:"state"`
+	Phase               string   `json:"phase"`
+	Summary             string   `json:"summary"`
+	NextAction          string   `json:"next_action"`
+	CheckpointRefs      []string `json:"checkpoint_refs"`
+	CheckpointCompleted *int     `json:"checkpoint_completed"`
+	CheckpointTotal     *int     `json:"checkpoint_total"`
 }
 
 // Bug contains the typed metadata associated with a bug task. The detail row
@@ -223,6 +256,9 @@ type TaskFilter struct {
 	Severity     string
 	Reporter     string
 	Resolution   string
+	AgentState   string
+	ActionNeeded bool
+	LiveWork     bool
 	Query        string
 	UpdatedAfter *time.Time
 	// ProjectIDs restricts global issue listings to an explicit allow-list.

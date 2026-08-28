@@ -85,6 +85,16 @@ func (s *Server) tasks(w http.ResponseWriter, r *http.Request, identity auth.Ide
 			s.writeError(w, http.StatusBadRequest, "invalid_request", err.Error(), nil)
 			return
 		}
+		agentState, err := parseOptionalEnum(r, "agent_state", agentWorkStates)
+		if err != nil {
+			s.writeError(w, http.StatusBadRequest, "invalid_request", err.Error(), nil)
+			return
+		}
+		actionNeeded, err := parseOptionalStrictBool(r, "action_needed")
+		if err != nil {
+			s.writeError(w, http.StatusBadRequest, "invalid_request", err.Error(), nil)
+			return
+		}
 		query, err := parseOptionalSearch(r)
 		if err != nil {
 			s.writeError(w, http.StatusBadRequest, "invalid_request", err.Error(), nil)
@@ -95,7 +105,7 @@ func (s *Server) tasks(w http.ResponseWriter, r *http.Request, identity auth.Ide
 			s.writeError(w, http.StatusBadRequest, "invalid_request", err.Error(), nil)
 			return
 		}
-		filter := store.TaskFilter{State: state, Column: columnFilter, Priority: priority, Label: label, Assignee: assignee, Kind: kind, Severity: severity, Reporter: reporter, Resolution: resolution, Query: query, Cursor: offset, Limit: limit, UpdatedAfter: updatedAfter}
+		filter := store.TaskFilter{State: state, Column: columnFilter, Priority: priority, Label: label, Assignee: assignee, Kind: kind, Severity: severity, Reporter: reporter, Resolution: resolution, AgentState: agentState, ActionNeeded: actionNeeded, Query: query, Cursor: offset, Limit: limit, UpdatedAfter: updatedAfter}
 		tasks, more, err := s.Store.ListTasksWithExtra(r.Context(), project.ID, filter)
 		if err != nil {
 			s.writeInternal(w, err)

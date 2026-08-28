@@ -219,17 +219,44 @@ Normal deployment requires these secrets:
 * `ROADMAP_CF_ACCESS_CLIENT_ID`
 * `ROADMAP_CF_ACCESS_CLIENT_SECRET`
 
-The install transaction stops the connector and application, creates a
-SQLite online-backup in `/var/lib/roadmap/backups`, verifies its checksum and
-`PRAGMA integrity_check`, then atomically switches
-`/var/lib/roadmap/current` to the new release. The database remains at
-`/var/lib/roadmap/data/roadmap.db` and is never replaced by a release. The
-state root, retained releases, and backups are root-owned; only the dedicated
-data directory is writable by `roadmap`. Failed
-health or connector checks automatically switch back and restart the previous
-release. Five releases and fourteen backups are retained by default; a
-randomized persistent systemd timer also runs the same verified backup helper
-daily. Pruning never removes the active release.
+The install transaction first creates an online SQLite backup while the
+application is still serving. The backup sidecars record the source
+`schema_version` and embedded `migration_digest`; the complete-set check
+validates those fields, the checksum, `PRAGMA integrity_check`, and
+`PRAGMA foreign_key_check`. The candidate binary then runs
+`schema-preflight` against a private copy of that verified backup. Only after
+that copy reaches the candidate's latest schema does the installer stop the
+connector and application and atomically switch `/var/lib/roadmap/current` to
+the new release. The production database remains at
+`/var/lib/roadmap/data/roadmap.db` and is never used as the preflight target.
+The state root, retained releases, and backups are root-owned; only the
+dedicated data directory is writable by `roadmap`. Failed health or connector
+checks automatically switch back and restart the previous release without
+restoring or migrating the database. Five releases and fourteen backups are
+retained by default; a randomized persistent systemd timer also runs the same
+verified backup helper daily. Historical backups made before schema metadata
+was introduced remain valid explicit restore sources and are not silently
+pruned solely because those fields are absent.
+
+The normal server intentionally tolerates an unknown newer schema version so a
+retained rollback binary can continue to start. To inspect a candidate without
+touching its source database, run the explicit command against a verified
+standalone backup:
+
+```sh
+/var/lib/roadmap/current/roadmap schema-preflight \
+  /var/lib/roadmap/backups/roadmap-<timestamp>-<sha-or-manual>.db
+```
+
+`migration-preflight` is an equivalent command name. Both copy the supplied
+file into a mode-0600 temporary sibling, run migrations and integrity checks on
+that copy, report the final schema version/digest, and remove the copy. They
+reject a live WAL source; use `roadmap-backup` for an online database. The
+one-shot `migration-info` command reports only the embedded version and digest.
+During the rollback window, the new backup helper may be paired with an older
+retained binary that has no `migration-info`; it reuses the newest complete
+backup's recorded digest (or a deterministic fresh-install compatibility
+identity when no prior backup exists) and never prints credentials.
 
 To make an explicit backup (for example before an operator migration):
 
@@ -263,18 +290,21 @@ pct exec 103 -- /usr/local/sbin/roadmap-restore \
   /var/lib/roadmap/backups/roadmap-20260827T120000Z-<sha-or-manual>.db
 ```
 
-The helper validates the matching checksum/metadata sidecars and SQLite
-integrity, stops both services, preserves the current database as a new
-recoverable `pre-restore` backup, prunes older backups under the configured
-retention while protecting both that recovery snapshot and the selected source,
-and atomically installs the candidate. It
-overlays the current authorization state (including actor password, admin,
-disabled/deleted state, setup, and valid project grants), disables and clears
-credentials for actors that exist only in the old backup, and clears all
-sessions, application tokens, and idempotency records before restart. Rotate
-the Cloudflare service token and any credentials that may have been exposed by
-the incident; reissue agent credentials after validation. Never swap a raw
-SQLite file or bypass this helper.
+The helper validates the matching checksum/metadata sidecars and both SQLite
+integrity predicates, stops both services, preserves the current database as a
+new recoverable `pre-restore` backup, and stages the selected source. Before
+the authorization overlay, the active binary migrates that disposable staged
+candidate; this is what makes old retained schema prefixes safe to restore.
+Only then does the helper overlay the current authorization state (including
+actor password, admin, disabled/deleted state, setup, and valid project
+grants), disable and clear credentials for actors that exist only in the old
+backup, and clear all sessions, application tokens, and idempotency records
+before restart. The final candidate is checked again before activation.
+Restore is explicit and destructive; binary-only rollback never restores a
+database or runs a migration. Rotate the Cloudflare service token and any
+credentials that may have been exposed by the incident; reissue agent
+credentials after validation. Never swap a raw SQLite file or bypass this
+helper.
 
 ## Recovery checks
 

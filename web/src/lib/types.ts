@@ -6,6 +6,49 @@ export type BugResolution = 'fixed' | 'duplicate' | 'not_planned' | 'cannot_repr
 export type ActorKind = 'human' | 'agent';
 export type Scope = 'projects:read' | 'projects:write' | 'tasks:read' | 'tasks:write' | 'tasks:claim' | 'events:read';
 
+/** States published by an agent while it is actively working a task. */
+export type AgentWorkState = 'working' | 'waiting' | 'verifying' | 'handoff';
+/** Published states plus server-derived collection filters. */
+export type AgentWorkStateFilter = AgentWorkState | 'stale' | 'missing';
+
+/**
+ * The server's current, structured progress for an agent-owned task.
+ *
+ * `stale` and `action_needed` are response-time conveniences supplied by the
+ * API. Consumers should still derive them from `updated_at` when rendering a
+ * long-lived response so the displayed state does not age silently.
+ */
+export interface AgentWork {
+  operation_id: string;
+  actor_id: string;
+  state: AgentWorkState;
+  phase?: string;
+  summary: string;
+  next_action?: string;
+  checkpoint_refs: string[];
+  checkpoint_completed?: number;
+  checkpoint_total?: number;
+  started_at: string;
+  updated_at: string;
+  stale: boolean;
+  action_needed: boolean;
+}
+
+/** Fields accepted when an agent publishes or refreshes task work. */
+export interface AgentWorkInput {
+  operation_id: string;
+  state: AgentWorkState;
+  phase?: string;
+  summary: string;
+  next_action?: string;
+  checkpoint_refs?: string[];
+  checkpoint_completed?: number;
+  checkpoint_total?: number;
+}
+
+/** More explicit alias for callers that prefer the endpoint's action name. */
+export type PublishAgentWorkInput = AgentWorkInput;
+
 export interface Actor {
   id: string;
   kind: ActorKind;
@@ -121,6 +164,8 @@ export interface Task {
   completed_at?: string;
   labels?: Label[];
   comment_count?: number;
+  /** Structured progress published by the current agent, when present. */
+  agent_work?: AgentWork | null;
 }
 
 export interface Comment {

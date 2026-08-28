@@ -1,6 +1,25 @@
 import { describe, expect, it } from 'vitest';
-import { bugReporterId, bugResolution, bugSeverity, dateToIso, filterTasks, formatDate, moveTaskLocal, nextPosition, projectInitials, toInputDate } from './state';
-import type { Column, Task } from './types';
+import {
+  agentWorkActionNeeded,
+  agentWorkProgressLabel,
+  bugReporterId,
+  bugResolution,
+  bugSeverity,
+  columnLookupByProject,
+  dateToIso,
+  displayAgentWorkStatus,
+  filterTasks,
+  formatDate,
+  groupLiveWork,
+  isAgentWorkStale,
+  liveWorkGroup,
+  moveTaskLocal,
+  nextPosition,
+  projectInitials,
+  sortLiveWork,
+  toInputDate
+} from './state';
+import type { AgentWork, Column, Task } from './types';
 
 const columns: Column[] = [
   { id: 'backlog', project_id: 'p', name: 'Backlog', semantic_state: 'backlog', position: 0 },
@@ -20,6 +39,37 @@ const bugTask: Task = {
   },
   priority: 'urgent', position: 1, version: 1
 };
+
+const workNow = Date.parse('2026-08-28T12:00:00Z');
+
+function liveTask(id: string, work: Partial<AgentWork> | null, updatedAt?: string): Task {
+  return {
+    id,
+    number: Number(id.replace(/\D/g, '')) || 1,
+    key: `OPS-${id}`,
+    project_id: 'p',
+    column_id: 'active',
+    title: id,
+    priority: 'normal',
+    position: 0,
+    version: 1,
+    updated_at: updatedAt,
+    agent_work: work
+      ? {
+          operation_id: 'operation-1',
+          actor_id: 'agent-1',
+          state: 'working',
+          summary: 'Update',
+          checkpoint_refs: [],
+          started_at: '2026-08-28T10:00:00Z',
+          updated_at: '2026-08-28T11:59:00Z',
+          stale: false,
+          action_needed: false,
+          ...work
+        }
+      : null
+  };
+}
 
 describe('board state helpers', () => {
   it('filters by text, priority, label, and column semantic state', () => {
@@ -56,5 +106,73 @@ describe('board state helpers', () => {
     expect(toInputDate('2026-08-27')).toBe('2026-08-27');
     expect(toInputDate('2026-08-27T23:59:59Z')).toBe('2026-08-27');
     expect(formatDate('2026-08-27')).toBe(formatDate('2026-08-27T23:59:59Z'));
+  });
+
+  it('marks agent work stale at exactly fifteen minutes and handles bad timestamps', () => {
+    expect(isAgentWorkStale('2026-08-28T11:45:00Z', workNow)).toBe(true);
+    expect(isAgentWorkStale('2026-08-28T11:45:01Z', workNow)).toBe(false);
+    expect(isAgentWorkStale('2026-08-28T12:01:00Z', workNow)).toBe(false);
+    expect(isAgentWorkStale('not-a-timestamp', workNow)).toBe(false);
+    expect(isAgentWorkStale('2026-08-28T11:45:00Z', 'not-a-timestamp')).toBe(false);
+  });
+
+  it('classifies missing, fresh, stale, and waiting work without losing waiting context', () => {
+    const fresh = liveTask('fresh', { state: 'working', updated_at: '2026-08-28T11:46:00Z' });
+    const stale = liveTask('stale', { state: 'working', updated_at: '2026-08-28T11:45:00Z' });
+    const waiting = liveTask('waiting', { state: 'waiting', updated_at: '2026-08-28T10:00:00Z' });
+    const handoff = liveTask('handoff', { state: 'handoff', updated_at: '2026-08-28T11:59:00Z' });
+    const missing = liveTask('missing', null);
+
+    expect(displayAgentWorkStatus(fresh, workNow)).toBe('working');
+    expect(displayAgentWorkStatus(stale, workNow)).toBe('stale');
+    expect(displayAgentWorkStatus(waiting, workNow)).toBe('waiting');
+    expect(agentWorkActionNeeded(stale, workNow)).toBe(true);
+    expect(agentWorkActionNeeded(waiting, workNow)).toBe(true);
+    expect(agentWorkActionNeeded(handoff, workNow)).toBe(true);
+    expect(displayAgentWorkStatus(missing, workNow)).toBe('missing');
+    expect(agentWorkActionNeeded(missing, workNow)).toBe(false);
+    expect(displayAgentWorkStatus(liveTask('bad', { updated_at: 'bad' }), workNow)).toBe('working');
+  });
+
+  it('formats checkpoint progress and refuses malformed or partial counts', () => {
+    expect(agentWorkProgressLabel(liveTask('full', { checkpoint_completed: 2, checkpoint_total: 4 }))).toBe('2/4');
+    expect(agentWorkProgressLabel(liveTask('refs', { checkpoint_completed: 1, checkpoint_refs: ['a', 'b', 'c'] }))).toBe('1/3');
+    expect(agentWorkProgressLabel(liveTask('partial', { checkpoint_completed: 1 }))).toBe('');
+    expect(agentWorkProgressLabel(liveTask('invalid', { checkpoint_completed: 4, checkpoint_total: 2 }))).toBe('');
+    expect(agentWorkProgressLabel(liveTask('none', null))).toBe('');
+  });
+
+  it('sorts live work by attention bucket then newest update and groups it', () => {
+    const tasks = [
+      liveTask('working', { state: 'working', updated_at: '2026-08-28T11:59:00Z' }),
+      liveTask('missing', null, '2026-08-28T11:58:00Z'),
+      liveTask('verifying', { state: 'verifying', updated_at: '2026-08-28T11:59:30Z' }),
+      liveTask('handoff', { state: 'handoff', updated_at: '2026-08-28T11:57:00Z' }),
+      liveTask('waiting', { state: 'waiting', updated_at: '2026-08-28T11:56:00Z' }),
+      liveTask('stale', { state: 'working', updated_at: '2026-08-28T11:00:00Z' })
+    ];
+
+    expect(sortLiveWork(tasks, workNow).map((task) => task.id)).toEqual([
+      'handoff',
+      'waiting',
+      'stale',
+      'verifying',
+      'working',
+      'missing'
+    ]);
+    expect(tasks.map((task) => task.id)).toEqual(['working', 'missing', 'verifying', 'handoff', 'waiting', 'stale']);
+    expect(liveWorkGroup(tasks[5], workNow)).toBe('stale');
+    expect(groupLiveWork(tasks, workNow).waiting.map((task) => task.id)).toEqual(['waiting']);
+    expect(groupLiveWork(tasks, workNow).missing.map((task) => task.id)).toEqual(['missing']);
+  });
+
+  it('builds independent per-project column lookups', () => {
+    const lookup = columnLookupByProject([
+      ...columns,
+      { id: 'ready-2', project_id: 'p-2', name: 'Ready', semantic_state: 'ready', position: 0 }
+    ]);
+    expect(lookup.get('p')?.get('active')?.name).toBe('In progress');
+    expect(lookup.get('p-2')?.get('ready-2')?.semantic_state).toBe('ready');
+    expect(lookup.get('p')?.get('ready-2')).toBeUndefined();
   });
 });

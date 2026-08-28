@@ -856,7 +856,12 @@ paths:
       description: |
         Results are ordered by column position and task position. `state`,
         `column`, `kind`, `priority`, `severity`, `label`, `assignee`,
-        `reporter`, `resolution`, `q`, and `updated_after` can be combined.
+        `reporter`, `resolution`, `agent_state`, `action_needed`, `q`, and
+        `updated_after` can be combined. `agent_state` filters the latest
+        structured agent-work snapshot; `stale` and `missing` identify
+        read-time liveness conditions. `action_needed=true` selects waiting,
+        handoff, or stale snapshots. `action_needed=false` is accepted as an
+        explicit no-op filter for clients that build filters dynamically.
         `state` filters by a column's semantic state. Supplied scalar filters
         are single-valued; empty identifier/enum/timestamp values and values
         outside their declared enum, format, or length are rejected with
@@ -873,6 +878,8 @@ paths:
         - $ref: '#/components/parameters/AssigneeFilter'
         - $ref: '#/components/parameters/ReporterFilter'
         - $ref: '#/components/parameters/ResolutionFilter'
+        - $ref: '#/components/parameters/AgentStateFilter'
+        - $ref: '#/components/parameters/ActionNeededFilter'
         - $ref: '#/components/parameters/SearchQuery'
         - $ref: '#/components/parameters/UpdatedAfter'
         - $ref: '#/components/parameters/Cursor'
@@ -1247,6 +1254,90 @@ paths:
           $ref: '#/components/responses/NotFound'
         '409':
           $ref: '#/components/responses/Conflict'
+        '413':
+          $ref: '#/components/responses/RequestTooLarge'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '507':
+          $ref: '#/components/responses/InsufficientStorage'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+
+  /api/v1/tasks/{task}/progress:
+    parameters:
+      - $ref: '#/components/parameters/TaskPath'
+    post:
+      operationId: publishTaskProgress
+      summary: Publish an agent progress snapshot
+      description: |
+        Replace the task's live structured agent-work snapshot. The caller
+        must have `tasks:claim`, send the exact current task ETag in
+        `If-Match`, and hold the task's active claim. This is a complete
+        snapshot: omitted optional fields clear their previous values. The
+        mutation appends the progress event and its human-readable comment in
+        the same transaction. Reusing an Idempotency-Key with the same
+        authenticated principal, path, and request body replays the original
+        response without publishing a second snapshot, comment, or event.
+        `working`, `waiting`, `verifying`, and `handoff` are publishable states;
+        `stale` and `missing` are read-time filter states only.
+      tags:
+        - Tasks
+      parameters:
+        - $ref: '#/components/parameters/IfMatch'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AgentWorkPublishRequest'
+            example:
+              operation_id: codex/ops-release
+              state: working
+              phase: Implementing event polling
+              summary: Added the progress persistence and HTTP contract.
+              next_action: Run the focused API tests.
+              checkpoint_refs:
+                - api-contract
+                - http-tests
+              checkpoint_completed: 1
+              checkpoint_total: 2
+      responses:
+        '200':
+          description: |
+            Updated task. Humans and bearer tokens with `tasks:read` receive
+            the full task, while bearer tokens without `tasks:read` receive
+            only `{id,version}`. The response includes the strong task ETag.
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/XRequestID'
+            X-Roadmap-Revision:
+              $ref: '#/components/headers/XRoadmapRevision'
+            ETag:
+              $ref: '#/components/headers/ETag'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TaskMutationResponse'
+              examples:
+                full:
+                  $ref: '#/components/examples/TaskProgressedExample'
+                reduced:
+                  $ref: '#/components/examples/TaskMutationSummaryExample'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/TaskMutationConflict'
+        '428':
+          $ref: '#/components/responses/PreconditionRequired'
         '413':
           $ref: '#/components/responses/RequestTooLarge'
         '429':
@@ -1904,16 +1995,24 @@ paths:
       operationId: listMyWork
       summary: List work assigned to the current actor
       description: |
-        Returns tasks assigned to the authenticated actor across all projects,
-        or across the requested project. Results include assigned tasks and
-        tasks with an active claim owned by the actor. An unknown requested
+        By default, returns tasks assigned to the authenticated actor across
+        all projects, or across the requested project. Results include
+        assigned tasks and tasks with an active claim owned by the actor. Set
+        `view=live` for the coordination pulse view: it returns unfinished
+        tasks that have a structured agent-work snapshot, ordered with
+        action-needed pulses first. `view=assigned` is an explicit spelling of
+        the legacy actor-assignment and active-claim view. `agent_state` and
+        `action_needed` can be combined with either view. An unknown requested
         project returns 404; a project-scoped token must name a project.
       tags:
         - My work
       parameters:
+        - $ref: '#/components/parameters/MyWorkView'
         - $ref: '#/components/parameters/TaskState'
         - $ref: '#/components/parameters/PriorityFilter'
         - $ref: '#/components/parameters/LabelFilter'
+        - $ref: '#/components/parameters/AgentStateFilter'
+        - $ref: '#/components/parameters/ActionNeededFilter'
         - $ref: '#/components/parameters/SearchQuery'
         - $ref: '#/components/parameters/UpdatedAfter'
         - name: project
@@ -2042,6 +2141,11 @@ paths:
       description: |
         Supply `after` with the last integer cursor seen to receive subsequent
         project, task, claim, comment, completion, and bug lifecycle events.
+        Agent progress publishes `task.progressed` events containing the
+        machine-readable state and checkpoint counts. Bearer tokens with
+        `events:read` but without `tasks:read` receive those coordination
+        fields with progress narrative (`phase`, `summary`, `next_action`,
+        and `checkpoint_refs`) redacted.
         Bug lifecycle events (`bug.created`, `bug.updated`, `bug.triaged`,
         `bug.resolved`, `bug.duplicated`, and `bug.reopened`) carry lifecycle
         and version metadata and are emitted in the same transaction as the
@@ -2580,6 +2684,52 @@ components:
       schema:
         $ref: '#/components/schemas/Timestamp'
       example: '2026-08-27T00:00:00Z'
+    AgentStateFilter:
+      name: agent_state
+      in: query
+      required: false
+      description: |
+        Filter by the latest agent-work state. `working`, `waiting`,
+        `verifying`, and `handoff` are published states; `stale` and `missing`
+        are read-time liveness states. Values are lowercase and repeated or
+        invalid values return 400.
+      schema:
+        type: string
+        enum:
+          - working
+          - waiting
+          - verifying
+          - handoff
+          - stale
+          - missing
+      example: waiting
+    ActionNeededFilter:
+      name: action_needed
+      in: query
+      required: false
+      description: |
+        Strict lowercase boolean. `true` selects waiting, handoff, or stale
+        agent-work snapshots; `false` leaves the result unfiltered. Empty,
+        malformed, or repeated values return 400.
+      schema:
+        type: boolean
+      example: true
+    MyWorkView:
+      name: view
+      in: query
+      required: false
+      description: |
+        Set to `live` for the coordination pulse view of unfinished tasks with
+        agent-work snapshots. Set to `assigned` or omit it to retain the
+        legacy actor-assignment and active-claim view. Empty, unsupported, or
+        repeated values return 400.
+      schema:
+        type: string
+        enum:
+          - assigned
+          - live
+        default: assigned
+      example: live
 
   responses:
     MethodNotAllowed:
@@ -3286,6 +3436,9 @@ components:
         bug:
           $ref: '#/components/schemas/BugDetails'
           description: Bug-specific details; omitted for ordinary tasks.
+        agent_work:
+          $ref: '#/components/schemas/AgentWork'
+          description: Latest structured agent progress snapshot; omitted when no pulse has been published.
         priority:
           $ref: '#/components/schemas/Priority'
         position:
@@ -3324,6 +3477,131 @@ components:
         comment_count:
           type: integer
           minimum: 0
+      additionalProperties: false
+
+    AgentWork:
+      type: object
+      required:
+        - operation_id
+        - actor_id
+        - state
+        - phase
+        - summary
+        - next_action
+        - checkpoint_refs
+        - started_at
+        - updated_at
+        - stale
+        - action_needed
+      description: |
+        The latest complete agent progress snapshot for a task. `stale` is
+        derived when the snapshot has not been updated within the server's
+        liveness window. `action_needed` is true for waiting, handoff, or stale
+        snapshots. Checkpoint counts are either both present or both omitted.
+      properties:
+        operation_id:
+          type: string
+          minLength: 1
+          maxLength: 128
+          pattern: '^[A-Za-z0-9][A-Za-z0-9_.:/-]*$'
+        actor_id:
+          $ref: '#/components/schemas/Identifier'
+          description: Actor that published the latest snapshot.
+        state:
+          type: string
+          enum:
+            - working
+            - waiting
+            - verifying
+            - handoff
+        phase:
+          type: string
+          maxLength: 120
+        summary:
+          type: string
+          minLength: 1
+          maxLength: 1000
+        next_action:
+          type: string
+          maxLength: 1000
+        checkpoint_refs:
+          type: array
+          maxItems: 100
+          uniqueItems: true
+          items:
+            type: string
+            minLength: 1
+            maxLength: 128
+        checkpoint_completed:
+          type: integer
+          minimum: 0
+          maximum: 100
+        checkpoint_total:
+          type: integer
+          minimum: 1
+          maximum: 100
+        started_at:
+          $ref: '#/components/schemas/Timestamp'
+        updated_at:
+          $ref: '#/components/schemas/Timestamp'
+        stale:
+          type: boolean
+        action_needed:
+          type: boolean
+      additionalProperties: false
+
+    AgentWorkPublishRequest:
+      type: object
+      required:
+        - operation_id
+        - state
+        - summary
+      description: |
+        Complete replacement snapshot for POST /api/v1/tasks/{task}/progress.
+        Optional properties omitted from the request clear their previous
+        values. Null is not accepted for any property. Checkpoint counts must
+        be supplied together and satisfy 0 <= checkpoint_completed <=
+        checkpoint_total <= 100; non-empty checkpoint_refs must have the same
+        length as checkpoint_total.
+      properties:
+        operation_id:
+          type: string
+          minLength: 1
+          maxLength: 128
+          pattern: '^[A-Za-z0-9][A-Za-z0-9_.:/-]*$'
+        state:
+          type: string
+          enum:
+            - working
+            - waiting
+            - verifying
+            - handoff
+        phase:
+          type: string
+          maxLength: 120
+        summary:
+          type: string
+          minLength: 1
+          maxLength: 1000
+        next_action:
+          type: string
+          maxLength: 1000
+        checkpoint_refs:
+          type: array
+          maxItems: 100
+          uniqueItems: true
+          items:
+            type: string
+            minLength: 1
+            maxLength: 128
+        checkpoint_completed:
+          type: integer
+          minimum: 0
+          maximum: 100
+        checkpoint_total:
+          type: integer
+          minimum: 1
+          maximum: 100
       additionalProperties: false
 
     BugDetails:
@@ -4031,7 +4309,7 @@ components:
         type:
           type: string
           minLength: 1
-          description: Event type, for example task.claimed, task.completed, bug.triaged, bug.resolved, bug.duplicated, or bug.reopened.
+          description: Event type, for example task.claimed, task.progressed, task.completed, bug.triaged, bug.resolved, bug.duplicated, or bug.reopened.
           example: task.claimed
         actor_id:
           $ref: '#/components/schemas/Identifier'
@@ -4519,6 +4797,47 @@ components:
             created_at: '2026-08-27T09:00:00Z'
             updated_at: '2026-08-27T09:00:00Z'
         comment_count: 1
+    TaskProgressedExample:
+      summary: Task with the latest agent progress snapshot
+      value:
+        id: task_42
+        number: 42
+        key: OPS-42
+        project_id: proj_ops
+        column_id: col_active
+        kind: task
+        title: Add event polling
+        description: Implement incremental event polling for agents.
+        priority: high
+        position: 0
+        claimed_by: agent_ada
+        claim_expires_at: '2026-08-27T11:00:00Z'
+        version: 8
+        created_at: '2026-08-27T09:30:00Z'
+        updated_at: '2026-08-27T10:30:00Z'
+        labels: []
+        comment_count: 2
+        agent_work:
+          operation_id: codex/ops-release
+          actor_id: agent_ada
+          state: working
+          phase: Implementing event polling
+          summary: Added the progress persistence and HTTP contract.
+          next_action: Run the focused API tests.
+          checkpoint_refs:
+            - api-contract
+            - http-tests
+          checkpoint_completed: 1
+          checkpoint_total: 2
+          started_at: '2026-08-27T10:00:00Z'
+          updated_at: '2026-08-27T10:30:00Z'
+          stale: false
+          action_needed: false
+    TaskMutationSummaryExample:
+      summary: Reduced task mutation response for a write-only bearer token
+      value:
+        id: task_42
+        version: 8
     BugExample:
       summary: Open internal bug
       value:
@@ -4767,6 +5086,21 @@ components:
               version: 8
               claim_expires_at: '2026-08-27T11:00:00Z'
         next_cursor: '43'
+    TaskProgressedEventExample:
+      summary: Structured task progress event
+      value:
+        cursor: 44
+        id: event_44
+        type: task.progressed
+        actor_id: agent_ada
+        project_id: proj_ops
+        task_id: task_42
+        created_at: '2026-08-27T10:30:00Z'
+        payload:
+          version: 8
+          state: working
+          completed: 1
+          total: 2
     AgentCollectionExample:
       summary: Agent collection
       value:

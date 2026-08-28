@@ -589,6 +589,8 @@ func (s *Server) dispatchAuthed(w http.ResponseWriter, r *http.Request, identity
 			switch parts[2] {
 			case "comments":
 				s.comments(w, r, identity, parts[1])
+			case "progress":
+				s.taskProgress(w, r, identity, parts[1])
 			case "claim":
 				s.taskAction(w, r, identity, parts[1], "claim")
 			case "renew":
@@ -1335,6 +1337,27 @@ func parseOptionalBool(r *http.Request, name string) (bool, error) {
 		return false, nil
 	default:
 		return false, fmt.Errorf("%s must be a boolean", name)
+	}
+}
+
+// parseOptionalStrictBool is used by newer coordination filters whose wire
+// contract permits only the lowercase JSON-style query spellings. Unlike the
+// legacy helper above it does not trim or case-fold values.
+func parseOptionalStrictBool(r *http.Request, name string) (bool, error) {
+	value, present, err := queryValue(r, name)
+	if err != nil {
+		return false, err
+	}
+	if !present {
+		return false, nil
+	}
+	switch value {
+	case "true":
+		return true, nil
+	case "false":
+		return false, nil
+	default:
+		return false, fmt.Errorf("%s must be true or false", name)
 	}
 }
 

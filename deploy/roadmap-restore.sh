@@ -14,6 +14,9 @@ RETENTION=${ROADMAP_BACKUP_RETENTION:-14}
 BACKUP_PATH=${1:-}
 LOCK_PATH="$STATE_DIR/deploy.lock"
 SERVICE_STOP_TIMEOUT=30
+MIGRATION_DIGEST=${ROADMAP_MIGRATION_DIGEST:-}
+MIGRATION_INFO_BINARY=${ROADMAP_MIGRATION_INFO_BINARY:-$STATE_DIR/current/roadmap}
+MIGRATION_BINARY=${ROADMAP_MIGRATION_BINARY:-$STATE_DIR/current/roadmap}
 
 fail() {
 	printf '[roadmap-restore] %s\n' "$*" >&2
@@ -33,6 +36,48 @@ secure_backup_artifact() {
 	[[ "$owner" = root:root && "$mode" = 600 ]]
 }
 
+resolve_migration_digest() {
+	local schema_hint=${1:-0} info digest count metadata_path metadata_digest metadata_count metadata_db
+	if [[ -z "$MIGRATION_DIGEST" ]]; then
+		if [[ "$MIGRATION_INFO_BINARY" = /* && -f "$MIGRATION_INFO_BINARY" && ! -L "$MIGRATION_INFO_BINARY" && -x "$MIGRATION_INFO_BINARY" ]]; then
+			if info=$("$MIGRATION_INFO_BINARY" migration-info 2>/dev/null); then
+				count=$(awk -F= '$1 == "migration_digest" { count++ } END { print count + 0 }' <<<"$info") || return 1
+				if [[ "$count" = 1 ]]; then
+					digest=$(awk -F= '$1 == "migration_digest" { print $2 }' <<<"$info") || return 1
+					[[ "$digest" =~ ^[0-9a-f]{64}$ ]] && MIGRATION_DIGEST=$digest
+				fi
+			fi
+		fi
+	fi
+	if [[ -z "$MIGRATION_DIGEST" ]]; then
+		while IFS= read -r -d '' metadata_path; do
+			[[ -f "$metadata_path" && ! -L "$metadata_path" ]] || continue
+			metadata_db=${metadata_path%.metadata}
+			backup_set_is_complete "$metadata_db" || continue
+			[[ "$(stat -c '%U:%G' -- "$metadata_path" 2>/dev/null || true)" = root:root ]] || continue
+			[[ "$(stat -c '%a' -- "$metadata_path" 2>/dev/null || true)" = 600 ]] || continue
+			metadata_count=$(awk -F= '$1 == "migration_digest" { count++ } END { print count + 0 }' "$metadata_path") || continue
+			[[ "$metadata_count" = 1 ]] || continue
+			metadata_digest=$(awk -F= '$1 == "migration_digest" { print $2 }' "$metadata_path") || continue
+			if [[ "$metadata_digest" =~ ^[0-9a-f]{64}$ ]]; then
+				MIGRATION_DIGEST=$metadata_digest
+				break
+			fi
+		done < <(find "$BACKUP_DIR" -maxdepth 1 -type f -name 'roadmap-*.db.metadata' -printf '%T@ %p\n' 2>/dev/null | sort -nr | cut -d' ' -f2- | while IFS= read -r path; do printf '%s\0' "$path"; done)
+	fi
+	if [[ -z "$MIGRATION_DIGEST" ]]; then
+		MIGRATION_DIGEST=$(printf 'roadmap-migration-digest-fallback-v1\nschema_version=%s\n' "$schema_hint" | sha256sum | awk '{print $1}')
+	fi
+	[[ "$MIGRATION_DIGEST" =~ ^[0-9a-f]{64}$ ]]
+}
+
+schema_version_from_database() {
+	local path=$1 value
+	value=$(sqlite3 "$path" 'SELECT COALESCE(MAX(version), 0) FROM schema_migrations;') || return 1
+	[[ "$value" =~ ^[0-9]+$ ]] || return 1
+	printf '%s' "$value"
+}
+
 # A backup can be selected or counted for retention only when its database,
 # checksum sidecar, and metadata sidecar form one complete, trusted set. Keep
 # this predicate identical to the one used by roadmap-backup.sh so restore
@@ -40,6 +85,7 @@ secure_backup_artifact() {
 backup_set_is_complete() {
 	local path=$1 name parent checksum_path metadata_path checksum checksum_count
 	local expected_release metadata_release metadata_created checksum_name
+	local metadata_schema metadata_digest actual_schema schema_count digest_count
 	name=$(basename -- "$path")
 	backup_filename_is_valid "$name" || return 1
 	expected_release=${BASH_REMATCH[1]}
@@ -66,7 +112,32 @@ backup_set_is_complete() {
 	# A mismatch means the metadata release does not match its filename.
 	[[ "$metadata_release" = "$expected_release" ]] || return 1
 	[[ "$metadata_created" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$ ]] || return 1
+	schema_count=$(awk -F= '$1 == "schema_version" { count++ } END { print count + 0 }' "$metadata_path") || return 1
+	digest_count=$(awk -F= '$1 == "migration_digest" { count++ } END { print count + 0 }' "$metadata_path") || return 1
+	if [[ "$schema_count" = 0 && "$digest_count" = 0 ]]; then
+		# Historical backups predate schema metadata. They remain selectable;
+		# restore migrates their disposable candidate before using current-schema
+		# authorization columns.
+		:
+	else
+		[[ "$schema_count" = 1 && "$digest_count" = 1 ]] || return 1
+		metadata_schema=$(awk -F= '$1 == "schema_version" { print $2 }' "$metadata_path") || return 1
+		metadata_digest=$(awk -F= '$1 == "migration_digest" { print $2 }' "$metadata_path") || return 1
+		[[ "$metadata_schema" =~ ^[0-9]+$ && "$metadata_digest" =~ ^[0-9a-f]{64}$ ]] || return 1
+		actual_schema=$(schema_version_from_database "$path") || return 1
+		[[ "$actual_schema" = "$metadata_schema" ]] || return 1
+	fi
 	[[ "$(sqlite3 "$path" 'PRAGMA integrity_check;')" = ok ]] || return 1
+	[[ -z "$(sqlite3 "$path" 'PRAGMA foreign_key_check;')" ]] || return 1
+}
+
+backup_set_is_legacy() {
+	local metadata_path=$1 schema_count digest_count
+	metadata_path="$metadata_path.metadata"
+	[[ -f "$metadata_path" && ! -L "$metadata_path" ]] || return 1
+	schema_count=$(awk -F= '$1 == "schema_version" { count++ } END { print count + 0 }' "$metadata_path") || return 1
+	digest_count=$(awk -F= '$1 == "migration_digest" { count++ } END { print count + 0 }' "$metadata_path") || return 1
+	[[ "$schema_count" = 0 && "$digest_count" = 0 ]]
 }
 
 # Remove the database first so an interrupted prune cannot leave a final-name
@@ -302,6 +373,18 @@ restore_database_file() {
 	chmod 0640 "$DB_PATH" || return 1
 }
 
+migrate_staged_candidate() {
+	local candidate=$1 output candidate_schema
+	[[ -f "$candidate" && ! -L "$candidate" ]] || return 1
+	[[ "$MIGRATION_BINARY" = /* && -f "$MIGRATION_BINARY" && ! -L "$MIGRATION_BINARY" && -x "$MIGRATION_BINARY" ]] || return 1
+	[[ "$(stat -c '%U:%G' -- "$MIGRATION_BINARY")" = root:root ]] || return 1
+	output=$("$MIGRATION_BINARY" migration-apply "$candidate" 2>/dev/null) || return 1
+	grep -Fx 'status=ok' <<<"$output" >/dev/null || return 1
+	candidate_schema=$(schema_version_from_database "$candidate") || return 1
+	[[ "$candidate_schema" =~ ^[0-9]+$ ]] || return 1
+	[[ -z "$(sqlite3 "$candidate" 'PRAGMA foreign_key_check;')" ]] || return 1
+}
+
 restore_prior_services() {
 	local status=0
 	if (( roadmap_was_active == 1 )); then
@@ -434,6 +517,9 @@ prune_backups() {
 		if [[ "$path" = "$protected_recovery" || "$path" = "$protected_selected" ]]; then
 			continue
 		fi
+		# Do not silently age out historical backups that lack the newer schema
+		# metadata fields; they remain valid explicit restore sources.
+		backup_set_is_legacy "$path" && continue
 		kept=$((kept + 1))
 		(( kept <= RETENTION )) && continue
 		remove_backup_set "$path" || return 1
@@ -530,13 +616,23 @@ if (( live_database_present == 1 )); then
 	fi
 	[[ "$(sqlite3 "$current_tmp" 'PRAGMA integrity_check;')" = ok ]] \
 		|| fail 'active database snapshot failed SQLite integrity check'
+	[[ -z "$(sqlite3 "$current_tmp" 'PRAGMA foreign_key_check;')" ]] \
+		|| fail 'active database snapshot failed SQLite foreign-key check'
+	migrate_staged_candidate "$current_tmp" \
+		|| fail 'could not migrate active database snapshot with the current binary'
 	current_snapshot="$BACKUP_DIR/$current_name"
 	for artifact in "$current_snapshot" "$current_snapshot.sha256" "$current_snapshot.metadata"; do
 		[[ ! -e "$artifact" && ! -L "$artifact" ]] || fail 'active database snapshot name already exists'
 	done
+	current_schema_version=$(schema_version_from_database "$current_tmp") \
+		|| fail 'could not inspect active snapshot schema version'
+	[[ "$current_schema_version" =~ ^[0-9]+$ ]] \
+		|| fail 'active snapshot schema version is invalid'
+	resolve_migration_digest "$current_schema_version" || fail 'migration digest is unavailable'
 	current_checksum=$(sha256sum -- "$current_tmp" | awk '{print $1}')
 	printf '%s  %s\n' "$current_checksum" "$current_name" > "$work/$current_name.sha256"
-	printf 'release_sha=pre-restore\ncreated_at=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$work/$current_name.metadata"
+	printf 'release_sha=pre-restore\ncreated_at=%s\nschema_version=%s\nmigration_digest=%s\n' \
+		"$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$current_schema_version" "$MIGRATION_DIGEST" > "$work/$current_name.metadata"
 	chmod 0600 "$work/$current_name.sha256" "$work/$current_name.metadata"
 	chown root:root "$work/$current_name.sha256" "$work/$current_name.metadata"
 	backup_set_is_complete "$current_tmp" || fail 'active database snapshot set validation failed'
@@ -569,6 +665,14 @@ assert_selected_backup_identity \
 	|| fail 'selected backup changed during restore copy'
 [[ "$(sqlite3 "$candidate" 'PRAGMA integrity_check;')" = ok ]] \
 	|| fail 'restore candidate failed SQLite integrity check'
+[[ -z "$(sqlite3 "$candidate" 'PRAGMA foreign_key_check;')" ]] \
+	|| fail 'restore candidate failed SQLite foreign-key check'
+
+# Retained backups may predate the current schema. Upgrade the disposable
+# candidate with the active binary before the authorization overlay references
+# columns introduced by newer migrations (description, grants, and quotas).
+migrate_staged_candidate "$candidate" \
+	|| fail 'could not migrate restore candidate with the current binary'
 
 # Restore data while preserving the current authorization plane. Every table
 # named below is part of the supported schema; a missing table is a hard
@@ -578,6 +682,8 @@ preserve_live_authorization "$candidate"
 	|| fail 'restored credential tables were not emptied'
 [[ "$(sqlite3 "$candidate" 'PRAGMA integrity_check;')" = ok ]] \
 	|| fail 'revoked restore candidate failed SQLite integrity check'
+[[ -z "$(sqlite3 "$candidate" 'PRAGMA foreign_key_check;')" ]] \
+	|| fail 'revoked restore candidate failed SQLite foreign-key check'
 
 assert_selected_backup_identity \
 	|| fail 'selected backup changed before restore activation'

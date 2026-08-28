@@ -1,12 +1,36 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"strings"
 	"testing"
 )
+
+func TestRunMigrationInfo(t *testing.T) {
+	var output bytes.Buffer
+	if err := runMigrationInfo(&output); err != nil {
+		t.Fatalf("runMigrationInfo: %v", err)
+	}
+	text := output.String()
+	if !strings.Contains(text, "latest_schema_version=") || !strings.Contains(text, "migration_digest=") {
+		t.Fatalf("migration-info output = %q", text)
+	}
+}
+
+func TestRunSchemaPreflightRejectsMissingSource(t *testing.T) {
+	var output bytes.Buffer
+	err := runSchemaPreflight(context.Background(), filepath.Join(t.TempDir(), "missing.db"), &output)
+	if err == nil {
+		t.Fatal("runSchemaPreflight unexpectedly succeeded")
+	}
+	if output.Len() != 0 {
+		t.Fatalf("failed preflight wrote output: %q", output.String())
+	}
+}
 
 func TestCheckHealth(t *testing.T) {
 	tests := []struct {

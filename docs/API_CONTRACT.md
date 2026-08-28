@@ -99,6 +99,7 @@ defaults to `#94a3b8` when omitted or null.
 - `GET|PATCH|DELETE /api/v1/tasks/{task}`
 - `GET|POST /api/v1/tasks/{task}/comments`
 - `POST /api/v1/tasks/{task}/claim`
+- `POST /api/v1/tasks/{task}/progress`
 - `POST /api/v1/tasks/{task}/renew`
 - `POST /api/v1/tasks/{task}/release`
 - `POST /api/v1/tasks/{task}/complete`
@@ -111,9 +112,11 @@ Task references accept an opaque task ID or a project-local key such as
 `OPS-42`; key matching is case-insensitive. A task contains `id`, `number`,
 `key`, `project_id`, `kind`, non-null `column_id`, `title`, Markdown
 `description`, `priority`, `position`, `version`, timestamps, `labels`, and
-`comment_count`. `kind` is `task` or `bug`; bug tasks also contain the optional
-nested `bug` details described below. The assignee, current claimant, claim
-expiry, due date, and completion timestamp are omitted when unset.
+`comment_count`. It may also contain the latest agent progress snapshot in
+`agent_work`; this field is omitted until an agent publishes progress. `kind`
+is `task` or `bug`; bug tasks also contain the optional nested `bug` details
+described below. The assignee, current claimant, claim expiry, due date, and
+completion timestamp are omitted when unset.
 
 Task PATCH requires at least one recognized field. `{}` and unknown-only bodies
 return `400`. `column_id`/`column`, `position`, and other non-null fields
@@ -127,8 +130,8 @@ Successful task mutations return the full Task for humans and bearer tokens
 with `tasks:read`. Bearer tokens without `tasks:read` receive exactly
 `{ "id": "...", "version": N }`, with the strong ETag still set to `"vN"`.
 This reduced form applies to task creation, PATCH, claim, renew, release,
-complete, block, triage, resolve, and reopen, and idempotent retries replay the
-already-reduced body.
+complete, block, progress, triage, resolve, and reopen, and idempotent retries
+replay the already-reduced body.
 Direct task GET and task collections still require `tasks:read`.
 
 PATCH, DELETE, and task action requests require an exact quoted `If-Match: "vN"`
@@ -151,6 +154,68 @@ compatibility alias `duration_seconds`) must be an integer from 30 through
 the current owner may renew or release an active lease. A non-owner cannot
 complete or block a task with an active claim (`403`), except for a human
 administrator explicitly overriding that claim.
+
+### Live agent work
+
+`POST /api/v1/tasks/{task}/progress` publishes the current live-work snapshot
+for a task. The caller must be the actor that owns an unexpired active claim;
+bearer tokens also require the `tasks:claim` scope and must remain inside their
+project ceiling. The task must not already be complete. The request requires
+the exact quoted current task ETag in `If-Match: "vN"`; missing or malformed
+preconditions use the normal `428` or `400` responses, and a stale ETag returns
+`409` with the current task. Clients should also send an `Idempotency-Key` for
+safe retries. A successful publish advances the task version and returns the
+normal full-or-reduced Task mutation response with its new strong ETag. Retries
+with the same key replay the original response.
+
+The JSON body is a complete replacement snapshot. Required, non-null fields
+are `operation_id`, `state`, and `summary`:
+
+```json
+{
+  "operation_id": "deploy-42",
+  "state": "working",
+  "summary": "Validated the migration against the copied database.",
+  "phase": "Preflight",
+  "next_action": "Run the release smoke test",
+  "checkpoint_refs": ["backup", "preflight", "smoke"],
+  "checkpoint_completed": 2,
+  "checkpoint_total": 3
+}
+```
+
+`state` is one of `working`, `waiting`, `verifying`, or `handoff`; it describes
+agent coordination and is independent of the task's board-column state.
+`phase` and `next_action` are optional strings. `checkpoint_refs` is an
+optional list of unique reference strings. `checkpoint_completed` and
+`checkpoint_total` are optional but must be supplied together; counts satisfy
+`0 <= checkpoint_completed <= checkpoint_total <= 100`, and a non-empty refs
+list must contain exactly `checkpoint_total` entries. Omitting optional fields
+clears their prior snapshot values; explicit JSON `null` is not accepted.
+`operation_id` is a stable safe identifier for the current operation. Reusing
+it preserves `started_at`; changing it starts a new operation. The server
+sets `actor_id` and the `started_at`/`updated_at` timestamps; the timestamps
+are UTC RFC 3339 values and are never accepted from the client.
+
+Every Task response that includes a snapshot embeds `agent_work` with
+`operation_id`, `actor_id`, `state`, `phase`, `summary`, `next_action`,
+`checkpoint_refs`, optional paired checkpoint counts, `started_at`,
+`updated_at`, `stale`, and `action_needed`. `stale` is computed at read time
+when `updated_at` is at least 15 minutes old, using the server clock and an
+inclusive boundary. It is deterministic and is not a task failure: the server
+does not mark the task failed or release its claim merely because a pulse is
+stale. `action_needed` is true when the state is `waiting` or `handoff`, or
+when the pulse is stale. These are response/filter signals, not additional
+writeable states.
+
+Publishing is atomic. Alongside the snapshot, the server appends a
+`task.progressed` event whose payload is bounded safe metadata (`version`,
+`state`, `completed`, and `total`), and a `comment.created` event for the
+generated narrative comment. The comment body contains the required summary
+and, when supplied, `Next: {next_action}`; free-form narrative is therefore
+kept out of the structured event payload. Ordinary comments remain compatible:
+`POST /api/v1/tasks/{task}/comments` still creates an independent comment and
+does not require an agent claim, progress fields, or the progress endpoint.
 
 Comments return `id`, `task_id`, `actor_id`, `body`, `created_at`, and
 `updated_at`. On create, `body` and compatibility field `text` are accepted;
@@ -222,29 +287,46 @@ malformed, or repeated `limit` values return `400`; values above 200 are capped.
 Their `next_cursor` is an opaque offset cursor (the runtime accepts raw decimal
 or URL-safe base64 offset input); malformed, negative, empty, or repeated
 supplied cursor values return `400`. The terminal value is the literal empty
-string, not JSON null. Boolean filters (`archived`, `favorite`, and agent
-`disabled`) reject empty, malformed, or repeated values. Agents are listed as
+string, not JSON null. Boolean filters (`archived`, `favorite`, `action_needed`,
+and agent `disabled`) reject empty, malformed, or repeated values. Agents are listed as
 `kind=agent` only and disabled agents are excluded by default; pass
 `disabled=true` to include them.
 
 Task listings support `state`, `column`, `kind`, `priority`, `severity`,
 `label`, `assignee`, `reporter`, `resolution`, `q`, `updated_after`, `cursor`,
-and `limit`. `kind` filters `task` or `bug`; `severity`, `reporter`, and
-`resolution` apply to bug details. Column names and label names are
-matched case-insensitively. Enum values must use the documented lowercase
-spelling; mixed-case values are rejected. Enum, identifier, and timestamp
-filters reject empty, malformed, repeated, or out-of-range values with `400`;
-search values are capped at 200 characters and repeated values are rejected.
-`GET /api/v1/my-work` lists tasks
-assigned to or actively claimed by the current actor. Events use a separate
-monotonic integer `after` cursor: a supplied empty, negative, non-integer,
-malformed, or repeated value returns `400`; event `next_cursor` is the last
-event's decimal cursor or the empty string.
+`agent_state`, `action_needed`, and `limit`. `kind` filters `task` or `bug`;
+`severity`, `reporter`, and `resolution` apply to bug details. `agent_state`
+accepts the published states `working`, `waiting`, `verifying`, and `handoff`,
+plus the read-time conditions `stale` and `missing`. `missing` selects tasks
+without a snapshot; `stale` selects snapshots whose 15-minute liveness window
+has elapsed. `action_needed`
+is a boolean filter and `action_needed=true` matches a snapshot whose state is
+`waiting`/`handoff` or whose 15-minute liveness window has elapsed. These
+filters are evaluated against the server's current time. Column names and
+label names are matched case-insensitively. Enum values must use the
+documented lowercase spelling; mixed-case values are rejected. Enum,
+identifier, boolean, and timestamp filters reject empty, malformed, repeated,
+or out-of-range values with `400`; search values are capped at 200 characters
+and repeated values are rejected.
+
+`GET /api/v1/my-work` defaults to the existing assigned-or-actively-claimed
+view for the current actor. `view=live` instead lists tasks with published
+agent-work snapshots, including work by other agents, and accepts the
+`agent_state`, `action_needed`, `state`, `priority`, `label`, `q`,
+`updated_after`, `cursor`, and `limit` filters. For an unscoped human identity,
+`view=live` can aggregate across all visible projects. A project-scoped bearer
+token must supply `project` and may select only one permitted project;
+omitting it returns `403`, just as for the global roadmap route. The normal
+task-read scope and collection pagination rules still apply. Events use a
+separate monotonic integer `after` cursor: a supplied empty, negative,
+non-integer, malformed, or repeated value returns `400`; event `next_cursor`
+is the last event's decimal cursor or the empty string.
 
 ## Roadmap, events, and agent administration
 
 - `GET /api/v1/roadmap`
 - `GET /api/v1/projects/{project}/roadmap`
+- `GET /api/v1/my-work`
 - `GET /api/v1/events?after={cursor}&project={project}`
 - `GET|POST /api/v1/agents`
 - `POST /api/v1/agents/{agent}/tokens`

@@ -10,6 +10,8 @@ DB_PATH=${ROADMAP_DB_PATH:-$DATA_DIR/roadmap.db}
 BACKUP_DIR=${ROADMAP_BACKUP_DIR:-$STATE_DIR/backups}
 RETENTION=${ROADMAP_BACKUP_RETENTION:-14}
 RELEASE_SHA=${1:-manual}
+MIGRATION_DIGEST=${ROADMAP_MIGRATION_DIGEST:-}
+MIGRATION_INFO_BINARY=${ROADMAP_MIGRATION_INFO_BINARY:-$STATE_DIR/current/roadmap}
 
 fail() {
 	printf '[roadmap-backup] %s\n' "$*" >&2
@@ -29,6 +31,55 @@ secure_backup_artifact() {
 	[[ "$owner" = root:root && "$mode" = 600 ]]
 }
 
+resolve_migration_digest() {
+	local schema_hint=${1:-0} info digest count metadata_path metadata_digest metadata_count metadata_db
+	if [[ -z "$MIGRATION_DIGEST" ]]; then
+		if [[ "$MIGRATION_INFO_BINARY" = /* && -f "$MIGRATION_INFO_BINARY" && ! -L "$MIGRATION_INFO_BINARY" && -x "$MIGRATION_INFO_BINARY" ]]; then
+			if info=$("$MIGRATION_INFO_BINARY" migration-info 2>/dev/null); then
+				count=$(awk -F= '$1 == "migration_digest" { count++ } END { print count + 0 }' <<<"$info") || return 1
+				if [[ "$count" = 1 ]]; then
+					digest=$(awk -F= '$1 == "migration_digest" { print $2 }' <<<"$info") || return 1
+					[[ "$digest" =~ ^[0-9a-f]{64}$ ]] && MIGRATION_DIGEST=$digest
+				fi
+			fi
+		fi
+	fi
+	if [[ -z "$MIGRATION_DIGEST" ]]; then
+		# During a binary-only rollback, current may point to an older retained
+		# executable without migration-info. Reuse the newest validated digest
+		# already recorded by a candidate backup; this keeps manual/daily backups
+		# identifiable without executing an untrusted or mismatched binary.
+		while IFS= read -r -d '' metadata_path; do
+			[[ -f "$metadata_path" && ! -L "$metadata_path" ]] || continue
+			metadata_db=${metadata_path%.metadata}
+			backup_set_is_complete "$metadata_db" || continue
+			[[ "$(stat -c '%U:%G' -- "$metadata_path" 2>/dev/null || true)" = root:root ]] || continue
+			[[ "$(stat -c '%a' -- "$metadata_path" 2>/dev/null || true)" = 600 ]] || continue
+			metadata_count=$(awk -F= '$1 == "migration_digest" { count++ } END { print count + 0 }' "$metadata_path") || continue
+			[[ "$metadata_count" = 1 ]] || continue
+			metadata_digest=$(awk -F= '$1 == "migration_digest" { print $2 }' "$metadata_path") || continue
+			if [[ "$metadata_digest" =~ ^[0-9a-f]{64}$ ]]; then
+				MIGRATION_DIGEST=$metadata_digest
+				break
+			fi
+		done < <(find "$BACKUP_DIR" -maxdepth 1 -type f -name 'roadmap-*.db.metadata' -printf '%T@ %p\n' 2>/dev/null | sort -nr | cut -d' ' -f2- | while IFS= read -r path; do printf '%s\0' "$path"; done)
+	fi
+	if [[ -z "$MIGRATION_DIGEST" ]]; then
+		# No prior metadata exists on a fresh installation. This deterministic
+		# compatibility identity is only a last resort for retained binaries;
+		# subsequent candidate backups carry the real embedded digest.
+		MIGRATION_DIGEST=$(printf 'roadmap-migration-digest-fallback-v1\nschema_version=%s\n' "$schema_hint" | sha256sum | awk '{print $1}')
+	fi
+	[[ "$MIGRATION_DIGEST" =~ ^[0-9a-f]{64}$ ]]
+}
+
+schema_version_from_database() {
+	local path=$1 value
+	value=$(sqlite3 "$path" 'SELECT COALESCE(MAX(version), 0) FROM schema_migrations;') || return 1
+	[[ "$value" =~ ^[0-9]+$ ]] || return 1
+	printf '%s' "$value"
+}
+
 # A backup is usable only when every sidecar names this exact file, the
 # metadata agrees with the filename, the checksum matches, and SQLite can
 # read the complete database. Retention uses this same predicate, so a
@@ -36,6 +87,7 @@ secure_backup_artifact() {
 backup_set_is_complete() {
 	local path=$1 name parent checksum_path metadata_path checksum checksum_count
 	local expected_release metadata_release metadata_created checksum_name
+	local metadata_schema metadata_digest actual_schema schema_count digest_count
 	name=$(basename -- "$path")
 	[[ "$name" =~ ^roadmap-[0-9]{8}T[0-9]{6}Z-(manual|daily|pre-restore|[0-9a-f]{40})\.db$ ]] \
 		|| return 1
@@ -62,7 +114,34 @@ backup_set_is_complete() {
 	metadata_created=$(awk -F= '$1 == "created_at" { print $2 }' "$metadata_path") || return 1
 	[[ "$metadata_release" = "$expected_release" ]] || return 1
 	[[ "$metadata_created" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$ ]] || return 1
+	schema_count=$(awk -F= '$1 == "schema_version" { count++ } END { print count + 0 }' "$metadata_path") || return 1
+	digest_count=$(awk -F= '$1 == "migration_digest" { count++ } END { print count + 0 }' "$metadata_path") || return 1
+	if [[ "$schema_count" = 0 && "$digest_count" = 0 ]]; then
+		# Backups created before schema metadata was introduced remain valid
+		# historical restore sources. Their staged candidate is migrated by the
+		# current binary before any current-schema fields are referenced.
+		:
+	else
+		[[ "$schema_count" = 1 && "$digest_count" = 1 ]] || return 1
+		metadata_schema=$(awk -F= '$1 == "schema_version" { print $2 }' "$metadata_path") || return 1
+		metadata_digest=$(awk -F= '$1 == "migration_digest" { print $2 }' "$metadata_path") || return 1
+		[[ "$metadata_schema" =~ ^[0-9]+$ && "$metadata_digest" =~ ^[0-9a-f]{64}$ ]] || return 1
+		# Read schema_version from this backup artifact, never from the live
+		# source, so a concurrent online write cannot produce mismatched sidecars.
+		actual_schema=$(schema_version_from_database "$path") || return 1
+		[[ "$actual_schema" = "$metadata_schema" ]] || return 1
+	fi
 	[[ "$(sqlite3 "$path" 'PRAGMA integrity_check;')" = ok ]] || return 1
+	[[ -z "$(sqlite3 "$path" 'PRAGMA foreign_key_check;')" ]] || return 1
+}
+
+backup_set_is_legacy() {
+	local metadata_path=$1 schema_count digest_count
+	metadata_path="$metadata_path.metadata"
+	[[ -f "$metadata_path" && ! -L "$metadata_path" ]] || return 1
+	schema_count=$(awk -F= '$1 == "schema_version" { count++ } END { print count + 0 }' "$metadata_path") || return 1
+	digest_count=$(awk -F= '$1 == "migration_digest" { count++ } END { print count + 0 }' "$metadata_path") || return 1
+	[[ "$schema_count" = 0 && "$digest_count" = 0 ]]
 }
 
 cleanup_staging_dirs() {
@@ -222,8 +301,15 @@ exec {source_fd}<&-
 source_fd=
 
 [[ "$(sqlite3 "$backup_path" 'PRAGMA integrity_check;')" = ok ]] || fail 'SQLite integrity check failed'
+schema_version=$(schema_version_from_database "$backup_path") \
+	|| fail 'could not inspect completed backup schema version'
+[[ "$schema_version" =~ ^[0-9]+$ ]] || fail 'completed backup schema version is invalid'
+resolve_migration_digest "$schema_version" || fail 'migration digest is unavailable'
+source_schema_digest="$MIGRATION_DIGEST"
+[[ "$source_schema_digest" =~ ^[0-9a-f]{64}$ ]] || fail 'source migration digest is invalid'
 (cd "$work" && sha256sum "$backup_name" > "$backup_name.sha256") || fail 'could not checksum backup'
-printf 'release_sha=%s\ncreated_at=%s\n' "$RELEASE_SHA" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$work/$backup_name.metadata"
+printf 'release_sha=%s\ncreated_at=%s\nschema_version=%s\nmigration_digest=%s\n' \
+	"$RELEASE_SHA" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$schema_version" "$source_schema_digest" > "$work/$backup_name.metadata"
 chmod 0600 "$work/$backup_name.sha256" "$work/$backup_name.metadata"
 chown root:root "$work/$backup_name.sha256" "$work/$backup_name.metadata"
 
@@ -265,6 +351,7 @@ done
 if (( ${#valid_backups[@]} > RETENTION )); then
 	for entry in "${valid_backups[@]:RETENTION}"; do
 		path=${entry#* }
+		backup_set_is_legacy "$path" && continue
 		remove_backup_set "$path" \
 			|| fail "could not prune invalidated backup set $path"
 	done

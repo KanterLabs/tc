@@ -326,12 +326,13 @@ restore_previous() {
 # useful diagnostics; this EXIT trap covers package/configuration failures too.
 recovery_needed=1
 recovery_in_progress=0
+upgrade_transaction_started=0
 on_exit() {
 	local status=$?
 	# Recovery itself must not recursively invoke this EXIT transaction.
 	trap - EXIT
 	rm -f -- "$CONFIG_DIR/roadmap.env.new" || true
-	if [[ "$status" -ne 0 && "$recovery_needed" -eq 1 && "$recovery_in_progress" -eq 0 && -n "$previous_target" ]]; then
+	if [[ "$status" -ne 0 && "$recovery_needed" -eq 1 && "$upgrade_transaction_started" -eq 1 && "$recovery_in_progress" -eq 0 && -n "$previous_target" ]]; then
 		recovery_in_progress=1
 		log 'deployment failed before completion; restoring the previous release'
 		restore_previous || log 'previous release recovery failed; inspect systemd and the local health endpoint'
@@ -343,13 +344,18 @@ trap on_exit EXIT
 
 migrate_previous_env
 
-log 'Stopping the application before the SQLite backup and atomic switch'
-stop_unit cloudflared.service || fail 'could not stop cloudflared.service and verify it is inactive'
-stop_unit roadmap.service || fail 'could not stop roadmap.service and verify it is inactive'
-
+# Normalize a legacy database location before taking the online snapshot. The
+# application uses DATA_DIR, while the move itself is only needed on old
+# installations that predate that directory.
 if [[ -e "$STATE_DIR/roadmap.db" ]]; then
 	[[ -f "$STATE_DIR/roadmap.db" ]] || fail 'legacy database path is not a regular file'
 	[[ ! -e "$DATA_DIR/roadmap.db" ]] || fail 'both legacy and data database paths exist'
+	# Moving a live SQLite pathname can race a process creating its WAL/SHM
+	# siblings. This legacy-only migration is therefore the one offline branch;
+	# normal DATA_DIR upgrades below keep the service online through backup.
+	upgrade_transaction_started=1
+	stop_unit cloudflared.service || fail 'could not stop cloudflared.service before legacy database move'
+	stop_unit roadmap.service || fail 'could not stop roadmap.service before legacy database move'
 	mv -T -- "$STATE_DIR/roadmap.db" "$DATA_DIR/roadmap.db"
 	for suffix in -wal -shm; do
 		if [[ -e "$STATE_DIR/roadmap.db$suffix" ]]; then
@@ -365,13 +371,38 @@ if [[ -e "$STATE_DIR/roadmap.db" ]]; then
 	chmod 0640 "$DATA_DIR/roadmap.db"
 fi
 
+# Take and verify the pre-upgrade backup while Roadmap is still online. The
+# helper records the source schema version and migration digest, then the new
+# binary migrates a private copy of that exact backup before any service stop
+# or release-link switch.
+verified_backup=
 if [[ -f "$DATA_DIR/roadmap.db" && ! -L "$DATA_DIR/roadmap.db" ]]; then
-	ROADMAP_STATE_DIR="$STATE_DIR" ROADMAP_DATA_DIR="$DATA_DIR" ROADMAP_DB_PATH="$DATA_DIR/roadmap.db" ROADMAP_BACKUP_DIR="$BACKUPS_DIR" ROADMAP_DEPLOY_LOCK_HELD=1 \
-		ROADMAP_BACKUP_RETENTION="${ROADMAP_BACKUP_RETENTION:-14}" \
-		"$RELEASE_DIR/roadmap-backup.sh" "$SHA"
+	# The candidate binary owns the metadata format. A retained prior binary
+	# may predate migration-info, especially on the first TC-33 deployment.
+	migration_info_binary="$RELEASE_DIR/roadmap"
+	backup_output=$(ROADMAP_STATE_DIR="$STATE_DIR" ROADMAP_DATA_DIR="$DATA_DIR" ROADMAP_DB_PATH="$DATA_DIR/roadmap.db" ROADMAP_BACKUP_DIR="$BACKUPS_DIR" ROADMAP_DEPLOY_LOCK_HELD=1 \
+		ROADMAP_BACKUP_RETENTION="${ROADMAP_BACKUP_RETENTION:-14}" ROADMAP_MIGRATION_INFO_BINARY="$migration_info_binary" ROADMAP_MIGRATION_DIGEST= \
+		"$RELEASE_DIR/roadmap-backup.sh" "$SHA") \
+		|| fail 'could not create the verified pre-upgrade backup'
+	[[ "$(grep -Ec '^backup=/[^[:cntrl:]]+$' <<<"$backup_output")" = 1 ]] \
+		|| fail 'backup helper returned an invalid result'
+	verified_backup=${backup_output#backup=}
+	[[ "$verified_backup" = "$BACKUPS_DIR"/roadmap-*.db && -f "$verified_backup" && ! -L "$verified_backup" ]] \
+		|| fail 'verified backup path is invalid'
+	preflight_output=$("$RELEASE_DIR/roadmap" schema-preflight "$verified_backup") \
+		|| fail 'candidate schema preflight failed'
+	grep -Fx 'status=ok' <<<"$preflight_output" >/dev/null \
+		|| fail 'candidate schema preflight did not complete successfully'
+	grep -Fx 'foreign_key_check=ok' <<<"$preflight_output" >/dev/null \
+		|| fail 'candidate schema preflight did not pass foreign-key validation'
 elif [[ -e "$DATA_DIR/roadmap.db" ]]; then
 	fail 'database path is not a regular file'
 fi
+
+log 'Stopping the application before the atomic release switch'
+upgrade_transaction_started=1
+stop_unit cloudflared.service || fail 'could not stop cloudflared.service and verify it is inactive'
+stop_unit roadmap.service || fail 'could not stop roadmap.service and verify it is inactive'
 
 # Configuration and helpers are installed atomically.  The tunnel token is
 # copied only into the LXC's root-owned configuration directory and is never

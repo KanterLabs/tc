@@ -331,6 +331,10 @@ func (s *Store) ResolveTaskReference(ctx context.Context, reference string) (Tas
 }
 
 func (s *Store) enrichTask(ctx context.Context, task *Task) error {
+	return s.enrichTaskAt(ctx, task, time.Now().UTC())
+}
+
+func (s *Store) enrichTaskAt(ctx context.Context, task *Task, at time.Time) error {
 	var key string
 	if err := s.DB.QueryRowContext(ctx, `SELECT key FROM projects WHERE id = ?`, task.ProjectID).Scan(&key); err != nil {
 		return err
@@ -363,6 +367,11 @@ func (s *Store) enrichTask(ctx context.Context, task *Task) error {
 		}
 		task.Bug = bug
 	}
+	work, err := s.agentWorkAt(ctx, task.ID, at)
+	if err != nil {
+		return err
+	}
+	task.AgentWork = work
 	return s.DB.QueryRowContext(ctx, `SELECT COUNT(1) FROM comments WHERE task_id=?`, task.ID).Scan(&task.CommentCount)
 }
 
@@ -377,6 +386,8 @@ func (s *Store) ListTasksWithExtra(ctx context.Context, projectID string, filter
 }
 
 func (s *Store) listTasks(ctx context.Context, projectID string, filter TaskFilter, allowExtra bool) ([]Task, bool, error) {
+	readAt := time.Now().UTC()
+	staleCutoff := agentWorkStaleCutoff(readAt)
 	if filter.Limit <= 0 {
 		filter.Limit = 50
 	}
@@ -433,6 +444,22 @@ func (s *Store) listTasks(ctx context.Context, projectID string, filter TaskFilt
 			args = append(args, filter.Resolution)
 		}
 	}
+	if filter.AgentState != "" {
+		switch filter.AgentState {
+		case "missing":
+			query += ` AND NOT EXISTS (SELECT 1 FROM task_agent_work aw WHERE aw.task_id=t.id)`
+		case "stale":
+			query += ` AND EXISTS (SELECT 1 FROM task_agent_work aw WHERE aw.task_id=t.id AND julianday(aw.updated_at) <= julianday(?))`
+			args = append(args, staleCutoff)
+		default:
+			query += ` AND EXISTS (SELECT 1 FROM task_agent_work aw WHERE aw.task_id=t.id AND aw.state=?)`
+			args = append(args, filter.AgentState)
+		}
+	}
+	if filter.ActionNeeded {
+		query += ` AND EXISTS (SELECT 1 FROM task_agent_work aw WHERE aw.task_id=t.id AND (aw.state IN ('waiting', 'handoff') OR julianday(aw.updated_at) <= julianday(?)))`
+		args = append(args, staleCutoff)
+	}
 	if filter.Label != "" {
 		query += ` AND EXISTS (SELECT 1 FROM task_labels tl JOIN labels l ON l.id=tl.label_id WHERE tl.task_id=t.id AND (l.id=? OR lower(l.name)=lower(?)))`
 		args = append(args, filter.Label, filter.Label)
@@ -474,7 +501,7 @@ func (s *Store) listTasks(ctx context.Context, projectID string, filter TaskFilt
 		result = result[:filter.Limit]
 	}
 	for i := range result {
-		if err := s.enrichTask(ctx, &result[i]); err != nil {
+		if err := s.enrichTaskAt(ctx, &result[i], readAt); err != nil {
 			return nil, false, err
 		}
 	}

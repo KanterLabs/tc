@@ -16,19 +16,24 @@ Trello-compatible API or a full team-suite replacement.
 - Work from a board with Backlog, Ready, In progress, Blocked, and Done
   columns. Create tasks quickly, move them with drag-and-drop or keyboard
   controls, and filter by text, state, kind, priority, severity, label,
-  assignee, reporter, or resolution.
+  assignee, reporter, resolution, or agent-work state. Claimed agent tasks
+  expose a compact live pulse on the board and a fuller progress panel in the
+  task drawer.
 - Keep task context in Markdown descriptions, priorities, due dates, labels,
   assignees, comments, and chronological human/agent activity. Record bugs
   with actual versus expected behavior, reproduction steps, environment, and
   affected version.
-- See assigned and claimed work across projects in **My work**, or inspect
-  completion, overdue work, upcoming deadlines, and recent activity in the
-  **Roadmap** view.
+- Follow assigned work in **My work** and all published agent pulses across
+  permitted projects in cross-project **Live Work**, or inspect completion,
+  overdue work, upcoming deadlines, and recent activity in **Roadmap**.
 - Coordinate safely through atomic leased claims, renew/release/complete/block
   actions, bug triage/resolve/reopen actions, optimistic versions
   (`ETag`/`If-Match`), idempotency keys, and a cursor-based event feed.
 - Create agents and issue project-scoped bearer tokens with independently
   selected read, write, claim, and event scopes.
+- Keep the live view current through bounded polling. The responsive browser
+  UI remains usable on mobile widths and supports keyboard navigation,
+  focus-visible controls, and screen-reader status announcements.
 
 The built-in bug tracker is an internal MVP. Bugs use the existing task,
 board, claim, comment, scope, and event model. Public issue intake, external
@@ -157,6 +162,29 @@ and titles directly. Filters use the same global issue query vocabulary, so a
 filtered URL can be bookmarked as a working view without a separate issue
 permission or search system.
 
+Agent work workflow:
+
+1. Claim a task with `POST /api/v1/tasks/{task}/claim` using a token with the
+   `tasks:claim` scope, then retain the returned strong task ETag.
+2. Publish a complete progress snapshot with
+   `POST /api/v1/tasks/{task}/progress`, the current `If-Match` value, and an
+   `Idempotency-Key`. The request requires an `operation_id`, one of the
+   documented agent-work states, and a non-empty `summary`; optional phase,
+   next action, checkpoint references, and paired checkpoint counts are
+   described in [`docs/API_CONTRACT.md`](docs/API_CONTRACT.md).
+3. Refresh the ETag from each response before the next mutation. The server
+   records the structured pulse and a readable activity comment atomically;
+   ordinary `POST .../comments` remains available for notes that are not live
+   progress snapshots.
+
+The board and drawer read the same `Task.agent_work` snapshot. A pulse is
+marked stale deterministically after 15 minutes without an update; stale is a
+coordination signal, not a task failure or automatic claim release. Filter
+task collections with `agent_state` or `action_needed=true`, and use
+`/api/v1/my-work?view=live` for the Live Work view. Unscoped human identities
+may see live work across their visible projects; a project-scoped bearer token
+must include a permitted `project` query value.
+
 ```sh
 # Contract and liveness checks
 curl --fail http://127.0.0.1:8080/openapi.json
@@ -252,13 +280,19 @@ only on an ephemeral runner.
 
 Before each install, the host takes a SQLite online backup, verifies its
 checksum and `PRAGMA integrity_check`, and stores it under
-`/var/lib/roadmap/backups`. The database is kept outside release directories
-and is never replaced by an executable upgrade. By default, five releases and
-fourteen backups are retained.
+`/var/lib/roadmap/backups`. A pre-upgrade backup is complete only when its
+release SHA, schema identifier/digest, database digest, and integrity metadata
+are recorded alongside the verified backup. Additive schema migrations run in
+transactions; the candidate release first performs its preflight checks on a
+copy before the active database is touched. The database is kept outside
+release directories and is never replaced by an executable upgrade. By
+default, five releases and fourteen backups are retained.
 
 The active release is switched atomically. Failed Roadmap health or
 cloudflared checks automatically restore the previous release and restart the
-services. A retained release can also be selected with the workflow's
+services. A binary/release rollback changes only the active release pointer:
+it never restores an older database or discards writes accepted by the
+running service. A retained release can also be selected with the workflow's
 `workflow_dispatch` `rollback_sha` input, or from a configured deployment
 shell with:
 
@@ -273,4 +307,8 @@ production secrets above); it expects the origin's JSON `401` error and echoed
 `X-Request-ID`, which distinguishes Roadmap from an Access edge error.
 
 For manual backups, database restores, first-time bootstrap, and the exact
-operator permissions, follow [`docs/OPERATIONS.md`](docs/OPERATIONS.md).
+operator permissions, follow [`docs/OPERATIONS.md`](docs/OPERATIONS.md). A
+database restore is a separate, explicitly requested operation against one
+exact retained backup; the restore helper first takes a new recoverable
+`pre-restore` snapshot of the current database before installing the selected
+copy.

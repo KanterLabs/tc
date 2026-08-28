@@ -10,6 +10,7 @@ import os
 import stat
 import sys
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 from urllib import error, parse, request
@@ -251,6 +252,20 @@ def cmd_resume(client: Client, args: argparse.Namespace) -> Any:
 
 def cmd_progress(client: Client, args: argparse.Namespace) -> Any:
     current = _task(client, args.task)
+    if _structured_progress_supplied(args):
+        if not _active_claim(current):
+            raise RoadmapError("structured progress requires an actively claimed task")
+        payload = _structured_progress_payload(args)
+        updated, _ = client.call(
+            "POST",
+            "/tasks/" + parse.quote(str(current["id"]), safe="") + "/progress",
+            body=payload,
+            if_match=current["version"],
+            idempotency_key=_idempotency(args.operation_id, "progress", _canonical_json(payload)),
+        )
+        if not isinstance(updated, dict) or not isinstance(updated.get("version"), int):
+            raise RoadmapError("TC Roadmap returned an unexpected updated task")
+        return {"task": updated, "operation_id": args.operation_id}
     message = _progress_message(args)
     comment, _ = client.call(
         "POST",
@@ -259,6 +274,96 @@ def cmd_progress(client: Client, args: argparse.Namespace) -> Any:
         idempotency_key=_idempotency(args.operation_id, "progress", message),
     )
     return {"task": current.get("key", current["id"]), "comment": comment}
+
+
+def _structured_progress_supplied(args: argparse.Namespace) -> bool:
+    """Return whether the caller selected the structured progress API."""
+
+    for field in ("state", "phase", "completed", "total", "next_step"):
+        if getattr(args, field, None) is not None:
+            return True
+    refs = getattr(args, "checkpoint_refs", ())
+    return isinstance(refs, (list, tuple)) and bool(refs)
+
+
+def _active_claim(task: dict[str, Any]) -> bool:
+    """Check the claim data available in a task response before posting."""
+
+    claimed_by = task.get("claimed_by")
+    if not isinstance(claimed_by, str) or not claimed_by.strip():
+        return False
+    # Older task representations may expose the claimant without the lease
+    # timestamp. Let the progress endpoint remain authoritative in that case,
+    # while rejecting an explicitly absent, malformed, or expired lease.
+    if "claim_expires_at" not in task:
+        return True
+    expires_at = task.get("claim_expires_at")
+    if not isinstance(expires_at, str) or not expires_at.strip():
+        return False
+    try:
+        expires = datetime.fromisoformat(expires_at.replace("Z", "+00:00"))
+    except ValueError:
+        return False
+    if expires.tzinfo is None:
+        expires = expires.replace(tzinfo=timezone.utc)
+    return expires > datetime.now(timezone.utc)
+
+
+def _structured_progress_payload(args: argparse.Namespace) -> dict[str, Any]:
+    completed = getattr(args, "completed", None)
+    total = getattr(args, "total", None)
+    if (completed is None) != (total is None):
+        raise RoadmapError("completed and total must be provided together")
+    if completed is not None and (total < 1 or total > 100 or completed < 0 or completed > total):
+        raise RoadmapError("progress must satisfy 0 <= completed <= total <= 100")
+
+    operation_id = getattr(args, "operation_id", "")
+    state = getattr(args, "state", None)
+    message = getattr(args, "message", "")
+    payload: dict[str, Any] = {
+        "operation_id": operation_id.strip(),
+        "state": state or "working",
+        "summary": message.strip(),
+    }
+    phase = getattr(args, "phase", None)
+    if phase is not None:
+        phase = phase.strip()
+        if not phase:
+            raise RoadmapError("phase must not be empty")
+        payload["phase"] = phase
+    next_step = getattr(args, "next_step", None)
+    if next_step is not None:
+        next_step = next_step.strip()
+        if not next_step:
+            raise RoadmapError("next action must not be empty")
+        payload["next_action"] = next_step
+    if completed is not None:
+        payload["checkpoint_completed"] = completed
+        payload["checkpoint_total"] = total
+
+    refs = getattr(args, "checkpoint_refs", ())
+    if not isinstance(refs, (list, tuple)):
+        refs = ()
+    if refs:
+        normalized_refs = [ref.strip() if isinstance(ref, str) else "" for ref in refs]
+        if any(not isinstance(ref, str) or not ref for ref in normalized_refs):
+            raise RoadmapError("checkpoint references must be non-empty")
+        if len(normalized_refs) > 100:
+            raise RoadmapError("checkpoint references must contain at most 100 items")
+        if len(set(normalized_refs)) != len(normalized_refs):
+            raise RoadmapError("checkpoint references must not contain duplicates")
+        if any(len(ref) > 128 for ref in normalized_refs):
+            raise RoadmapError("checkpoint references must be at most 128 characters")
+        if completed is None:
+            raise RoadmapError("checkpoint counts are required when checkpoint refs are provided")
+        if len(normalized_refs) != total:
+            raise RoadmapError("checkpoint refs must match checkpoint total")
+        payload["checkpoint_refs"] = normalized_refs
+    return payload
+
+
+def _canonical_json(value: Any) -> str:
+    return json.dumps(value, sort_keys=True, separators=(",", ":"))
 
 
 def _progress_message(args: argparse.Namespace) -> str:
@@ -341,6 +446,7 @@ def build_parser() -> argparse.ArgumentParser:
     progress.add_argument("--completed", type=int)
     progress.add_argument("--total", type=int)
     progress.add_argument("--next", dest="next_step")
+    progress.add_argument("--checkpoint-ref", action="append", dest="checkpoint_refs", default=[])
     progress.add_argument("--operation-id", required=True)
     progress.set_defaults(handler=cmd_progress)
 

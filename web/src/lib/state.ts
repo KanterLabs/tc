@@ -1,4 +1,4 @@
-import type { BugSeverity, Column, Project, Task } from './types';
+import type { AgentWork, AgentWorkState, BugSeverity, Column, Project, Task } from './types';
 
 export interface BoardFilters {
   query: string;
@@ -21,6 +21,218 @@ export function actorId(value: Task['assignee'] | Task['claimed_by']): string {
 export function actorName(value: Task['assignee'] | Task['claimed_by']): string {
   if (!value) return '';
   return typeof value === 'string' ? value : value.name;
+}
+
+export type AgentWorkDisplayStatus = AgentWorkState | 'stale' | 'missing';
+export type LiveWorkGroup = 'stale' | 'waiting' | 'handoff' | 'verifying' | 'working' | 'missing';
+
+type TimeValue = Date | number | string;
+type AgentWorkLike = Partial<AgentWork> & { updated_at?: string };
+type AgentWorkSource = AgentWork | AgentWorkLike | Task | null | undefined;
+
+const AGENT_WORK_STALE_AFTER_MS = 15 * 60 * 1000;
+
+function milliseconds(value: TimeValue | undefined | null): number | null {
+  if (value instanceof Date) {
+    const timestamp = value.getTime();
+    return Number.isFinite(timestamp) ? timestamp : null;
+  }
+  if (typeof value === 'number') return Number.isFinite(value) ? value : null;
+  if (typeof value !== 'string' || !value.trim()) return null;
+  const timestamp = Date.parse(value);
+  return Number.isFinite(timestamp) ? timestamp : null;
+}
+
+function workValue(value: AgentWorkSource): AgentWorkLike | null {
+  if (!value) return null;
+  if ('agent_work' in value) return value.agent_work ?? null;
+  return value as AgentWorkLike;
+}
+
+function workUpdatedAt(value: AgentWorkSource): string | undefined {
+  const work = workValue(value);
+  return work?.updated_at;
+}
+
+function hasStaleWork(value: AgentWorkSource, now?: TimeValue): boolean {
+  const work = workValue(value);
+  if (!work) return false;
+  // The API's flag is useful when a response was produced on the server
+  // shortly before it reached the browser. Recompute as well so a response
+  // can become stale while it remains mounted.
+  return work.stale === true || isAgentWorkStale(work.updated_at, now);
+}
+
+/**
+ * Return whether an agent update is at least fifteen minutes old.
+ *
+ * Invalid timestamps are treated as unknown (and therefore not stale) rather
+ * than allowing NaN to leak into sorting or status decisions. `now` accepts a
+ * Date, epoch milliseconds, or an ISO timestamp so callers can test the exact
+ * boundary without changing the process clock.
+ */
+export function isAgentWorkStale(value: AgentWorkSource | string, now: TimeValue = Date.now()): boolean {
+  const updatedAt = typeof value === 'string' ? value : workUpdatedAt(value);
+  const updated = milliseconds(updatedAt);
+  const current = milliseconds(now);
+  if (updated === null || current === null) return false;
+  return current - updated >= AGENT_WORK_STALE_AFTER_MS;
+}
+
+/** Descriptive alias for callers that prefer the computation wording. */
+export const computeAgentWorkStale = isAgentWorkStale;
+
+/** Backwards-friendly alias for callers that read the predicate as a noun. */
+export const agentWorkIsStale = isAgentWorkStale;
+
+/**
+ * Classify the compact status shown for a task's agent work.
+ *
+ * Waiting is intentionally preserved even after its update goes stale: the
+ * waiting state tells a human why work needs attention, while the separate
+ * action-needed helper supplies the attention signal.
+ */
+export function displayAgentWorkStatus(value: AgentWorkSource, now: TimeValue = Date.now()): AgentWorkDisplayStatus {
+  const work = workValue(value);
+  if (!work) return 'missing';
+  if (work.state === 'waiting') return 'waiting';
+  if (hasStaleWork(value, now)) return 'stale';
+  if (work.state === 'working' || work.state === 'verifying' || work.state === 'handoff') return work.state;
+  // Runtime JSON can be malformed even though the TypeScript contract is
+  // narrow. Unknown states are safer to surface as stale than as fresh work.
+  return 'stale';
+}
+
+export const classifyAgentWorkStatus = displayAgentWorkStatus;
+export const classifyDisplayedAgentWork = displayAgentWorkStatus;
+export const classifyAgentWork = displayAgentWorkStatus;
+export const agentWorkDisplayStatus = displayAgentWorkStatus;
+
+/** Return whether a human should inspect or respond to the published work. */
+export function agentWorkActionNeeded(value: AgentWorkSource, now: TimeValue = Date.now()): boolean {
+  const work = workValue(value);
+  if (!work) return false;
+  return work.action_needed === true || hasStaleWork(value, now) || work.state === 'waiting' || work.state === 'handoff';
+}
+
+export const isAgentWorkActionNeeded = agentWorkActionNeeded;
+export const actionNeededForAgentWork = agentWorkActionNeeded;
+export const agentWorkNeedsAction = agentWorkActionNeeded;
+
+function count(value: unknown): number | null {
+  return typeof value === 'number' && Number.isInteger(value) && Number.isFinite(value) && value >= 0 ? value : null;
+}
+
+/**
+ * Format checkpoint progress for a compact badge. Explicit server counts win;
+ * when only refs are available their count is the total. Invalid or partial
+ * counts produce an empty label instead of inventing progress.
+ */
+export function agentWorkProgressLabel(value: AgentWorkSource): string {
+  const work = workValue(value);
+  if (!work) return '';
+  const completed = count(work.checkpoint_completed);
+  const explicitTotal = count(work.checkpoint_total);
+  const refs = Array.isArray(work.checkpoint_refs)
+    ? work.checkpoint_refs.filter((reference): reference is string => typeof reference === 'string')
+    : [];
+  const total = explicitTotal ?? (refs.length ? refs.length : null);
+  if (completed !== null && total !== null && completed <= total) return `${completed}/${total}`;
+  return '';
+}
+
+export const progressLabelForAgentWork = agentWorkProgressLabel;
+export const agentWorkProgress = agentWorkProgressLabel;
+export const progressLabel = agentWorkProgressLabel;
+
+/** Determine the sort bucket used by the live-work view. */
+export function liveWorkGroup(value: AgentWorkSource, now: TimeValue = Date.now()): LiveWorkGroup {
+  const work = workValue(value);
+  if (!work) return 'missing';
+  if (work.state === 'waiting') return 'waiting';
+  if (hasStaleWork(value, now)) return 'stale';
+  if (work.state === 'handoff') return 'handoff';
+  if (work.state === 'verifying') return 'verifying';
+  if (work.state === 'working') return 'working';
+  return 'stale';
+}
+
+const liveWorkRank: Record<LiveWorkGroup, number> = {
+  stale: 0,
+  waiting: 0,
+  handoff: 0,
+  verifying: 1,
+  working: 2,
+  missing: 3
+};
+
+function liveWorkTimestamp(task: Task): number | null {
+  return milliseconds(task.agent_work?.updated_at) ?? milliseconds(task.updated_at);
+}
+
+/**
+ * Sort live work by attention bucket and, within a bucket, newest update.
+ * Input order is retained for equal/unknown timestamps to keep rendering
+ * stable across refreshes.
+ */
+export function sortLiveWork(tasks: Task[], now: TimeValue = Date.now()): Task[] {
+  return tasks
+    .map((task, index) => ({ task, index, group: liveWorkGroup(task, now), updated: liveWorkTimestamp(task) }))
+    .sort((a, b) => {
+      const groupDelta = liveWorkRank[a.group] - liveWorkRank[b.group];
+      if (groupDelta) return groupDelta;
+      if (a.updated !== null && b.updated !== null && a.updated !== b.updated) return b.updated - a.updated;
+      if (a.updated !== null && b.updated === null) return -1;
+      if (a.updated === null && b.updated !== null) return 1;
+      return a.index - b.index;
+    })
+    .map(({ task }) => task);
+}
+
+export const sortAgentWork = sortLiveWork;
+export const sortLiveWorkTasks = sortLiveWork;
+
+/**
+ * Group live work while retaining the same display order as `sortLiveWork`.
+ * Empty groups are included so a caller can render predictable sections.
+ */
+export function groupLiveWork(tasks: Task[], now: TimeValue = Date.now()): Record<LiveWorkGroup, Task[]> {
+  const groups: Record<LiveWorkGroup, Task[]> = {
+    stale: [],
+    waiting: [],
+    handoff: [],
+    verifying: [],
+    working: [],
+    missing: []
+  };
+  sortLiveWork(tasks, now).forEach((task) => groups[liveWorkGroup(task, now)].push(task));
+  return groups;
+}
+
+export const groupAgentWork = groupLiveWork;
+
+/** Build project -> column ID -> column lookup maps for cross-project views. */
+export function columnLookupByProject(columns: Column[]): Map<string, Map<string, Column>> {
+  const projects = new Map<string, Map<string, Column>>();
+  columns.forEach((column) => {
+    let byId = projects.get(column.project_id);
+    if (!byId) {
+      byId = new Map<string, Column>();
+      projects.set(column.project_id, byId);
+    }
+    byId.set(column.id, column);
+  });
+  return projects;
+}
+
+export const columnsByProject = columnLookupByProject;
+
+export function columnForTask(
+  task: Pick<Task, 'project_id' | 'column_id'>,
+  columns: Column[] | Map<string, Map<string, Column>>
+): Column | undefined {
+  if (columns instanceof Map) return columns.get(task.project_id)?.get(task.column_id);
+  return columns.find((column) => column.project_id === task.project_id && column.id === task.column_id);
 }
 
 export function bugReporterId(task: Task): string {

@@ -130,6 +130,7 @@ func (s *Store) ListBugsWithExtra(ctx context.Context, filter TaskFilter) ([]Tas
 }
 
 func (s *Store) listIssues(ctx context.Context, filter TaskFilter, allowExtra bool) ([]Task, bool, error) {
+	readAt := time.Now().UTC()
 	if filter.Limit <= 0 {
 		filter.Limit = 50
 	}
@@ -153,7 +154,7 @@ func (s *Store) listIssues(ctx context.Context, filter TaskFilter, allowExtra bo
 		}
 		query += ` AND t.project_id IN (` + strings.Join(placeholders, ",") + `)`
 	}
-	query, args = appendIssueFilters(query, args, filter)
+	query, args = appendIssueFilters(query, args, filter, readAt)
 	query += ` ORDER BY t.project_id, c.position, t.position, t.number, t.id LIMIT ? OFFSET ?`
 	args = append(args, filter.Limit+1, filter.Cursor)
 	rows, err := s.DB.QueryContext(ctx, query, args...)
@@ -177,14 +178,14 @@ func (s *Store) listIssues(ctx context.Context, filter TaskFilter, allowExtra bo
 		result = result[:filter.Limit]
 	}
 	for i := range result {
-		if err := s.enrichTask(ctx, &result[i]); err != nil {
+		if err := s.enrichTaskAt(ctx, &result[i], readAt); err != nil {
 			return nil, false, err
 		}
 	}
 	return result, hasMore, nil
 }
 
-func appendIssueFilters(query string, args []any, filter TaskFilter) (string, []any) {
+func appendIssueFilters(query string, args []any, filter TaskFilter, readAt time.Time) (string, []any) {
 	if filter.State != "" {
 		query += ` AND c.semantic_state=?`
 		args = append(args, filter.State)
@@ -228,6 +229,23 @@ func appendIssueFilters(query string, args []any, filter TaskFilter) (string, []
 			query += ` AND EXISTS (SELECT 1 FROM bug_details bd WHERE bd.task_id=t.id AND bd.resolution=?)`
 			args = append(args, filter.Resolution)
 		}
+	}
+	staleCutoff := agentWorkStaleCutoff(readAt)
+	if filter.AgentState != "" {
+		switch filter.AgentState {
+		case "missing":
+			query += ` AND NOT EXISTS (SELECT 1 FROM task_agent_work aw WHERE aw.task_id=t.id)`
+		case "stale":
+			query += ` AND EXISTS (SELECT 1 FROM task_agent_work aw WHERE aw.task_id=t.id AND julianday(aw.updated_at) <= julianday(?))`
+			args = append(args, staleCutoff)
+		default:
+			query += ` AND EXISTS (SELECT 1 FROM task_agent_work aw WHERE aw.task_id=t.id AND aw.state=?)`
+			args = append(args, filter.AgentState)
+		}
+	}
+	if filter.ActionNeeded {
+		query += ` AND EXISTS (SELECT 1 FROM task_agent_work aw WHERE aw.task_id=t.id AND (aw.state IN ('waiting', 'handoff') OR julianday(aw.updated_at) <= julianday(?)))`
+		args = append(args, staleCutoff)
 	}
 	if filter.Label != "" {
 		query += ` AND EXISTS (SELECT 1 FROM task_labels tl JOIN labels l ON l.id=tl.label_id WHERE tl.task_id=t.id AND (l.id=? OR lower(l.name)=lower(?)))`

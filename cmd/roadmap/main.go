@@ -39,6 +39,33 @@ func main() {
 				os.Exit(1)
 			}
 			return
+		case "migration-info":
+			if len(os.Args) != 2 {
+				log.Fatalf("migration-info does not accept arguments")
+			}
+			if err := runMigrationInfo(os.Stdout); err != nil {
+				log.Printf("migration-info: %v", err)
+				os.Exit(1)
+			}
+			return
+		case "schema-preflight", "migration-preflight":
+			if len(os.Args) != 3 {
+				log.Fatalf("%s requires exactly one database path", os.Args[1])
+			}
+			if err := runSchemaPreflight(context.Background(), os.Args[2], os.Stdout); err != nil {
+				log.Printf("schema preflight: %v", err)
+				os.Exit(1)
+			}
+			return
+		case "migration-apply":
+			if len(os.Args) != 3 {
+				log.Fatalf("migration-apply requires exactly one staged database path")
+			}
+			if err := runMigrationApply(context.Background(), os.Args[2], os.Stdout); err != nil {
+				log.Printf("migration apply: %v", err)
+				os.Exit(1)
+			}
+			return
 		default:
 			log.Fatalf("unknown command %q", os.Args[1])
 		}
@@ -87,6 +114,37 @@ func main() {
 	if err := server.Shutdown(shutdownCtx); err != nil {
 		log.Printf("shutdown: %v", err)
 	}
+}
+
+func runMigrationInfo(output io.Writer) error {
+	version, digest, err := db.EmbeddedSchema()
+	if err != nil {
+		return err
+	}
+	_, err = fmt.Fprintf(output, "latest_schema_version=%d\nmigration_digest=%s\n", version, digest)
+	return err
+}
+
+func runSchemaPreflight(ctx context.Context, sourcePath string, output io.Writer) error {
+	inspection, err := db.Preflight(ctx, sourcePath)
+	if err != nil {
+		return err
+	}
+	if _, err := fmt.Fprintf(output, "schema_version=%d\nlatest_schema_version=%d\nmigration_digest=%s\nintegrity_check=ok\nforeign_key_check=ok\nstatus=ok\n", inspection.SchemaVersion, inspection.EmbeddedSchemaVersion, inspection.MigrationDigest); err != nil {
+		return err
+	}
+	return nil
+}
+
+func runMigrationApply(ctx context.Context, candidatePath string, output io.Writer) error {
+	inspection, err := db.MigrateCandidate(ctx, candidatePath)
+	if err != nil {
+		return err
+	}
+	if _, err := fmt.Fprintf(output, "schema_version=%d\nlatest_schema_version=%d\nmigration_digest=%s\nintegrity_check=ok\nforeign_key_check=ok\nstatus=ok\n", inspection.SchemaVersion, inspection.EmbeddedSchemaVersion, inspection.MigrationDigest); err != nil {
+		return err
+	}
+	return nil
 }
 
 func runHealthcheck() error {

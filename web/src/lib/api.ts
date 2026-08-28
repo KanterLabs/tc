@@ -3,6 +3,8 @@ import {
   type ActivityEvent,
   type Actor,
   type Agent,
+  type AgentWorkInput,
+  type AgentWorkStateFilter,
   type ApiErrorShape,
   type ApiToken,
   type AuthStatus,
@@ -40,6 +42,8 @@ export interface TaskListParams {
   severity?: BugSeverity | 'untriaged' | 'none';
   reporter?: string;
   resolution?: BugResolution | 'unresolved' | 'none';
+  agent_state?: AgentWorkStateFilter;
+  action_needed?: boolean | string;
   q?: string;
   updated_after?: string;
   cursor?: string;
@@ -50,7 +54,23 @@ export interface IssueListParams extends Omit<TaskListParams, 'kind'> {
   project?: string;
 }
 
-function pathWithQuery(path: string, query?: Record<string, string | number | undefined | null>): string {
+export type WorkView = 'assigned' | 'live';
+
+export interface MyWorkParams {
+  project?: string;
+  state?: string;
+  priority?: string;
+  label?: string;
+  q?: string;
+  updated_after?: string;
+  view?: WorkView;
+  agent_state?: AgentWorkStateFilter;
+  action_needed?: boolean | string;
+  cursor?: string;
+  limit?: number;
+}
+
+function pathWithQuery(path: string, query?: Record<string, string | number | boolean | undefined | null>): string {
   const url = new URL(`${API_PREFIX}${path}`, window.location.origin);
   Object.entries(query ?? {}).forEach(([key, value]) => {
     if (value !== undefined && value !== null && String(value).length > 0) {
@@ -187,6 +207,8 @@ export const api = {
         severity: params.severity,
         reporter: params.reporter,
         resolution: params.resolution,
+        agent_state: params.agent_state,
+        action_needed: params.action_needed,
         q: params.q,
         updated_after: params.updated_after,
         cursor: params.cursor,
@@ -205,6 +227,8 @@ export const api = {
         severity: params.severity,
         reporter: params.reporter,
         resolution: params.resolution,
+        agent_state: params.agent_state,
+        action_needed: params.action_needed,
         q: params.q,
         updated_after: params.updated_after,
         cursor: params.cursor,
@@ -311,9 +335,17 @@ export const api = {
       ifMatch: version,
       idempotencyKey: key()
     }),
-  blockTask: (task: string, version: number) =>
+  blockTask: (task: string, version: number, reason?: string) =>
     request<Task>(`/tasks/${encodeURIComponent(task)}/block`, {
       method: 'POST',
+      ...(reason === undefined ? {} : { body: { reason } }),
+      ifMatch: version,
+      idempotencyKey: key()
+    }),
+  publishAgentWork: (task: string, version: number, input: AgentWorkInput) =>
+    request<Task>(`/tasks/${encodeURIComponent(task)}/progress`, {
+      method: 'POST',
+      body: input,
       ifMatch: version,
       idempotencyKey: key()
     }),
@@ -336,10 +368,38 @@ export const api = {
   deleteLabel: (label: string) =>
     request<void>(`/labels/${encodeURIComponent(label)}`, { method: 'DELETE', idempotencyKey: key() }),
 
-  myWork: (params: { cursor?: string; limit?: number } = {}) =>
-    request<Collection<Task> | Task[]>(pathWithQuery('/my-work', { cursor: params.cursor, limit: params.limit })).then(collectionFrom),
-  allMyWork: () => collectPages((cursor) =>
-    request<Collection<Task>>(pathWithQuery('/my-work', { cursor, limit: 200 })).then(collectionFrom)
+  myWork: (params: MyWorkParams = {}) =>
+    request<Collection<Task> | Task[]>(
+      pathWithQuery('/my-work', {
+        project: params.project,
+        state: params.state,
+        priority: params.priority,
+        label: params.label,
+        q: params.q,
+        updated_after: params.updated_after,
+        view: params.view,
+        agent_state: params.agent_state,
+        action_needed: params.action_needed,
+        cursor: params.cursor,
+        limit: params.limit
+      })
+    ).then(collectionFrom),
+  allMyWork: (params: MyWorkParams = {}) => collectPages((cursor) =>
+    request<Collection<Task> | Task[]>(
+      pathWithQuery('/my-work', {
+        project: params.project,
+        state: params.state,
+        priority: params.priority,
+        label: params.label,
+        q: params.q,
+        updated_after: params.updated_after,
+        view: params.view,
+        agent_state: params.agent_state,
+        action_needed: params.action_needed,
+        cursor,
+        limit: params.limit ?? 200
+      })
+    ).then(collectionFrom), params.cursor
   ),
   roadmap: (project?: string) =>
     request<RoadmapSummary>(project ? `/projects/${encodeURIComponent(project)}/roadmap` : '/roadmap'),

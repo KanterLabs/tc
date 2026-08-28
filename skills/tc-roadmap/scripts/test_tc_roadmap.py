@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import argparse
 import json
 import os
 import tempfile
@@ -78,6 +79,143 @@ class CommandTests(unittest.TestCase):
         invalid = mock.Mock(message="Working", state=None, phase=None, completed=4, total=3, next_step=None)
         with self.assertRaisesRegex(helper.RoadmapError, "0 <= completed"):
             helper._progress_message(invalid)
+
+    def test_structured_progress_posts_payload_with_version_and_canonical_idempotency(self) -> None:
+        calls: list[tuple[str, str, dict[str, object]]] = []
+        current = {
+            "id": "task-1",
+            "key": "TC-1",
+            "version": 7,
+            "claimed_by": "agent-1",
+        }
+        updated = {**current, "version": 8}
+
+        class StubClient:
+            def call(self, method: str, path: str, **kwargs):  # type: ignore[no-untyped-def]
+                calls.append((method, path, kwargs))
+                if method == "GET":
+                    return current, {}
+                return updated, {}
+
+        args = argparse.Namespace(
+            task="TC-1",
+            message="API is complete",
+            state=None,
+            phase="Backend",
+            completed=1,
+            total=2,
+            next_step="Run the browser suite",
+            checkpoint_refs=["tests/unit", "tests/browser"],
+            operation_id="run-1",
+        )
+        result = helper.cmd_progress(StubClient(), args)  # type: ignore[arg-type]
+
+        expected = {
+            "operation_id": "run-1",
+            "state": "working",
+            "phase": "Backend",
+            "summary": "API is complete",
+            "next_action": "Run the browser suite",
+            "checkpoint_completed": 1,
+            "checkpoint_total": 2,
+            "checkpoint_refs": ["tests/unit", "tests/browser"],
+        }
+        self.assertEqual(result, {"task": updated, "operation_id": "run-1"})
+        self.assertEqual(calls[0][0:2], ("GET", "/tasks/TC-1"))
+        self.assertEqual(calls[1][0:2], ("POST", "/tasks/task-1/progress"))
+        self.assertEqual(calls[1][2]["body"], expected)
+        self.assertEqual(calls[1][2]["if_match"], 7)
+        self.assertEqual(
+            calls[1][2]["idempotency_key"],
+            helper._idempotency("run-1", "progress", helper._canonical_json(expected)),
+        )
+
+    def test_plain_progress_uses_legacy_comments_endpoint(self) -> None:
+        calls: list[tuple[str, str, dict[str, object]]] = []
+
+        class StubClient:
+            def call(self, method: str, path: str, **kwargs):  # type: ignore[no-untyped-def]
+                calls.append((method, path, kwargs))
+                if method == "GET":
+                    return {"id": "task-1", "key": "TC-1", "version": 2}, {}
+                return {"id": "comment-1", "body": "Validated"}, {}
+
+        args = argparse.Namespace(
+            task="TC-1",
+            message="  Validated  ",
+            state=None,
+            phase=None,
+            completed=None,
+            total=None,
+            next_step=None,
+            checkpoint_refs=[],
+            operation_id="run-2",
+        )
+        result = helper.cmd_progress(StubClient(), args)  # type: ignore[arg-type]
+
+        self.assertEqual(result["task"], "TC-1")
+        self.assertEqual(calls[1][0:2], ("POST", "/tasks/task-1/comments"))
+        self.assertEqual(calls[1][2]["body"], {"body": "Validated"})
+        self.assertNotIn("if_match", calls[1][2])
+        self.assertNotIn("/progress", calls[1][1])
+
+    def test_structured_progress_requires_a_claim(self) -> None:
+        calls: list[tuple[str, str, dict[str, object]]] = []
+
+        class StubClient:
+            def call(self, method: str, path: str, **kwargs):  # type: ignore[no-untyped-def]
+                calls.append((method, path, kwargs))
+                return {"id": "task-1", "key": "TC-1", "version": 2}, {}
+
+        args = argparse.Namespace(
+            task="TC-1",
+            message="Working",
+            state="working",
+            phase=None,
+            completed=None,
+            total=None,
+            next_step=None,
+            checkpoint_refs=[],
+            operation_id="run-3",
+        )
+        with self.assertRaisesRegex(helper.RoadmapError, "actively claimed"):
+            helper.cmd_progress(StubClient(), args)  # type: ignore[arg-type]
+        self.assertEqual(len(calls), 1)
+
+    def test_structured_progress_validates_counts_and_normalizes_refs(self) -> None:
+        args = argparse.Namespace(
+            operation_id="run-4",
+            message="Working",
+            state="working",
+            phase=None,
+            completed=3,
+            total=2,
+            next_step=None,
+            checkpoint_refs=["  tests/unit  "],
+        )
+        with self.assertRaisesRegex(helper.RoadmapError, "0 <= completed"):
+            helper._structured_progress_payload(args)
+
+        args.completed, args.total = 1, 1
+        self.assertEqual(helper._structured_progress_payload(args)["checkpoint_refs"], ["tests/unit"])
+
+    def test_progress_parser_accepts_repeatable_checkpoint_refs(self) -> None:
+        args = helper.build_parser().parse_args(
+            [
+                "progress",
+                "--task",
+                "TC-1",
+                "--message",
+                "Working",
+                "--checkpoint-ref",
+                "tests/unit",
+                "--checkpoint-ref",
+                "tests/browser",
+                "--operation-id",
+                "run-5",
+            ]
+        )
+        self.assertEqual(args.checkpoint_refs, ["tests/unit", "tests/browser"])
 
     def test_backlog_creates_unclaimed_task_in_backlog_column(self) -> None:
         calls: list[tuple[str, str, dict[str, object]]] = []

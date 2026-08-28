@@ -47,6 +47,9 @@ done
 fixture=$(mktemp -d "${TMPDIR:-/tmp}/roadmap-deploy-security.XXXXXX")
 cleanup_fixture() { rm -rf -- "$fixture"; }
 trap cleanup_fixture EXIT
+# Mocked backup publication tests do not have a release binary from which to
+# query migration-info; use a deterministic non-secret fixture digest.
+export ROADMAP_MIGRATION_DIGEST=0000000000000000000000000000000000000000000000000000000000000000
 
 # The SSH key enters one fixed root command through non-interactive sudo. The
 # gateway sees SSH_ORIGINAL_COMMAND, while local argv is an explicit root-only
@@ -142,8 +145,24 @@ contains '127\.0\.0\.1:8080|\[::1\]:8080' "$INSTALL"
 contains 'install -m 0640 -o root -g root "$RELEASE_DIR/roadmap.env" "$new_target/roadmap.env"' "$INSTALL"
 contains 'stop_unit cloudflared.service' "$INSTALL"
 contains 'stop_unit roadmap.service' "$INSTALL"
+contains 'ROADMAP_MIGRATION_INFO_BINARY' "$INSTALL"
+contains 'schema-preflight' "$INSTALL"
+contains 'verified pre-upgrade backup' "$INSTALL"
+contains 'migration-info' "$BACKUP"
+contains 'migration-info' "$ROOT_DIR/cmd/roadmap/main.go"
 not_contains 'systemctl stop cloudflared.service 2>/dev/null || true' "$INSTALL"
 not_contains 'systemctl stop roadmap.service 2>/dev/null || true' "$INSTALL"
+
+# A retained binary may predate migration-info. The installer must ask the
+# candidate binary for metadata rather than selecting the retained executable
+# and failing before the first metadata-bearing backup is published.
+old_binary="$fixture/retained-old-roadmap"
+printf '#!/usr/bin/env bash\nexit 64\n' > "$old_binary"
+chmod 0755 "$old_binary"
+if "$old_binary" migration-info >/dev/null 2>&1; then
+	fail 'old retained binary fixture unexpectedly implements migration-info'
+fi
+contains 'migration_info_binary="$RELEASE_DIR/roadmap"' "$INSTALL"
 
 # Postfix is not used by Roadmap. Keep the aggregate, template, and generated
 # default instance names explicit so the active postfix@-.service unit is
@@ -298,6 +317,14 @@ contains 'roadmap-backup.timer' "$INSTALL"
 contains 'ROADMAP_DATA_DIR' "$BACKUP"
 contains 'ROADMAP_DATA_DIR' "$RESTORE"
 contains 'ROADMAP_DEPLOY_LOCK_HELD' "$BACKUP"
+contains 'schema_version' "$BACKUP"
+contains 'migration_digest' "$BACKUP"
+contains 'PRAGMA foreign_key_check' "$BACKUP"
+contains 'schema_version' "$RESTORE"
+contains 'migration_digest' "$RESTORE"
+contains 'PRAGMA foreign_key_check' "$RESTORE"
+contains 'migration-apply' "$RESTORE"
+contains 'migrate_staged_candidate "$candidate"' "$RESTORE"
 contains 'metadata release does not match its filename' "$RESTORE"
 contains 'email = NULL' "$RESTORE"
 contains 'password_hash = NULL' "$RESTORE"
@@ -321,6 +348,18 @@ contains 'DELETE FROM tokens' "$RESTORE"
 contains 'DELETE FROM idempotency_keys' "$RESTORE"
 contains 'Never swap a raw' "$DOCS"
 not_contains 'atomically move it to /var/lib/roadmap/roadmap.db' "$DOCS"
+
+# The candidate gate must complete while the application is still online and
+# before the installer stops either unit or switches the current release link.
+install_backup_line=$(grep -n 'roadmap-backup.sh" "\$SHA"' "$INSTALL" | cut -d: -f1 || true)
+install_preflight_line=$(grep -n 'schema-preflight' "$INSTALL" | cut -d: -f1 || true)
+install_stop_line=$(grep -n '^stop_unit cloudflared\.service' "$INSTALL" | tail -n 1 | cut -d: -f1 || true)
+install_switch_line=$(grep -n '^atomic_switch "\$release_target"' "$INSTALL" | cut -d: -f1 || true)
+[[ -n "$install_backup_line" && -n "$install_preflight_line" && -n "$install_stop_line" && -n "$install_switch_line" ]] \
+	|| fail 'install migration-gate ordering checks could not find backup/preflight/stop/switch'
+[[ "$install_backup_line" -lt "$install_preflight_line" && "$install_preflight_line" -lt "$install_stop_line" && "$install_stop_line" -lt "$install_switch_line" ]] \
+	|| fail 'install does not gate the atomic switch on a preflight of the verified backup'
+not_contains 'roadmap.db' "$ROLLBACK"
 
 # Exercise the gateway cleanup predicate with a mocked pct boundary. A failed
 # pct create is allowed to leave a partial configuration, but the transaction
@@ -1566,7 +1605,7 @@ if [[ "$(id -u)" -eq 0 && -n "$(id -u roadmap 2>/dev/null || true)" && $(command
 	install -d -m 0755 -o root -g root "$backup_fixture"
 	install -d -m 0750 -o roadmap -g roadmap "$backup_fixture/data"
 	install -d -m 0700 -o root -g root "$backup_fixture/backups"
-	sqlite3 "$backup_fixture/data/roadmap.db" 'CREATE TABLE smoke (id INTEGER PRIMARY KEY); INSERT INTO smoke VALUES (1);'
+	sqlite3 "$backup_fixture/data/roadmap.db" 'CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL); INSERT INTO schema_migrations VALUES (8, "fixture"); CREATE TABLE smoke (id INTEGER PRIMARY KEY); INSERT INTO smoke VALUES (1);'
 	chown roadmap:roadmap "$backup_fixture/data/roadmap.db"
 	chmod 0640 "$backup_fixture/data/roadmap.db"
 	backup_output=$(cd /tmp && ROADMAP_STATE_DIR="$backup_fixture" ROADMAP_DATA_DIR="$backup_fixture/data" \
@@ -1649,8 +1688,15 @@ backup_mock_sqlite3() {
 		return 0
 	fi
 	for sql in "$@"; do
+		if [[ "$sql" = 'SELECT COALESCE(MAX(version), 0) FROM schema_migrations;' ]]; then
+			printf '8\n'
+			return 0
+		fi
 		if [[ "$sql" = 'PRAGMA integrity_check;' ]]; then
 			printf 'ok\n'
+			return 0
+		fi
+		if [[ "$sql" = 'PRAGMA foreign_key_check;' ]]; then
 			return 0
 		fi
 	done
@@ -1724,6 +1770,42 @@ backup_mock_run() {
 	fi
 }
 
+# The helper must remain usable during a binary-only rollback when current
+# points at an older executable that does not implement migration-info.
+backup_old_binary_case="$fixture/backup-old-binary"
+backup_mock_setup "$backup_old_binary_case"
+backup_old_binary_state="$backup_old_binary_case/state"
+backup_old_binary_dir="$backup_old_binary_state/backups"
+backup_old_binary_path="$backup_old_binary_state/data/roadmap.db"
+backup_old_binary_failure="$backup_old_binary_case/failure.marker"
+set +e
+(
+	export ROADMAP_STATE_DIR="$backup_old_binary_state" ROADMAP_DATA_DIR="$backup_old_binary_state/data" \
+		ROADMAP_DB_PATH="$backup_old_binary_path" ROADMAP_BACKUP_DIR="$backup_old_binary_dir" ROADMAP_BACKUP_RETENTION=2 \
+		ROADMAP_MIGRATION_INFO_BINARY="$old_binary"
+	unset ROADMAP_MIGRATION_DIGEST
+	BACKUP_MOCK_DB_PATH="$backup_old_binary_path" BACKUP_MOCK_DIR="$backup_old_binary_dir" \
+		BACKUP_MOCK_MV_FAILURE= BACKUP_MOCK_SOURCE_DRIFT=0 BACKUP_MOCK_FAILURE_MARKER="$backup_old_binary_failure"
+	export BACKUP_MOCK_DB_PATH BACKUP_MOCK_DIR BACKUP_MOCK_MV_FAILURE BACKUP_MOCK_SOURCE_DRIFT BACKUP_MOCK_FAILURE_MARKER
+	export -f backup_mock_id backup_mock_install backup_mock_chown backup_mock_stat backup_mock_sqlite3 backup_mock_mv
+	id() { backup_mock_id "$@"; }
+	install() { backup_mock_install "$@"; }
+	chown() { backup_mock_chown "$@"; }
+	stat() { backup_mock_stat "$@"; }
+	sqlite3() { backup_mock_sqlite3 "$@"; }
+	mv() { backup_mock_mv "$@"; }
+	export -f id install chown stat sqlite3 mv
+	"$BACKUP" manual
+) >"$backup_old_binary_case/output.log" 2>&1
+backup_old_binary_status=$?
+set -e
+[[ "$backup_old_binary_status" -eq 0 ]] || fail 'backup failed with an old current binary lacking migration-info'
+backup_old_binary_metadata=$(find "$backup_old_binary_dir" -maxdepth 1 -type f -name '*.db.metadata' -print -quit)
+[[ -n "$backup_old_binary_metadata" ]] || fail 'old-binary backup did not publish metadata'
+grep -Eq '^migration_digest=[0-9a-f]{64}$' "$backup_old_binary_metadata" \
+	|| fail 'old-binary backup did not publish deterministic migration digest'
+printf 'backup_old_binary_compatibility_test=ok\n'
+
 backup_mock_run publication-metadata-failure metadata
 backup_mock_run publication-database-failure database
 
@@ -1772,8 +1854,8 @@ set +e
 backup_retention_status=$?
 set -e
 [[ "$backup_retention_status" -eq 0 ]] || fail 'backup retention fixture failed unexpectedly'
-[[ ! -e "$backup_old" && ! -e "$backup_old.sha256" && ! -e "$backup_old.metadata" ]] \
-	|| fail 'retention kept an older complete backup beyond its limit'
+[[ -f "$backup_old" && -f "$backup_old.sha256" && -f "$backup_old.metadata" ]] \
+	|| fail 'retention removed a valid historical backup without schema metadata'
 [[ -f "$backup_incomplete" && -f "$backup_corrupt" && -f "$backup_corrupt.sha256" && -f "$backup_corrupt.metadata" ]] \
 	|| fail 'retention removed or counted an invalid/incomplete backup set'
 
