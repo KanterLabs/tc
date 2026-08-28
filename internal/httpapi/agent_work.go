@@ -44,6 +44,10 @@ type agentWorkRequest struct {
 	CheckpointTotal     *int     `json:"checkpoint_total"`
 }
 
+type agentWorkHeartbeatRequest struct {
+	OperationID *string `json:"operation_id"`
+}
+
 func (s *Server) taskProgress(w http.ResponseWriter, r *http.Request, identity auth.Identity, reference string) {
 	if r.Method != http.MethodPost {
 		s.writeError(w, http.StatusMethodNotAllowed, "method_not_allowed", "method not allowed", nil)
@@ -88,6 +92,86 @@ func (s *Server) taskProgress(w http.ResponseWriter, r *http.Request, identity a
 		}
 		return http.StatusOK, body, taskETag(updated), nil
 	})
+}
+
+// taskHeartbeat refreshes the liveness timestamp for an already-published
+// snapshot. It intentionally does not use the normal mutation wrapper: a
+// heartbeat creates no idempotency row, task version, event, comment, or
+// resource-budget reservation. The timestamp touch is inherently idempotent;
+// callers that send Idempotency-Key receive an explicit unsupported response
+// rather than a key whose replay semantics differ from other mutations.
+func (s *Server) taskHeartbeat(w http.ResponseWriter, r *http.Request, identity auth.Identity, reference string) {
+	if r.Method != http.MethodPost {
+		s.writeError(w, http.StatusMethodNotAllowed, "method_not_allowed", "method not allowed", nil)
+		return
+	}
+	if !requireScope(w, identity, "tasks:claim") {
+		return
+	}
+	if strings.TrimSpace(r.Header.Get("Idempotency-Key")) != "" {
+		s.writeError(w, http.StatusBadRequest, "idempotency_not_supported", "Idempotency-Key is not supported on heartbeat routes", nil)
+		return
+	}
+	task, err := s.Store.ResolveTaskReference(r.Context(), reference)
+	if err != nil {
+		s.writeStoreError(w, err)
+		return
+	}
+	if !identity.CanProject(task.ProjectID) {
+		s.writeError(w, http.StatusForbidden, "forbidden", "token is not scoped to this project", nil)
+		return
+	}
+	operationID, err := decodeAgentWorkHeartbeatInput(r)
+	if err != nil {
+		writeTaskInputError(w, err)
+		return
+	}
+	if !s.admitHeartbeat(w, r, identity) {
+		return
+	}
+	updated, err := s.Store.HeartbeatAgentWork(r.Context(), task.ID, operationID, identity.Actor.ID)
+	if err != nil {
+		s.writeStoreErrorForIdentity(w, identity, err)
+		return
+	}
+	body, err := marshalTaskForIdentity(identity, updated)
+	if err != nil {
+		s.writeInternal(w, err)
+		return
+	}
+	s.writeRaw(w, http.StatusOK, body, taskETag(updated))
+}
+
+func decodeAgentWorkHeartbeatInput(r *http.Request) (string, error) {
+	var payload agentWorkHeartbeatRequest
+	var rawPayload map[string]json.RawMessage
+	fields, err := decodeJSONObject(r, &rawPayload)
+	if err != nil {
+		return "", err
+	}
+	body, err := requestBodyData(r)
+	if err != nil {
+		return "", err
+	}
+	if err := json.Unmarshal(body, &payload); err != nil {
+		return "", err
+	}
+	for name := range fields {
+		if name != "operation_id" {
+			return "", taskInputError("unknown heartbeat field: " + name)
+		}
+	}
+	if err := requireJSONFields(fields, "operation_id"); err != nil {
+		return "", err
+	}
+	if payload.OperationID == nil {
+		return "", taskInputError("operation_id must not be empty")
+	}
+	operationID := strings.TrimSpace(*payload.OperationID)
+	if utf8.RuneCountInString(operationID) > 128 || !safeAgentWorkIdentifier(operationID) {
+		return "", taskInputError("operation_id must be between 1 and 128 safe identifier characters")
+	}
+	return operationID, nil
 }
 
 func decodeAgentWorkInput(r *http.Request) (store.AgentWorkInput, error) {

@@ -1349,6 +1349,77 @@ paths:
         '503':
           $ref: '#/components/responses/ServiceUnavailable'
 
+  /api/v1/tasks/{task}/heartbeat:
+    parameters:
+      - $ref: '#/components/parameters/TaskPath'
+    post:
+      operationId: heartbeatTaskAgentWork
+      summary: Refresh an agent work heartbeat
+      description: |
+        Refresh only the `updated_at` liveness timestamp of the existing
+        agent-work snapshot identified by `operation_id`. The caller must
+        have `tasks:claim`, be allowed to access the task's project, own the
+        task's active unexpired claim, and match both the snapshot actor and
+        operation ID. The task must remain unfinished. Heartbeats are quiet
+        and inherently idempotent: they do not change the task version or
+        `tasks.updated_at`, replace any snapshot content, append comments or
+        events, reserve the agent mutation budget, or persist idempotency
+        records. `If-Match` is intentionally not required because the
+        heartbeat never changes task state or its optimistic-concurrency
+        version. `Idempotency-Key` is not supported; omit it.
+      tags:
+        - Tasks
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AgentWorkHeartbeatRequest'
+            example:
+              operation_id: codex/ops-release
+      responses:
+        '200':
+          description: |
+            Task with the unchanged version and refreshed agent-work
+            timestamp. Humans and bearer tokens with `tasks:read` receive the
+            full task; bearer tokens without `tasks:read` receive only
+            `{id,version}` according to the normal mutation redaction. The
+            strong task ETag is unchanged.
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/XRequestID'
+            X-Roadmap-Revision:
+              $ref: '#/components/headers/XRoadmapRevision'
+            ETag:
+              $ref: '#/components/headers/ETag'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TaskMutationResponse'
+              examples:
+                full:
+                  $ref: '#/components/examples/TaskHeartbeatExample'
+                reduced:
+                  $ref: '#/components/examples/TaskMutationSummaryExample'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '413':
+          $ref: '#/components/responses/RequestTooLarge'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+
   /api/v1/tasks/{task}/claim:
     parameters:
       - $ref: '#/components/parameters/TaskPath'
@@ -3604,6 +3675,22 @@ components:
           maximum: 100
       additionalProperties: false
 
+    AgentWorkHeartbeatRequest:
+      type: object
+      required:
+        - operation_id
+      description: |
+        Existing agent-work operation to keep alive. The heartbeat refreshes
+        only the snapshot's `updated_at` timestamp; null and unknown
+        properties are rejected.
+      properties:
+        operation_id:
+          type: string
+          minLength: 1
+          maxLength: 128
+          pattern: '^[A-Za-z0-9][A-Za-z0-9_.:/-]*$'
+      additionalProperties: false
+
     BugDetails:
       type: object
       required:
@@ -4831,6 +4918,42 @@ components:
           checkpoint_total: 2
           started_at: '2026-08-27T10:00:00Z'
           updated_at: '2026-08-27T10:30:00Z'
+          stale: false
+          action_needed: false
+    TaskHeartbeatExample:
+      summary: Task with a quietly refreshed agent-work heartbeat
+      value:
+        id: task_42
+        number: 42
+        key: OPS-42
+        project_id: proj_ops
+        column_id: col_active
+        kind: task
+        title: Add event polling
+        description: Implement incremental event polling for agents.
+        priority: high
+        position: 0
+        claimed_by: agent_ada
+        claim_expires_at: '2026-08-27T11:00:00Z'
+        version: 8
+        created_at: '2026-08-27T09:30:00Z'
+        updated_at: '2026-08-27T10:30:00Z'
+        labels: []
+        comment_count: 2
+        agent_work:
+          operation_id: codex/ops-release
+          actor_id: agent_ada
+          state: working
+          phase: Implementing event polling
+          summary: Added the progress persistence and HTTP contract.
+          next_action: Run the focused API tests.
+          checkpoint_refs:
+            - api-contract
+            - http-tests
+          checkpoint_completed: 1
+          checkpoint_total: 2
+          started_at: '2026-08-27T10:00:00Z'
+          updated_at: '2026-08-27T10:38:00Z'
           stale: false
           action_needed: false
     TaskMutationSummaryExample:

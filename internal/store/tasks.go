@@ -758,7 +758,7 @@ func activeClaimByOtherTx(ctx context.Context, tx *sql.Tx, id, actorID, timestam
 // taskClaimStateTx returns the current version and whether actorID owns an
 // active lease. It is used only after a guarded UPDATE matched zero rows, so
 // the authorization decision itself remains in the UPDATE predicate.
-func taskClaimStateTx(ctx context.Context, tx *sql.Tx, id, actorID, timestamp string) (int64, bool, error) {
+func taskClaimStateTx(ctx context.Context, tx *sql.Tx, id, actorID string) (int64, bool, error) {
 	var version int64
 	var claimedBy, claimExpiry sql.NullString
 	err := tx.QueryRowContext(ctx, `SELECT version, claimed_by, claim_expires_at FROM tasks WHERE id=? AND deleted_at IS NULL`, id).Scan(&version, &claimedBy, &claimExpiry)
@@ -769,7 +769,7 @@ func taskClaimStateTx(ctx context.Context, tx *sql.Tx, id, actorID, timestamp st
 		return 0, false, err
 	}
 	var activeValue int
-	if err := tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM tasks WHERE id=? AND deleted_at IS NULL AND claimed_by=? AND claim_expires_at IS NOT NULL AND julianday(claim_expires_at) > julianday(?))`, id, actorID, timestamp).Scan(&activeValue); err != nil {
+	if err := tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM tasks WHERE id=? AND deleted_at IS NULL AND claimed_by=? AND claim_expires_at IS NOT NULL AND julianday(claim_expires_at) > julianday('now'))`, id, actorID).Scan(&activeValue); err != nil {
 		return 0, false, err
 	}
 	active := claimedBy.Valid && claimedBy.String == actorID && claimExpiry.Valid && activeValue != 0
@@ -823,10 +823,13 @@ func (s *Store) ClaimTask(ctx context.Context, id, actorID string, duration time
 	if err != nil {
 		return Task{}, err
 	}
-	expires := time.Now().UTC().Add(duration).Format(time.RFC3339Nano)
-	timestamp := now()
+	// Keep the duration as a SQLite date modifier. The clock itself is read by
+	// the guarded UPDATE, after it acquires SQLite's writer lock; calculating an
+	// expiry or updated_at value in Go here would let lock wait time age both
+	// values before the claim is authorized.
+	expiresModifier := fmt.Sprintf("+%.9f seconds", duration.Seconds())
 	err = s.withTx(ctx, func(tx *sql.Tx) error {
-		result, err := tx.ExecContext(ctx, `UPDATE tasks SET claimed_by=?, claim_expires_at=?, version=version+1, updated_at=? WHERE id=? AND version=? AND deleted_at IS NULL AND (claimed_by=? OR claimed_by IS NULL OR claim_expires_at IS NULL OR julianday(claim_expires_at) <= julianday(?))`, actorID, expires, timestamp, id, expected, actorID, timestamp)
+		result, err := tx.ExecContext(ctx, `UPDATE tasks SET claimed_by=?, claim_expires_at=strftime('%Y-%m-%dT%H:%M:%fZ','now',?), version=version+1, updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id=? AND version=? AND deleted_at IS NULL AND completed_at IS NULL AND (claimed_by=? OR claimed_by IS NULL OR claim_expires_at IS NULL OR julianday(claim_expires_at) <= julianday('now'))`, actorID, expiresModifier, id, expected, actorID)
 		if err != nil {
 			return err
 		}
@@ -835,7 +838,14 @@ func (s *Store) ClaimTask(ctx context.Context, id, actorID string, duration time
 			if current.Version != expected {
 				return conflict("task has changed", map[string]any{"current": current})
 			}
+			if current.CompletedAt != nil {
+				return conflict("task is already finished", nil)
+			}
 			return &Error{Kind: ErrClaimUnavailable, Message: "task is currently claimed", Details: map[string]any{"current": current}}
+		}
+		var expires string
+		if err := tx.QueryRowContext(ctx, `SELECT claim_expires_at FROM tasks WHERE id=?`, id).Scan(&expires); err != nil {
+			return err
 		}
 		_, err = insertEvent(ctx, tx, "task.claimed", actorID, current.ProjectID, id, map[string]any{"expires_at": expires})
 		return err
@@ -867,17 +877,21 @@ func (s *Store) renewTask(ctx context.Context, id, actorID string, duration time
 	if err != nil {
 		return Task{}, err
 	}
-	expires := time.Now().UTC().Add(duration).Format(time.RFC3339Nano)
-	timestamp := now()
+	// The expiry modifier is fixed input; SQLite supplies the clock when the
+	// guarded UPDATE executes after writer-lock acquisition.
+	expiresModifier := fmt.Sprintf("+%.9f seconds", duration.Seconds())
 	err = s.withTx(ctx, func(tx *sql.Tx) error {
-		result, err := tx.ExecContext(ctx, `UPDATE tasks SET claim_expires_at=?, version=version+1, updated_at=? WHERE id=? AND version=? AND claimed_by=? AND julianday(claim_expires_at) > julianday(?) AND deleted_at IS NULL`, expires, timestamp, id, expected, actorID, timestamp)
+		result, err := tx.ExecContext(ctx, `UPDATE tasks SET claim_expires_at=strftime('%Y-%m-%dT%H:%M:%fZ','now',?), version=version+1, updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id=? AND version=? AND claimed_by=? AND julianday(claim_expires_at) > julianday('now') AND deleted_at IS NULL AND completed_at IS NULL`, expiresModifier, id, expected, actorID)
 		if err != nil {
 			return err
 		}
 		count, _ := result.RowsAffected()
 		if count == 0 {
+			if current.Version == expected && current.CompletedAt != nil {
+				return conflict("task is already finished", nil)
+			}
 			if requireActiveClaim {
-				version, active, claimErr := taskClaimStateTx(ctx, tx, id, actorID, timestamp)
+				version, active, claimErr := taskClaimStateTx(ctx, tx, id, actorID)
 				if claimErr != nil {
 					return claimErr
 				}
@@ -886,6 +900,10 @@ func (s *Store) renewTask(ctx context.Context, id, actorID string, duration time
 				}
 			}
 			return conflict("claim cannot be renewed", map[string]any{"current": current})
+		}
+		var expires string
+		if err := tx.QueryRowContext(ctx, `SELECT claim_expires_at FROM tasks WHERE id=?`, id).Scan(&expires); err != nil {
+			return err
 		}
 		_, err = insertEvent(ctx, tx, "task.claim_renewed", actorID, current.ProjectID, id, map[string]any{"expires_at": expires})
 		return err
@@ -911,13 +929,11 @@ func (s *Store) releaseTask(ctx context.Context, id, actorID string, expected in
 	if err != nil {
 		return Task{}, err
 	}
-	timestamp := now()
 	err = s.withTx(ctx, func(tx *sql.Tx) error {
-		query := `UPDATE tasks SET claimed_by=NULL, claim_expires_at=NULL, version=version+1, updated_at=? WHERE id=? AND version=? AND claimed_by=? AND deleted_at IS NULL`
-		args := []any{timestamp, id, expected, actorID}
+		query := `UPDATE tasks SET claimed_by=NULL, claim_expires_at=NULL, version=version+1, updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id=? AND version=? AND claimed_by=? AND deleted_at IS NULL`
+		args := []any{id, expected, actorID}
 		if requireActiveClaim {
-			query += ` AND claim_expires_at IS NOT NULL AND julianday(claim_expires_at) > julianday(?)`
-			args = append(args, timestamp)
+			query += ` AND claim_expires_at IS NOT NULL AND julianday(claim_expires_at) > julianday('now')`
 		}
 		result, err := tx.ExecContext(ctx, query, args...)
 		if err != nil {
@@ -926,7 +942,7 @@ func (s *Store) releaseTask(ctx context.Context, id, actorID string, expected in
 		count, _ := result.RowsAffected()
 		if count == 0 {
 			if requireActiveClaim {
-				version, active, claimErr := taskClaimStateTx(ctx, tx, id, actorID, timestamp)
+				version, active, claimErr := taskClaimStateTx(ctx, tx, id, actorID)
 				if claimErr != nil {
 					return claimErr
 				}
@@ -992,21 +1008,15 @@ func (s *Store) transitionTask(ctx context.Context, id, actorID string, expected
 	if err != nil {
 		return Task{}, err
 	}
-	timestamp := now()
 	err = s.withTx(ctx, func(tx *sql.Tx) error {
 		// Compare the task's pre-update column state inside the guarded UPDATE.
 		// Repeating complete while already completed must preserve its original
 		// timestamp; only a transition into completed gets a new one.
-		query := `UPDATE tasks SET column_id=?, completed_at=CASE WHEN ? <> 'completed' THEN NULL WHEN (SELECT semantic_state FROM columns WHERE id=tasks.column_id) = 'completed' THEN tasks.completed_at ELSE ? END, claimed_by=NULL, claim_expires_at=NULL, version=version+1, updated_at=? WHERE id=? AND version=? AND deleted_at IS NULL`
-		args := []any{column.ID, state, func() any {
-			if state == "completed" {
-				return timestamp
-			}
-			return nil
-		}(), timestamp, id, expected}
+		query := `UPDATE tasks SET column_id=?, completed_at=CASE WHEN ? <> 'completed' THEN NULL WHEN (SELECT semantic_state FROM columns WHERE id=tasks.column_id) = 'completed' THEN tasks.completed_at ELSE strftime('%Y-%m-%dT%H:%M:%fZ','now') END, claimed_by=NULL, claim_expires_at=NULL, version=version+1, updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id=? AND version=? AND deleted_at IS NULL`
+		args := []any{column.ID, state, id, expected}
 		if requireActiveClaim {
-			query += ` AND claimed_by=? AND claim_expires_at IS NOT NULL AND julianday(claim_expires_at) > julianday(?)`
-			args = append(args, actorID, timestamp)
+			query += ` AND claimed_by=? AND claim_expires_at IS NOT NULL AND julianday(claim_expires_at) > julianday('now')`
+			args = append(args, actorID)
 		}
 		result, err := tx.ExecContext(ctx, query, args...)
 		if err != nil {
@@ -1015,7 +1025,7 @@ func (s *Store) transitionTask(ctx context.Context, id, actorID string, expected
 		count, _ := result.RowsAffected()
 		if count == 0 {
 			if requireActiveClaim {
-				version, active, claimErr := taskClaimStateTx(ctx, tx, id, actorID, timestamp)
+				version, active, claimErr := taskClaimStateTx(ctx, tx, id, actorID)
 				if claimErr != nil {
 					return claimErr
 				}
@@ -1030,7 +1040,7 @@ func (s *Store) transitionTask(ctx context.Context, id, actorID string, expected
 				return invalid("action note is too long", nil)
 			}
 			commentID := newID()
-			if _, err := tx.ExecContext(ctx, `INSERT INTO comments(id, task_id, actor_id, body, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)`, commentID, id, actorID, strings.TrimSpace(note), timestamp, timestamp); err != nil {
+			if _, err := tx.ExecContext(ctx, `INSERT INTO comments(id, task_id, actor_id, body, created_at, updated_at) VALUES (?, ?, ?, ?, strftime('%Y-%m-%dT%H:%M:%fZ','now'), strftime('%Y-%m-%dT%H:%M:%fZ','now'))`, commentID, id, actorID, strings.TrimSpace(note)); err != nil {
 				return err
 			}
 			if _, err := insertEvent(ctx, tx, "comment.created", actorID, current.ProjectID, id, map[string]any{"comment_id": commentID}); err != nil {

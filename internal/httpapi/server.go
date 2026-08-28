@@ -591,6 +591,8 @@ func (s *Server) dispatchAuthed(w http.ResponseWriter, r *http.Request, identity
 				s.comments(w, r, identity, parts[1])
 			case "progress":
 				s.taskProgress(w, r, identity, parts[1])
+			case "heartbeat":
+				s.taskHeartbeat(w, r, identity, parts[1])
 			case "claim":
 				s.taskAction(w, r, identity, parts[1], "claim")
 			case "renew":

@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import io
 import json
 import tempfile
@@ -53,6 +54,25 @@ class InstallTests(unittest.TestCase):
             with self.assertRaisesRegex(update_skill.UpdateError, "unexpected skill target"):
                 update_skill.install_from_source(source, root / "wrong")
 
+    def test_install_rejects_symlinked_parent_without_touching_target(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            source = root / "source"
+            (source / "scripts").mkdir(parents=True)
+            (source / "SKILL.md").write_text("---\nname: tc-roadmap\n---\n", encoding="utf-8")
+            (source / "scripts" / "tc_roadmap.py").write_text("# helper\n", encoding="utf-8")
+            real = root / "real-skills"
+            real.mkdir()
+            (real / "keep.txt").write_text("keep\n", encoding="utf-8")
+            linked = root / "codex" / "skills"
+            linked.parent.mkdir()
+            linked.symlink_to(real, target_is_directory=True)
+
+            with self.assertRaisesRegex(update_skill.UpdateError, "symlink"):
+                update_skill.install_from_source(source, linked / "tc-roadmap")
+            self.assertEqual((real / "keep.txt").read_text(encoding="utf-8"), "keep\n")
+            self.assertFalse((real / "tc-roadmap").exists())
+
     def test_update_skips_clone_when_installed_revision_matches(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             target = Path(raw) / "skills" / "tc-roadmap"
@@ -62,12 +82,13 @@ class InstallTests(unittest.TestCase):
             (target / ".source-revision").write_text("a" * 40 + "\n", encoding="utf-8")
             with mock.patch.object(update_skill, "_remote_revision", return_value="a" * 40), mock.patch.object(
                 update_skill, "_run"
-            ) as run:
+            ) as run, mock.patch.object(update_skill, "reconcile_hooks") as reconcile:
                 updated, revision = update_skill.update(update_skill.DEFAULT_REPOSITORY, target)
 
             self.assertFalse(updated)
             self.assertEqual(revision, "a" * 40)
             run.assert_not_called()
+            reconcile.assert_called_once_with(target)
 
     def test_update_clones_and_installs_when_revision_differs(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
@@ -82,7 +103,9 @@ class InstallTests(unittest.TestCase):
 
             with mock.patch.object(update_skill, "_remote_revision", return_value="b" * 40), mock.patch.object(
                 update_skill, "_run", side_effect=run
-            ) as execute, mock.patch.object(update_skill, "install_from_source") as install:
+            ) as execute, mock.patch.object(update_skill, "install_from_source") as install, mock.patch.object(
+                update_skill, "reconcile_hooks"
+            ) as reconcile:
                 updated, revision = update_skill.update(update_skill.DEFAULT_REPOSITORY, target)
 
             self.assertTrue(updated)
@@ -90,6 +113,31 @@ class InstallTests(unittest.TestCase):
             self.assertTrue(any(call.args[0][:2] == ["git", "clone"] for call in execute.call_args_list))
             install.assert_called_once()
             self.assertEqual(install.call_args.kwargs["revision"], "b" * 40)
+            reconcile.assert_called_once_with(target)
+
+    def test_hook_reconciliation_failure_warns_without_failing_skill_update(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            target = Path(raw) / "skills" / "tc-roadmap"
+            target.mkdir(parents=True)
+            (target / ".source-revision").write_text("a" * 40 + "\n", encoding="utf-8")
+
+            def run(command: list[str], *, cwd: Path | None = None) -> str:
+                if command[:2] == ["git", "rev-parse"]:
+                    return "b" * 40
+                return ""
+
+            stderr = io.StringIO()
+            with mock.patch.object(update_skill, "_remote_revision", return_value="b" * 40), mock.patch.object(
+                update_skill, "_run", side_effect=run
+            ), mock.patch.object(update_skill, "install_from_source"), mock.patch.object(
+                update_skill, "reconcile_hooks", side_effect=RuntimeError("not safe to display")
+            ), contextlib.redirect_stderr(stderr):
+                updated, revision = update_skill.update(update_skill.DEFAULT_REPOSITORY, target)
+
+            self.assertTrue(updated)
+            self.assertEqual(revision, "b" * 40)
+            self.assertIn("warning", stderr.getvalue())
+            self.assertNotIn("not safe to display", stderr.getvalue())
 
     def test_invalid_marker_requires_fetch(self) -> None:
         with tempfile.TemporaryDirectory() as raw:

@@ -19,10 +19,19 @@ const AgentWorkStaleAfter = 15 * time.Minute
 
 var agentWorkOperationIDPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_.:/-]*$`)
 
+func validateAgentWorkOperationID(operationID string) (string, error) {
+	operationID = strings.TrimSpace(operationID)
+	if operationID == "" || utf8.RuneCountInString(operationID) > 128 || !agentWorkOperationIDPattern.MatchString(operationID) {
+		return "", invalid("operation_id must be between 1 and 128 safe identifier characters", nil)
+	}
+	return operationID, nil
+}
+
 func validateAgentWorkInput(input AgentWorkInput) (AgentWorkInput, error) {
-	input.OperationID = strings.TrimSpace(input.OperationID)
-	if input.OperationID == "" || utf8.RuneCountInString(input.OperationID) > 128 || !agentWorkOperationIDPattern.MatchString(input.OperationID) {
-		return AgentWorkInput{}, invalid("operation_id must be between 1 and 128 safe identifier characters", nil)
+	var err error
+	input.OperationID, err = validateAgentWorkOperationID(input.OperationID)
+	if err != nil {
+		return AgentWorkInput{}, err
 	}
 
 	input.State = strings.TrimSpace(input.State)
@@ -139,6 +148,72 @@ func (s *Store) agentWorkAt(ctx context.Context, taskID string, at time.Time) (*
 		return nil, err
 	}
 	return &work, nil
+}
+
+// HeartbeatAgentWork refreshes only the liveness timestamp of an existing
+// agent-work snapshot. The guarded UPDATE is the authorization boundary: the
+// task must still be unfinished, the caller must own an unexpired claim, and
+// the snapshot must belong to both the caller and operation ID. Keeping all
+// predicates in the UPDATE makes expiry safe when this transaction waits for
+// SQLite's single writer lock; a failed heartbeat performs no write.
+func (s *Store) HeartbeatAgentWork(ctx context.Context, taskID, operationID, actorID string) (Task, error) {
+	validatedOperationID, err := validateAgentWorkOperationID(operationID)
+	if err != nil {
+		return Task{}, err
+	}
+
+	err = s.withTx(ctx, func(tx *sql.Tx) error {
+		// SQLite evaluates every 'now' expression in this statement from the
+		// same clock reading. Both the timestamp assignment and lease predicate
+		// therefore happen after this UPDATE acquires SQLite's write lock; time
+		// spent waiting behind another writer cannot permit a heartbeat after the
+		// claim has expired or write an old application-side timestamp.
+		result, err := tx.ExecContext(ctx, `UPDATE task_agent_work SET updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE task_id=? AND operation_id=? AND actor_id=? AND EXISTS (SELECT 1 FROM tasks t WHERE t.id=task_agent_work.task_id AND t.deleted_at IS NULL AND t.completed_at IS NULL AND t.claimed_by=? AND t.claim_expires_at IS NOT NULL AND julianday(t.claim_expires_at) > julianday('now'))`, taskID, validatedOperationID, actorID, actorID)
+		if err != nil {
+			return err
+		}
+		changed, err := result.RowsAffected()
+		if err != nil {
+			return err
+		}
+		if changed != 0 {
+			return nil
+		}
+
+		// Classify the failed guard without issuing any write. These checks are
+		// intentionally ordered like task progress: a missing/deleted task is
+		// not-found, a completed task is a conflict, and all claim/snapshot
+		// authorization failures are forbidden without disclosing snapshot
+		// details.
+		var completed sql.NullString
+		err = tx.QueryRowContext(ctx, `SELECT completed_at FROM tasks WHERE id=? AND deleted_at IS NULL`, taskID).Scan(&completed)
+		if errors.Is(err, sql.ErrNoRows) {
+			return notFound("task not found")
+		}
+		if err != nil {
+			return err
+		}
+		if completed.Valid {
+			return conflict("task is already finished", nil)
+		}
+
+		var snapshotOperationID, snapshotActorID string
+		err = tx.QueryRowContext(ctx, `SELECT operation_id, actor_id FROM task_agent_work WHERE task_id=?`, taskID).Scan(&snapshotOperationID, &snapshotActorID)
+		if errors.Is(err, sql.ErrNoRows) {
+			return forbidden("a matching agent work snapshot is required")
+		}
+		if err != nil {
+			return err
+		}
+		if snapshotOperationID != validatedOperationID || snapshotActorID != actorID {
+			return forbidden("a matching agent work snapshot is required")
+		}
+		return forbidden("an active claim owned by this actor is required")
+	})
+	if err != nil {
+		return Task{}, err
+	}
+	return s.GetTask(ctx, taskID)
 }
 
 // PublishAgentWork atomically advances a task version and replaces its live

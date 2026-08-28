@@ -43,6 +43,14 @@
   import AgentPulse, { type AgentWorkLike } from './lib/components/AgentPulse.svelte';
   import AgentWorkPanel from './lib/components/AgentWorkPanel.svelte';
   import LiveWorkRow from './lib/components/LiveWorkRow.svelte';
+  import {
+    mergeAuthoritativeTask,
+    mergeAuthoritativeTaskList,
+    taskMutationsAfter,
+    type TaskMutationKind,
+    type TaskMutationRecord,
+    type TaskMutationScope
+  } from './lib/liveness';
 
   type View = 'board' | 'issues' | 'my-work' | 'roadmap' | 'settings';
   type AuthView = 'login' | 'setup';
@@ -90,6 +98,7 @@
   const labelPalette = ['#6d5efc', '#2ea879', '#d49534', '#dc626f', '#4b9cf5'];
   const scopeOptions = ['projects:read', 'projects:write', 'tasks:read', 'tasks:write', 'tasks:claim', 'events:read'];
   const staleAfterMs = 15 * 60 * 1000;
+  const livenessRefreshIntervalMs = 60 * 1000;
 
   let booting = true;
   let authStatus: AuthStatus | null = null;
@@ -150,6 +159,14 @@
   let taskModalColumnsRequest = 0;
   let taskDetailRequest = 0;
   let myWorkRequest = 0;
+  let sessionGeneration = 0;
+  let taskMutationRevision = 0;
+  const taskMutations: Record<TaskMutationScope, Map<string, TaskMutationRecord>> = {
+    board: new Map(),
+    issues: new Map(),
+    'my-work-live': new Map(),
+    'my-work-assigned': new Map()
+  };
   let dialogReturnFocus: { element: HTMLElement | null; fallbackSelector: string } | null = null;
 
   let drawerTask: Task | null = null;
@@ -252,7 +269,14 @@
   let eventsCursor: number | undefined;
   let pollTimer: number | undefined;
   let pulseTimer: number | undefined;
+  let livenessRefreshTimer: number | undefined;
   let pollInFlight: Promise<void> | null = null;
+  let boardLivenessRequest = 0;
+  let myWorkLivenessRequest = 0;
+  let drawerLivenessRequest = 0;
+  let boardLivenessInFlight: Promise<boolean> | null = null;
+  let myWorkLivenessInFlight: Promise<boolean> | null = null;
+  let drawerLivenessInFlight: { taskId: string; requestId: number; promise: Promise<boolean> } | null = null;
   let pulseClock = Date.now();
   let liveAnnouncement = '';
   let announcementTimer: number | undefined;
@@ -462,6 +486,35 @@
     return localColumns.find((column) => column.id === task.column_id)?.semantic_state || '';
   }
 
+  function myWorkMutationScope(workView = myWorkView): TaskMutationScope {
+    return workView === 'live' ? 'my-work-live' : 'my-work-assigned';
+  }
+
+  function recordTaskMutation(
+    taskId: string,
+    kind: TaskMutationKind,
+    scopes: TaskMutationScope[]
+  ) {
+    const revision = ++taskMutationRevision;
+    scopes.forEach((scope) => {
+      taskMutations[scope].set(taskId, { revision, kind });
+    });
+  }
+
+  function recordScopedTaskMutation(
+    taskId: string,
+    mutations: Partial<Record<TaskMutationScope, TaskMutationKind>>
+  ) {
+    const revision = ++taskMutationRevision;
+    Object.entries(mutations).forEach(([scope, kind]) => {
+      if (kind) taskMutations[scope as TaskMutationScope].set(taskId, { revision, kind });
+    });
+  }
+
+  function mutationsForRequest(scope: TaskMutationScope, requestRevision: number): Map<string, TaskMutationKind> {
+    return taskMutationsAfter(taskMutations[scope], requestRevision);
+  }
+
   function isMissingPulseCandidate(task: Task, localColumns = columns): boolean {
     return !agentWorkFor(task) && Boolean(
       task.claimed_by || ['active', 'blocked'].includes(semanticStateForTask(task, localColumns))
@@ -544,6 +597,7 @@
     const cleanup = () => {
       if (pollTimer) window.clearInterval(pollTimer);
       if (pulseTimer) window.clearInterval(pulseTimer);
+      if (livenessRefreshTimer) window.clearInterval(livenessRefreshTimer);
       if (announcementTimer) window.clearTimeout(announcementTimer);
     };
     void bootstrap();
@@ -628,7 +682,13 @@
   }
 
   async function finishAuthentication() {
+    // Every successful authentication starts a fresh client session. Any
+    // request left behind by a previous session must fail its generation
+    // check even when the browser logs back in as the same actor.
+    sessionGeneration += 1;
+    const requestedSession = sessionGeneration;
     await loadProjects();
+    if (sessionGeneration !== requestedSession || !user) return;
     startPolling();
   }
 
@@ -660,11 +720,10 @@
   }
 
   async function logout() {
-    try {
-      await api.authLogout();
-    } catch {
-      // Clearing the local session is still the least surprising UI result.
-    }
+    // Invalidate reads before awaiting the network logout. Otherwise a poll
+    // or list request can still resolve while the logout request is pending,
+    // and its response could repopulate the session being cleared below.
+    sessionGeneration += 1;
     user = null;
     projectListRequest += 1;
     boardRequest += 1;
@@ -677,26 +736,46 @@
     projects = [];
     columns = [];
     tasks = [];
+    labels = [];
     issueTasks = [];
     issueColumns = [];
+    myWorkTasks = [];
+    myWorkColumnsByProject = {};
+    roadmap = null;
     events = [];
     eventsCursor = undefined;
     if (pollTimer) window.clearInterval(pollTimer);
     if (pulseTimer) window.clearInterval(pulseTimer);
+    if (livenessRefreshTimer) window.clearInterval(livenessRefreshTimer);
     pollTimer = undefined;
     pulseTimer = undefined;
+    livenessRefreshTimer = undefined;
     pollInFlight = null;
+    boardLivenessRequest += 1;
+    myWorkLivenessRequest += 1;
+    drawerLivenessRequest += 1;
+    boardLivenessInFlight = null;
+    myWorkLivenessInFlight = null;
+    drawerLivenessInFlight = null;
+    taskMutationRevision = 0;
+    Object.values(taskMutations).forEach((records) => records.clear());
     workTransitionSnapshot = new Map();
+    try {
+      await api.authLogout();
+    } catch {
+      // Clearing the local session is still the least surprising UI result.
+    }
   }
 
   async function loadProjects() {
     const requestId = ++projectListRequest;
     const selectionVersion = projectSwitchVersion;
+    const requestedSession = sessionGeneration;
     projectsLoading = true;
     projectsError = '';
     try {
       const result = await api.listAllProjects();
-      if (requestId !== projectListRequest) return;
+      if (requestId !== projectListRequest || sessionGeneration !== requestedSession || !user) return;
       const nextProjects = result.data.filter((project) => !project.archived_at);
       projects = nextProjects;
       if (selectionVersion !== projectSwitchVersion) return;
@@ -713,7 +792,12 @@
         labels = [];
         if (!routeSlug) view = 'board';
       }
-      if (requestId !== projectListRequest || selectionVersion !== projectSwitchVersion) return;
+      if (
+        requestId !== projectListRequest
+        || selectionVersion !== projectSwitchVersion
+        || sessionGeneration !== requestedSession
+        || !user
+      ) return;
       const path = window.location.pathname;
       if (/^\/my-work\/?$/.test(path)) {
         roadmapProjectId = undefined;
@@ -738,14 +822,19 @@
         await loadRoadmap(roadmapProjectId);
       }
     } catch (error) {
-      if (requestId === projectListRequest) projectsError = friendlyError(error, 'Projects could not be loaded.');
+      if (requestId === projectListRequest && sessionGeneration === requestedSession && user) {
+        projectsError = friendlyError(error, 'Projects could not be loaded.');
+      }
     } finally {
-      if (requestId === projectListRequest) projectsLoading = false;
+      if (requestId === projectListRequest && sessionGeneration === requestedSession) projectsLoading = false;
     }
   }
 
   async function loadBoard(): Promise<boolean> {
     const requestId = ++boardRequest;
+    boardLivenessRequest += 1;
+    const requestedSession = sessionGeneration;
+    const mutationSnapshot = taskMutationRevision;
     const requestedSlug = activeProjectSlug;
     if (!requestedSlug) {
       boardLoading = false;
@@ -764,25 +853,41 @@
         listAllTasks(project.id, { limit: 200 }),
         api.listAllLabels(project.id)
       ]);
-      if (requestId !== boardRequest || activeProjectSlug !== requestedSlug) return false;
+      if (
+        requestId !== boardRequest
+        || activeProjectSlug !== requestedSlug
+        || sessionGeneration !== requestedSession
+        || !user
+      ) return false;
       columns = columnResult.data;
-      tasks = taskResult.data;
+      tasks = mergeAuthoritativeTaskList(
+        tasks,
+        taskResult.data,
+        mutationsForRequest('board', mutationSnapshot)
+      );
       labels = labelResult.data;
-      observeWorkTransitions(taskResult.data);
+      observeWorkTransitions(tasks);
       return true;
     } catch (error) {
-      if (requestId === boardRequest && activeProjectSlug === requestedSlug) {
+      if (
+        requestId === boardRequest
+        && activeProjectSlug === requestedSlug
+        && sessionGeneration === requestedSession
+        && user
+      ) {
         boardError = friendlyError(error, 'This board could not be loaded.');
       }
       return false;
     } finally {
-      if (requestId === boardRequest) boardLoading = false;
+      if (requestId === boardRequest && sessionGeneration === requestedSession) boardLoading = false;
     }
   }
 
   /** Load bug-capable tasks from every accessible project for the Issues view. */
   async function loadIssues(): Promise<boolean> {
     const requestId = ++issueRequest;
+    const requestedSession = sessionGeneration;
+    const mutationSnapshot = taskMutationRevision;
     issuesLoading = true;
     issuesError = '';
     try {
@@ -790,44 +895,68 @@
         listAllIssues({ limit: 200 }),
         Promise.all(projects.map(async (project) => api.listAllColumns(project.id)))
       ]);
-      if (requestId !== issueRequest || view !== 'issues') return false;
-      issueTasks = taskResult.data;
+      if (
+        requestId !== issueRequest
+        || view !== 'issues'
+        || sessionGeneration !== requestedSession
+        || !user
+      ) return false;
+      issueTasks = mergeAuthoritativeTaskList(
+        issueTasks,
+        taskResult.data,
+        mutationsForRequest('issues', mutationSnapshot)
+      );
       issueColumns = columnResults.flatMap((result) => result.data);
       return true;
     } catch (error) {
-      if (requestId === issueRequest && view === 'issues') {
+      if (requestId === issueRequest && view === 'issues' && sessionGeneration === requestedSession && user) {
         issuesError = friendlyError(error, 'Issues could not be loaded.');
       }
       return false;
     } finally {
-      if (requestId === issueRequest) issuesLoading = false;
+      if (requestId === issueRequest && sessionGeneration === requestedSession) issuesLoading = false;
     }
   }
 
   async function loadMyWork(): Promise<boolean> {
     const requestId = ++myWorkRequest;
+    myWorkLivenessRequest += 1;
+    const requestedSession = sessionGeneration;
+    const mutationSnapshot = taskMutationRevision;
+    const requestedView = myWorkView;
     myWorkLoading = true;
     myWorkColumnsLoading = true;
     myWorkError = '';
     const projectSnapshot = [...projects];
     try {
       const [workResult, columnResults] = await Promise.all([
-        api.allMyWork({ view: myWorkView }),
+        api.allMyWork({ view: requestedView }),
         Promise.all(projectSnapshot.map(async (project) => ({
           projectId: project.id,
           columns: (await api.listAllColumns(project.id)).data
         })))
       ]);
-      if (requestId !== myWorkRequest) return false;
-      myWorkTasks = workResult.data;
+      if (
+        requestId !== myWorkRequest
+        || myWorkView !== requestedView
+        || sessionGeneration !== requestedSession
+        || !user
+      ) return false;
+      myWorkTasks = mergeAuthoritativeTaskList(
+        myWorkTasks,
+        workResult.data,
+        mutationsForRequest(myWorkMutationScope(requestedView), mutationSnapshot)
+      );
       myWorkColumnsByProject = Object.fromEntries(columnResults.map((result) => [result.projectId, result.columns]));
-      observeWorkTransitions(workResult.data);
+      observeWorkTransitions(myWorkTasks);
       return true;
     } catch (error) {
-      if (requestId === myWorkRequest) myWorkError = friendlyError(error, 'Live work could not be loaded.');
+      if (requestId === myWorkRequest && sessionGeneration === requestedSession && user) {
+        myWorkError = friendlyError(error, 'Live work could not be loaded.');
+      }
       return false;
     } finally {
-      if (requestId === myWorkRequest) {
+      if (requestId === myWorkRequest && sessionGeneration === requestedSession) {
         myWorkLoading = false;
         myWorkColumnsLoading = false;
       }
@@ -913,21 +1042,135 @@
   function startPolling() {
     if (pollTimer) window.clearInterval(pollTimer);
     if (pulseTimer) window.clearInterval(pulseTimer);
+    if (livenessRefreshTimer) window.clearInterval(livenessRefreshTimer);
     pollTimer = window.setInterval(() => void pollEvents(), 15000);
     pulseTimer = window.setInterval(() => {
       pulseClock = Date.now();
       observeWorkTransitions([...tasks, ...myWorkTasks]);
     }, 30000);
+    livenessRefreshTimer = window.setInterval(() => void refreshLiveness(), livenessRefreshIntervalMs);
     pulseClock = Date.now();
     void pollEvents();
   }
 
+  async function refreshLiveness(): Promise<void> {
+    if (!user) return;
+    const refreshes: Promise<boolean>[] = [];
+    if (view === 'board') refreshes.push(refreshBoardTasks());
+    if (view === 'my-work') refreshes.push(refreshMyWorkTasks());
+    if (drawerTask) refreshes.push(refreshDrawerTask(drawerTask.id));
+    await Promise.all(refreshes).catch(() => undefined);
+  }
+
+  async function refreshBoardTasks(): Promise<boolean> {
+    if (!user || view !== 'board' || !activeProject || boardLoading) return true;
+    if (boardLivenessInFlight) return boardLivenessInFlight;
+
+    const requestId = ++boardLivenessRequest;
+    const requestedSession = sessionGeneration;
+    const mutationSnapshot = taskMutationRevision;
+    const requestedSlug = activeProjectSlug;
+    const requestedProjectId = activeProject.id;
+    const normalRequestId = boardRequest;
+    const refresh = (async () => {
+      try {
+        const result = await listAllTasks(requestedProjectId, { limit: 200 });
+        if (
+          !user
+          || sessionGeneration !== requestedSession
+          || view !== 'board'
+          || activeProjectSlug !== requestedSlug
+          || boardRequest !== normalRequestId
+          || boardLivenessRequest !== requestId
+        ) return false;
+        tasks = mergeAuthoritativeTaskList(
+          tasks,
+          result.data,
+          mutationsForRequest('board', mutationSnapshot)
+        );
+        const updatedDrawer = drawerTask?.id === undefined
+          ? undefined
+          : result.data.find((task) => task.id === drawerTask?.id);
+        if (updatedDrawer && drawerTask?.id === updatedDrawer.id) {
+          drawerTask = mergeAuthoritativeTask(drawerTask, updatedDrawer);
+        }
+        observeWorkTransitions(tasks);
+        return true;
+      } catch {
+        // Liveness refreshes are best effort and must not surface a transient
+        // failure as a board error or loading state.
+        return false;
+      }
+    })();
+    boardLivenessInFlight = refresh;
+    try {
+      return await refresh;
+    } finally {
+      if (boardLivenessInFlight === refresh) boardLivenessInFlight = null;
+    }
+  }
+
+  async function refreshMyWorkTasks(): Promise<boolean> {
+    if (!user || view !== 'my-work' || myWorkLoading || myWorkColumnsLoading) return true;
+    if (myWorkLivenessInFlight) return myWorkLivenessInFlight;
+
+    const requestId = ++myWorkLivenessRequest;
+    const requestedSession = sessionGeneration;
+    const mutationSnapshot = taskMutationRevision;
+    const requestedView = myWorkView;
+    const normalRequestId = myWorkRequest;
+    const refresh = (async () => {
+      try {
+        const result = await api.allMyWork({ view: requestedView });
+        if (
+          !user
+          || sessionGeneration !== requestedSession
+          || view !== 'my-work'
+          || myWorkView !== requestedView
+          || myWorkRequest !== normalRequestId
+          || myWorkLivenessRequest !== requestId
+        ) return false;
+        myWorkTasks = mergeAuthoritativeTaskList(
+          myWorkTasks,
+          result.data,
+          mutationsForRequest(myWorkMutationScope(requestedView), mutationSnapshot)
+        );
+        const updatedDrawer = drawerTask?.id === undefined
+          ? undefined
+          : result.data.find((task) => task.id === drawerTask?.id);
+        if (updatedDrawer && drawerTask?.id === updatedDrawer.id) {
+          drawerTask = mergeAuthoritativeTask(drawerTask, updatedDrawer);
+        }
+        observeWorkTransitions(myWorkTasks);
+        return true;
+      } catch {
+        // Liveness refreshes are best effort and must not surface a transient
+        // failure as a My Work error or loading state.
+        return false;
+      }
+    })();
+    myWorkLivenessInFlight = refresh;
+    try {
+      return await refresh;
+    } finally {
+      if (myWorkLivenessInFlight === refresh) myWorkLivenessInFlight = null;
+    }
+  }
+
   async function pollEvents() {
     if (!user || pollInFlight) return pollInFlight || undefined;
-    pollInFlight = (async () => {
+    const requestedSession = sessionGeneration;
+    const requestedCursor = eventsCursor;
+    let poll: Promise<void>;
+    poll = (async () => {
       try {
-        const result = await api.listEvents({ after: eventsCursor });
-        if (!result.data.length) return;
+        const result = await api.listEvents({ after: requestedCursor });
+        const isCurrentPoll = () => Boolean(
+          user
+          && sessionGeneration === requestedSession
+          && pollInFlight === poll
+        );
+        if (!isCurrentPoll() || !result.data.length) return;
         const mergedEvents = new Map<string, ActivityEvent>();
         [...events, ...result.data].forEach((event) => mergedEvents.set(event.id || String(event.cursor), event));
         events = [...mergedEvents.values()].sort((a, b) => b.cursor - a.cursor).slice(0, 100);
@@ -939,23 +1182,30 @@
         let reloadSucceeded = true;
 
         if (boardChanged && currentView === 'board') reloadSucceeded = (await loadBoard()) && reloadSucceeded;
+        if (!isCurrentPoll()) return;
         if (boardChanged && currentView === 'issues') reloadSucceeded = (await loadIssues()) && reloadSucceeded;
+        if (!isCurrentPoll()) return;
         if (currentView === 'my-work') reloadSucceeded = (await loadMyWork()) && reloadSucceeded;
+        if (!isCurrentPoll()) return;
         if (currentView === 'roadmap') reloadSucceeded = (await loadRoadmap()) && reloadSucceeded;
+        if (!isCurrentPoll()) return;
 
         if (drawerTask && affectedTaskIds.has(drawerTask.id)) {
           reloadSucceeded = (await refreshDrawerTask(drawerTask.id)) && reloadSucceeded;
         }
         // Leave the cursor where it was when any dependent read failed. The
         // next poll will replay the event and retry the authoritative refresh.
-        if (reloadSucceeded) eventsCursor = nextEventsCursor;
+        if (reloadSucceeded && isCurrentPoll()) eventsCursor = nextEventsCursor;
       } catch {
         // Polling is best effort; the visible board remains usable during a blip.
       }
     })().finally(() => {
-      pollInFlight = null;
+      // A logout/re-login may have installed a different poll while this
+      // response was settling. Only the owner may clear the in-flight slot.
+      if (pollInFlight === poll) pollInFlight = null;
     });
-    return pollInFlight;
+    pollInFlight = poll;
+    return poll;
   }
 
   function getProjectSlugFromLocation(): string {
@@ -1262,6 +1512,7 @@
         due_at: dateToIso(taskModalDueDate),
         assignee: taskModalAssignee.trim() || null
       });
+      recordTaskMutation(created.id, 'upsert', ['board']);
       if (taskModalProjectId === activeProject?.id) tasks = [...tasks, created];
       closeTaskModal();
       toast('success', `${created.key} created in ${taskModalProject?.name || 'your project'}.`);
@@ -1339,6 +1590,9 @@
           ...(bugModalSeverity ? { severity: bugModalSeverity } : {})
         }
       });
+      const createdScopes: TaskMutationScope[] = ['issues'];
+      if (bugModalProjectId === activeProject?.id) createdScopes.push('board');
+      recordTaskMutation(created.id, 'upsert', createdScopes);
       issueTasks = [...issueTasks.filter((task) => task.id !== created.id), created];
       if (bugModalProjectId === activeProject?.id) tasks = [...tasks, created];
       closeBugModal();
@@ -1460,7 +1714,7 @@
     taskActionLoading = task.id;
     try {
       const updated = await api.patchTask(task.id, { column_id: destinationColumnId, position: nextPosition(tasks, destinationColumnId) }, task.version);
-      replaceTask(updated);
+      replaceTask(updated, true);
       toast('success', `${task.key} moved to ${columns.find((column) => column.id === destinationColumnId)?.name || 'another column'}.`);
     } catch (error) {
       toast('error', friendlyError(error, 'The task could not be moved. Refresh and try again.'));
@@ -1477,33 +1731,52 @@
     if (destination) void moveTask(task, destination.id);
   }
 
-  function replaceTask(updated: Task) {
-    const previous = drawerTask?.id === updated.id
-      ? drawerTask
-      : tasks.find((task) => task.id === updated.id);
-    tasks = tasks.some((task) => task.id === updated.id) ? tasks.map((task) => (task.id === updated.id ? updated : task)) : [updated, ...tasks];
+  function replaceTask(updated: Task, localMutation = false) {
+    const issueHasTask = issueTasks.some((task) => task.id === updated.id);
+    const existing = [
+      drawerTask?.id === updated.id ? drawerTask : undefined,
+      tasks.find((task) => task.id === updated.id),
+      issueTasks.find((task) => task.id === updated.id),
+      myWorkTasks.find((task) => task.id === updated.id)
+    ].filter((task): task is Task => Boolean(task));
+    const previous = existing.reduce<Task | undefined>(
+      (current, task) => !current || task.version > current.version ? task : current,
+      undefined
+    );
+    const nextTask = mergeAuthoritativeTask(previous, updated);
+    tasks = tasks.some((task) => task.id === updated.id)
+      ? tasks.map((task) => (task.id === updated.id ? mergeAuthoritativeTask(task, nextTask) : task))
+      : [nextTask, ...tasks];
     if (issueTasks.some((task) => task.id === updated.id)) {
-      issueTasks = issueTasks.map((task) => (task.id === updated.id ? updated : task));
+      issueTasks = issueTasks.map((task) => (task.id === updated.id ? mergeAuthoritativeTask(task, nextTask) : task));
     }
     if (drawerTask?.id === updated.id) {
-      drawerTask = updated;
+      drawerTask = mergeAuthoritativeTask(drawerTask, nextTask);
     }
     const myWorkIndex = myWorkTasks.findIndex((task) => task.id === updated.id);
-    const belongsToUser = actorId(updated.assignee) === user?.id
-      || (actorId(updated.claimed_by) === user?.id && claimIsActive(updated, pulseClock));
+    const belongsToUser = actorId(nextTask.assignee) === user?.id
+      || (actorId(nextTask.claimed_by) === user?.id && claimIsActive(nextTask, pulseClock));
     const keepInMyWork = myWorkView === 'live'
-      ? !updated.completed_at && Boolean(updated.agent_work)
+      ? !nextTask.completed_at && Boolean(nextTask.agent_work)
       : belongsToUser;
+    if (localMutation) {
+      const mutations: Partial<Record<TaskMutationScope, TaskMutationKind>> = { board: 'upsert' };
+      if (issueHasTask) mutations.issues = 'upsert';
+      if (myWorkIndex >= 0 || keepInMyWork) {
+        mutations[myWorkMutationScope()] = myWorkIndex >= 0 && !keepInMyWork ? 'remove' : 'upsert';
+      }
+      recordScopedTaskMutation(updated.id, mutations);
+    }
     if (myWorkIndex >= 0) {
       myWorkTasks = keepInMyWork
-        ? myWorkTasks.map((task) => (task.id === updated.id ? updated : task))
+        ? myWorkTasks.map((task) => (task.id === updated.id ? mergeAuthoritativeTask(task, nextTask) : task))
         : myWorkTasks.filter((task) => task.id !== updated.id);
     } else if (keepInMyWork) {
-      myWorkTasks = [...myWorkTasks, updated];
+      myWorkTasks = [...myWorkTasks, nextTask];
     }
-    if (previous && workTransitionKey(previous) && workTransitionKey(previous) !== workTransitionKey(updated)) {
-      const status = isWorkStale(updated) && workState(updated) !== 'waiting' ? 'stale' : workState(updated) || 'updated';
-      announce(`${updated.key} is now ${status}${isActionNeeded(updated) ? ' · action needed' : ''}.`);
+    if (previous && workTransitionKey(previous) && workTransitionKey(previous) !== workTransitionKey(nextTask)) {
+      const status = isWorkStale(nextTask) && workState(nextTask) !== 'waiting' ? 'stale' : workState(nextTask) || 'updated';
+      announce(`${nextTask.key} is now ${status}${isActionNeeded(nextTask) ? ' · action needed' : ''}.`);
     }
   }
 
@@ -1518,6 +1791,7 @@
         position: nextPosition(tasks, columnId),
         priority: 'normal'
       });
+      recordTaskMutation(created.id, 'upsert', ['board']);
       tasks = [...tasks, created];
       quickAddTitle = { ...quickAddTitle, [columnId]: '' };
       quickAddColumn = '';
@@ -1557,16 +1831,34 @@
 
   async function refreshDrawerTask(taskId: string): Promise<boolean> {
     if (!drawerTask || drawerTask.id !== taskId) return true;
+    if (drawerLivenessInFlight?.taskId === taskId && drawerLivenessInFlight.requestId === drawerLivenessRequest) {
+      return drawerLivenessInFlight.promise;
+    }
+    const requestId = ++drawerLivenessRequest;
+    const requestedSession = sessionGeneration;
+    const refresh = (async () => {
+      try {
+        const updated = await api.getTask(taskId);
+        if (
+          drawerLivenessRequest !== requestId
+          || drawerTask?.id !== taskId
+          || sessionGeneration !== requestedSession
+          || !user
+        ) return false;
+        // Authoritative event refreshes update the task model only. Draft fields
+        // remain untouched so a background pulse cannot erase in-progress edits.
+        replaceTask(updated);
+        return true;
+      } catch {
+        // The next event or the drawer's explicit refresh can retry this read.
+        return false;
+      }
+    })();
+    drawerLivenessInFlight = { taskId, requestId, promise: refresh };
     try {
-      const updated = await api.getTask(taskId);
-      if (drawerTask?.id !== taskId) return true;
-      // Authoritative event refreshes update the task model only. Draft fields
-      // remain untouched so a background pulse cannot erase in-progress edits.
-      replaceTask(updated);
-      return true;
-    } catch {
-      // The next event or the drawer's explicit refresh can retry this read.
-      return false;
+      return await refresh;
+    } finally {
+      if (drawerLivenessInFlight?.promise === refresh) drawerLivenessInFlight = null;
     }
   }
 
@@ -1656,6 +1948,7 @@
 
   function closeDrawer() {
     taskDetailRequest += 1;
+    drawerLivenessRequest += 1;
     drawerTask = null;
     drawerError = '';
     comments = [];
@@ -1728,7 +2021,7 @@
         },
         drawerTask.version
       );
-      replaceTask(updated);
+      replaceTask(updated, true);
       syncDraft(updated);
       toast('success', `${updated.key} saved.`);
     } catch (error) {
@@ -1750,7 +2043,9 @@
     drawerError = '';
     try {
       await api.deleteTask(task.id, task.version);
+      recordTaskMutation(task.id, 'remove', ['board', 'issues', 'my-work-live', 'my-work-assigned']);
       tasks = tasks.filter((item) => item.id !== task.id);
+      issueTasks = issueTasks.filter((item) => item.id !== task.id);
       myWorkTasks = myWorkTasks.filter((item) => item.id !== task.id);
       closeDrawer();
       toast('success', `${task.key} deleted.`);
@@ -1785,7 +2080,7 @@
       else if (action === 'release') updated = await api.releaseTask(drawerTask.id, drawerTask.version);
       else if (action === 'complete') updated = await api.completeTask(drawerTask.id, drawerTask.version);
       else updated = await api.blockTask(drawerTask.id, drawerTask.version, reason.trim());
-      replaceTask(updated);
+      replaceTask(updated, true);
       if (action === 'block') {
         blockReasonOpen = false;
         blockReasonDraft = '';
@@ -1821,7 +2116,7 @@
         priority: draftPriority,
         assignee: draftAssignee.trim() || null
       });
-      replaceTask(updated);
+      replaceTask(updated, true);
       syncDraft(updated);
       toast('success', `${updated.key} triaged as ${triageSeverityDraft.toUpperCase()}.`);
     } catch (error) {
@@ -1846,7 +2141,7 @@
         duplicate_of: duplicateOfDraft.trim() || null,
         note: resolutionNoteDraft.trim() || undefined
       });
-      replaceTask(updated);
+      replaceTask(updated, true);
       syncDraft(updated);
       toast('success', `${updated.key} resolved.`);
     } catch (error) {
@@ -1867,7 +2162,7 @@
     drawerError = '';
     try {
       const updated = await api.reopenTask(drawerTask.id, drawerTask.version, { reason: reopenReasonDraft.trim() });
-      replaceTask(updated);
+      replaceTask(updated, true);
       syncDraft(updated);
       toast('success', `${updated.key} reopened.`);
     } catch (error) {

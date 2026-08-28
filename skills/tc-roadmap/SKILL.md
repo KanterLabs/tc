@@ -36,7 +36,17 @@ Use TC as the durable project record for substantive work. The chat plan is temp
      --operation-id "stable-session-local-id"
    ```
 
-4. Keep the returned task key. Mention it in normal progress updates when useful.
+   Resume is a claim-and-activate operation: the task must be claimed by this
+   session and placed in the project's Active/In progress column before work
+   continues. Keep the returned task key. Mention it in normal progress
+   updates when useful.
+
+4. On a machine where the lifecycle hook is not already installed, run
+   `python3 scripts/install_hooks.py`. The installer merges only the TC
+   command into `hooks.json`, preserves existing policy and commands, and
+   never edits Codex trust hashes or `config.toml`. If it reports a change,
+   review and trust the new command once in Codex `/hooks`; a later no-op does
+   not require another review.
 
 For planning work that should remain unclaimed in Backlog, create a separate,
 implementation-sized card with acceptance criteria:
@@ -74,18 +84,30 @@ python3 scripts/tc_roadmap.py progress \
   --operation-id "stable-session-local-id"
 ```
 
-Do not post narration, secrets, raw logs, customer data, tokens, local credential paths, or prompt contents. Update the Roadmap before a long external wait and after a material phase completes.
+Do not post narration, secrets, raw logs, customer data, tokens, local credential paths, or prompt contents. Progress belongs at meaningful checkpoints and before a long external wait, after compaction recovery, and after a material phase completes. Do not turn routine polling or hook heartbeats into comments.
 
-Use the structured options when they are known so the in-progress experience
-can show a concise agent pulse without forcing Shane to read the full activity
-log. Structured progress is sent as a claimed, version-checked task update;
-when `--state` is omitted, it defaults to `working`. States are `working`,
-`waiting`, `verifying`, and `handoff`. Counts must be measurable checkpoints,
-not an invented percentage or ETA, and `--checkpoint-ref` can be repeated for
-relevant files, tests, or other safe evidence references. Keep the message to
-the result or decision and `--next` to the next concrete action. Use plain
-`--message` for backward compatibility when structured context is unavailable;
-that form remains a task comment.
+Use the structured options as the canonical progress API so the in-progress
+experience can show a concise agent pulse without forcing Shane to read the
+full activity log. Structured progress is sent as a claimed, version-checked
+task update; when `--state` is omitted, it defaults to `working`. States are
+`working`, `waiting`, `verifying`, and `handoff`. Counts must be measurable
+checkpoints, not an invented percentage or ETA, and `--checkpoint-ref` can be
+repeated for relevant files, tests, or other safe evidence references. Keep
+the message to the result or decision and `--next` to the next concrete
+action. Use plain `--message` only for backward compatibility when structured
+context is unavailable; that form remains a task comment.
+
+The installed lifecycle hook may refresh a claimed task's agent-work liveness
+quietly; it does not renew the claim lease. A heartbeat must not create a
+comment or activity event, and it must not stand in for a meaningful
+structured update. After a session resumes from
+compaction, restore the saved task mapping, inspect the safe metadata, and
+post the next meaningful checkpoint before continuing; call `resume` only when
+the task or claim actually needs reactivation (or when beginning a genuinely
+resumed workstream). Local hook state may contain only safe recovery metadata
+such as the task key, operation ID, checkpoint counters, and timestamps; it
+must never contain tokens, prompts, task content, comments, raw tool output,
+or credential paths.
 
 ## Protect persistent data
 
@@ -123,7 +145,12 @@ python3 scripts/tc_roadmap.py block \
   --operation-id "stable-session-local-id"
 ```
 
-Do not mark a task complete merely because the current chat is ending. Leave a concise progress comment when handing unfinished work to another session.
+Before ending a session, leave exactly one durable outcome: complete the task,
+block it with an actionable reason, or publish a structured `handoff` or
+`waiting` update with the next action. A final prose message or a quiet hook
+heartbeat alone is not a handoff. Do not mark a task complete merely because
+the current chat is ending; leave safe recovery metadata for the next session
+when work remains.
 
 ## Authentication and failures
 

@@ -232,8 +232,14 @@ and claim semantics as any other API client.
 Install it from the public repository with Codex's skill installer using the
 GitHub path `KanterLabs/tc/tree/main/skills/tc-roadmap`. The installed
 `scripts/update_skill.py` command compares its recorded source revision with
-GitHub `main`, and only sparse-clones and atomically installs the skill when the
-revision changed.
+GitHub `main` first, and only sparse-clones and atomically installs the skill
+when the revision changed. A matching revision is a no-op for the skill fetch,
+but still reconciles the local lifecycle hooks. The companion
+[`scripts/install_hooks.py`](skills/tc-roadmap/scripts/install_hooks.py)
+additively installs bounded SessionStart, PostToolUse, PreCompact, and Stop
+commands into `hooks.json`, preserving existing policy and never changing
+Codex trust hashes; review/trust the command once in Codex `/hooks` after a
+configuration change.
 Agent and optional Cloudflare Access credentials stay in environment variables
 or a mode-`0600` local file; see
 [`skills/tc-roadmap/references/authentication.md`](skills/tc-roadmap/references/authentication.md).

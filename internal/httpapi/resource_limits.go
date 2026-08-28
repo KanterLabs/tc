@@ -225,10 +225,10 @@ func (s *Server) admitBearerRequest(w http.ResponseWriter, r *http.Request, iden
 	return true
 }
 
-// admitMutation runs immediately before a new mutation handler execution. It
-// reserves the persistent actor budget only after the short-lived mutation
-// rate check succeeds, so rejected bursts do not burn the lifetime allowance.
-func (s *Server) admitMutation(w http.ResponseWriter, r *http.Request, identity auth.Identity) bool {
+// admitMutationRate applies the short-lived actor-keyed mutation bucket. It is
+// separate from the persistent resource reservation so inherently idempotent
+// heartbeat touches can remain storage-neutral while still being rate-limited.
+func (s *Server) admitMutationRate(w http.ResponseWriter, r *http.Request, identity auth.Identity) bool {
 	if !isMutationMethod(r.Method) || !mutationIdentityIsLimited(identity) {
 		return true
 	}
@@ -244,6 +244,16 @@ func (s *Server) admitMutation(w http.ResponseWriter, r *http.Request, identity 
 		})
 		return false
 	}
+	return true
+}
+
+// admitMutation runs immediately before a new mutation handler execution. It
+// reserves the persistent actor budget only after the short-lived mutation
+// rate check succeeds, so rejected bursts do not burn the lifetime allowance.
+func (s *Server) admitMutation(w http.ResponseWriter, r *http.Request, identity auth.Identity) bool {
+	if !s.admitMutationRate(w, r, identity) {
+		return false
+	}
 	if err := s.Store.ReserveAgentMutation(r.Context(), identity.Actor.ID, len(bodyBytes(r))); err != nil {
 		if errors.Is(err, store.ErrResourceLimit) {
 			s.writeError(w, http.StatusInsufficientStorage, "resource_limit", "agent mutation resource budget exhausted", map[string]any{
@@ -255,4 +265,12 @@ func (s *Server) admitMutation(w http.ResponseWriter, r *http.Request, identity 
 		return false
 	}
 	return true
+}
+
+// admitHeartbeat applies the actor mutation bucket without reserving the
+// persistent lifetime budget. Heartbeats update one existing timestamp and
+// create no durable rows, so charging them against the budget would make a
+// healthy long-running agent exhaust its allowance solely by staying alive.
+func (s *Server) admitHeartbeat(w http.ResponseWriter, r *http.Request, identity auth.Identity) bool {
+	return s.admitMutationRate(w, r, identity)
 }

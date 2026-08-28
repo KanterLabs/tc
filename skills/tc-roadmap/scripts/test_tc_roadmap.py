@@ -4,14 +4,17 @@
 from __future__ import annotations
 
 import argparse
+import io
 import json
 import os
 import tempfile
 import unittest
+from email.message import Message
 from pathlib import Path
 from unittest import mock
 
 import tc_roadmap as helper
+import roadmap_session as session
 
 
 class ConfigTests(unittest.TestCase):
@@ -127,7 +130,7 @@ class CommandTests(unittest.TestCase):
         self.assertEqual(calls[1][2]["if_match"], 7)
         self.assertEqual(
             calls[1][2]["idempotency_key"],
-            helper._idempotency("run-1", "progress", helper._canonical_json(expected)),
+            helper._mutation_idempotency("run-1", "POST", "/tasks/task-1/progress", expected),
         )
 
     def test_plain_progress_uses_legacy_comments_endpoint(self) -> None:
@@ -253,9 +256,157 @@ class CommandTests(unittest.TestCase):
                     return {"data": [{"id": "project-1", "key": "TC"}]}, {}
                 return {"data": [{"id": "column-1", "semantic_state": "active"}]}, {}
 
-        args = mock.Mock(project="TC")
+        args = mock.Mock(project="TC", operation_id="plan-2")
         with self.assertRaisesRegex(helper.RoadmapError, "no backlog column"):
             helper.cmd_backlog(StubClient(), args)  # type: ignore[arg-type]
+
+    def test_resume_claims_then_activates_only_when_needed(self) -> None:
+        calls: list[tuple[str, str, dict[str, object]]] = []
+        current = {"id": "task-1", "key": "TC-1", "project_id": "project-1", "column_id": "ready", "version": 3}
+        claimed = {**current, "claimed_by": "agent-1", "version": 4}
+        moved = {**claimed, "column_id": "active", "version": 5}
+
+        class StubClient:
+            def call(self, method: str, path: str, **kwargs):  # type: ignore[no-untyped-def]
+                calls.append((method, path, kwargs))
+                if method == "GET" and path.startswith("/tasks/"):
+                    return current, {}
+                if path.endswith("/claim"):
+                    return claimed, {}
+                if path.endswith("/columns?limit=200"):
+                    return {"data": [{"id": "active", "semantic_state": "active"}]}, {}
+                return moved, {}
+
+        args = argparse.Namespace(task="TC-1", lease_seconds=600, operation_id="resume-1")
+        result = helper.cmd_resume(StubClient(), args)  # type: ignore[arg-type]
+        self.assertEqual(result["task"], moved)
+        self.assertEqual(calls[1][0:2], ("POST", "/tasks/task-1/claim"))
+        self.assertEqual(calls[2][0:2], ("GET", "/projects/project-1/columns?limit=200"))
+        self.assertEqual(calls[3][0:2], ("PATCH", "/tasks/task-1"))
+        self.assertEqual(calls[3][2]["if_match"], 4)
+        self.assertNotEqual(calls[1][2]["idempotency_key"], calls[3][2]["idempotency_key"])
+
+    def test_resume_does_not_patch_already_active_task_or_foreign_claim(self) -> None:
+        calls: list[tuple[str, str, dict[str, object]]] = []
+        current = {"id": "task-1", "project_id": "project-1", "column_id": "active", "version": 3}
+        claimed = {**current, "version": 4}
+
+        class StubClient:
+            def call(self, method: str, path: str, **kwargs):  # type: ignore[no-untyped-def]
+                calls.append((method, path, kwargs))
+                if method == "GET":
+                    if path.endswith("/columns?limit=200"):
+                        return {"data": [{"id": "active", "semantic_state": "active"}]}, {}
+                    return current, {}
+                if path.endswith("/claim"):
+                    return claimed, {}
+                return claimed, {}
+
+        args = argparse.Namespace(task="TC-1", lease_seconds=600, operation_id="resume-2")
+        helper.cmd_resume(StubClient(), args)  # type: ignore[arg-type]
+        self.assertFalse(any(method == "PATCH" for method, _path, _kwargs in calls))
+
+    def test_operation_id_is_rejected_before_network_mutation(self) -> None:
+        class StubClient:
+            def call(self, *_args, **_kwargs):  # type: ignore[no-untyped-def]
+                self.fail("network should not be called")
+
+        args = argparse.Namespace(task="TC-1", operation_id="bad id", lease_seconds=600)
+        with self.assertRaisesRegex(helper.RoadmapError, "operation_id"):
+            helper.cmd_heartbeat(StubClient(), args)  # type: ignore[arg-type]
+
+    def test_heartbeat_updates_state_when_task_is_referenced_by_key(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            store = session.StateStore("session-heartbeat", directory=raw)
+            store.save(
+                session.SessionState(
+                    task_id="task-1",
+                    task_key="TC-35",
+                    project_id="project-1",
+                    operation_id="heartbeat-1",
+                    snapshot_ready=True,
+                )
+            )
+            args = argparse.Namespace(task="TC-35", operation_id="heartbeat-1")
+            calls: list[tuple[str, str, dict[str, object]]] = []
+
+            class StubClient:
+                def call(self, method: str, path: str, **kwargs):  # type: ignore[no-untyped-def]
+                    calls.append((method, path, kwargs))
+                    return {"id": "task-1", "version": 3}, {}
+
+            with mock.patch.dict(os.environ, {"CODEX_SESSION_ID": "session-heartbeat", "TC_ROADMAP_STATE_DIR": raw}, clear=False):
+                result = helper.cmd_heartbeat(StubClient(), args)  # type: ignore[arg-type]
+            self.assertEqual(calls[0][0:2], ("POST", "/tasks/TC-35/heartbeat"))
+            self.assertEqual(calls[0][2]["body"], {"operation_id": "heartbeat-1"})
+            self.assertNotIn("if_match", calls[0][2])
+            self.assertNotIn("idempotency_key", calls[0][2])
+            self.assertEqual(result["operation_id"], "heartbeat-1")
+            self.assertIsNotNone(store.load().last_heartbeat_at)  # type: ignore[union-attr]
+
+
+class RetryTests(unittest.TestCase):
+    class Response:
+        def __init__(self, body: bytes = b"{}", headers: Message | None = None) -> None:
+            self.body = body
+            self.headers = headers or Message()
+
+        def __enter__(self):  # type: ignore[no-untyped-def]
+            return self
+
+        def __exit__(self, *_args):  # type: ignore[no-untyped-def]
+            return False
+
+        def read(self, _limit: int) -> bytes:
+            return self.body
+
+    @staticmethod
+    def _http_error(status: int, body: bytes = b'{"error":{"code":"busy","message":"try later"}}', retry_after: str = "") -> helper.error.HTTPError:
+        headers = Message()
+        if retry_after:
+            headers["Retry-After"] = retry_after
+        return helper.error.HTTPError("https://tc.example/api/v1/tasks", status, "busy", headers, io.BytesIO(body))
+
+    def test_get_and_replay_safe_mutation_retry_twice_with_bounded_delay(self) -> None:
+        client = helper.Client(helper.Config("https://tc.example", "token"))
+        opener = mock.Mock()
+        opener.open.side_effect = [self._http_error(503, retry_after="99"), self._http_error(429, retry_after="1"), self.Response()]
+        with mock.patch.object(helper.request, "build_opener", return_value=opener), mock.patch.object(helper.time, "sleep") as sleep:
+            payload, _ = client.call("POST", "/tasks/task-1/claim", body={"lease_seconds": 600}, idempotency_key="deterministic")
+        self.assertEqual(payload, {})
+        self.assertEqual(opener.open.call_count, 3)
+        self.assertEqual([call.args[0] for call in sleep.call_args_list], [5.0, 1.0])
+
+    def test_non_replayable_mutation_is_not_retried_and_error_context_survives(self) -> None:
+        client = helper.Client(helper.Config("https://tc.example", "token"))
+        opener = mock.Mock()
+        opener.open.side_effect = [self._http_error(503, retry_after="4")]
+        with mock.patch.object(helper.request, "build_opener", return_value=opener), mock.patch.object(helper.time, "sleep") as sleep:
+            with self.assertRaises(helper.RoadmapError) as caught:
+                client.call("POST", "/tasks/task-1/comments", body={"body": "note"})
+        self.assertEqual(opener.open.call_count, 1)
+        sleep.assert_not_called()
+        self.assertEqual(caught.exception.status_code, 503)
+        self.assertEqual(caught.exception.code, 503)
+        self.assertEqual(caught.exception.error_code, "busy")
+        self.assertEqual(caught.exception.retry_after, "4")
+
+    def test_heartbeat_without_key_is_replay_safe_but_conflict_is_not_retried(self) -> None:
+        client = helper.Client(helper.Config("https://tc.example", "token"))
+        opener = mock.Mock()
+        opener.open.side_effect = [self._http_error(503), self.Response()]
+        with mock.patch.object(helper.request, "build_opener", return_value=opener), mock.patch.object(helper.time, "sleep"):
+            payload, _ = client.call("POST", "/tasks/task-1/heartbeat", body={"operation_id": "op-1"})
+        self.assertEqual(payload, {})
+        self.assertEqual(opener.open.call_count, 2)
+
+        opener.open.reset_mock()
+        opener.open.side_effect = [self._http_error(409)]
+        with mock.patch.object(helper.request, "build_opener", return_value=opener), mock.patch.object(helper.time, "sleep") as sleep:
+            with self.assertRaises(helper.RoadmapError):
+                client.call("GET", "/tasks/task-1")
+        self.assertEqual(opener.open.call_count, 1)
+        sleep.assert_not_called()
 
 
 if __name__ == "__main__":
