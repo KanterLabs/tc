@@ -74,6 +74,10 @@
       "description": "Tasks, internal bugs, comments, labels, and coordination actions"
     },
     {
+      "name": "Audits",
+      "description": "Read-only board-audit snapshots and explicitly reviewed findings"
+    },
+    {
       "name": "Labels",
       "description": "Project labels"
     },
@@ -1542,6 +1546,583 @@
         }
       }
     },
+    "/api/v1/projects/{project}/audits": {
+      "parameters": [
+        {
+          "$ref": "#/components/parameters/ProjectPath"
+        }
+      ],
+      "get": {
+        "operationId": "listProjectAudits",
+        "summary": "List board-audit runs for a project",
+        "description": "Returns cursor-paginated audit-run metadata for the selected project.\nThis read-only operation requires `tasks:read`; it never changes a\ntask or applies a finding. Run detail contains only bounded summary\nmetadata; fetch findings through the separate findings collection.\n",
+        "tags": [
+          "Audits"
+        ],
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/Cursor"
+          },
+          {
+            "$ref": "#/components/parameters/Limit"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Cursor-paginated board-audit runs",
+            "headers": {
+              "X-Request-ID": {
+                "$ref": "#/components/headers/XRequestID"
+              },
+              "X-Roadmap-Revision": {
+                "$ref": "#/components/headers/XRoadmapRevision"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AuditRunCollection"
+                },
+                "examples": {
+                  "audits": {
+                    "$ref": "#/components/examples/AuditRunCollectionExample"
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalServerError"
+          },
+          "503": {
+            "$ref": "#/components/responses/ServiceUnavailable"
+          }
+        }
+      },
+      "post": {
+        "operationId": "createProjectAudit",
+        "summary": "Start a board-audit run",
+        "description": "Creates a queued or running audit snapshot for the selected project.\nAudit writes require `tasks:write`. Creating a run only records audit\nmetadata; it does not move, claim, update, or otherwise mutate tasks.\nSend `Idempotency-Key` when retrying the request.\n",
+        "tags": [
+          "Audits"
+        ],
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/IdempotencyKey"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AuditRunCreateRequest"
+              },
+              "example": {
+                "scope": "board",
+                "status": "queued"
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "Audit run created; no task changes are made.",
+            "headers": {
+              "X-Request-ID": {
+                "$ref": "#/components/headers/XRequestID"
+              },
+              "X-Roadmap-Revision": {
+                "$ref": "#/components/headers/XRoadmapRevision"
+              },
+              "Location": {
+                "$ref": "#/components/headers/Location"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AuditRun"
+                },
+                "examples": {
+                  "audit": {
+                    "$ref": "#/components/examples/AuditRunExample"
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "413": {
+            "$ref": "#/components/responses/RequestTooLarge"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalServerError"
+          },
+          "503": {
+            "$ref": "#/components/responses/ServiceUnavailable"
+          },
+          "507": {
+            "$ref": "#/components/responses/InsufficientStorage"
+          }
+        }
+      }
+    },
+    "/api/v1/audits/{audit}": {
+      "parameters": [
+        {
+          "$ref": "#/components/parameters/AuditPath"
+        }
+      ],
+      "get": {
+        "operationId": "getAudit",
+        "summary": "Get an audit-run summary",
+        "description": "Returns bounded run metadata and the finding count. The `findings`\narray is always empty on this summary resource; use\n`GET /api/v1/audits/{audit}/findings` for the paginated findings. This\noperation is read-only and requires `tasks:read`.\n",
+        "tags": [
+          "Audits"
+        ],
+        "responses": {
+          "200": {
+            "description": "Audit-run summary without expanded findings",
+            "headers": {
+              "X-Request-ID": {
+                "$ref": "#/components/headers/XRequestID"
+              },
+              "X-Roadmap-Revision": {
+                "$ref": "#/components/headers/XRoadmapRevision"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AuditRun"
+                },
+                "examples": {
+                  "audit": {
+                    "$ref": "#/components/examples/AuditRunExample"
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalServerError"
+          },
+          "503": {
+            "$ref": "#/components/responses/ServiceUnavailable"
+          }
+        }
+      }
+    },
+    "/api/v1/audits/{audit}/findings": {
+      "parameters": [
+        {
+          "$ref": "#/components/parameters/AuditPath"
+        }
+      ],
+      "get": {
+        "operationId": "listAuditFindings",
+        "summary": "List findings for an audit run",
+        "description": "Returns the immutable, cursor-paginated observations captured by an\naudit. Reading findings requires `tasks:read`; each response computes\n`changed_since_audit` from the current task version and source column.\nReading findings never changes a task.\n",
+        "tags": [
+          "Audits"
+        ],
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/Cursor"
+          },
+          {
+            "$ref": "#/components/parameters/Limit"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Cursor-paginated audit findings",
+            "headers": {
+              "X-Request-ID": {
+                "$ref": "#/components/headers/XRequestID"
+              },
+              "X-Roadmap-Revision": {
+                "$ref": "#/components/headers/XRoadmapRevision"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AuditFindingCollection"
+                },
+                "examples": {
+                  "findings": {
+                    "$ref": "#/components/examples/AuditFindingCollectionExample"
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalServerError"
+          },
+          "503": {
+            "$ref": "#/components/responses/ServiceUnavailable"
+          }
+        }
+      },
+      "post": {
+        "operationId": "appendAuditFinding",
+        "summary": "Append an audit finding",
+        "description": "Appends one immutable task observation while the run is queued or\nrunning. Audit writes require `tasks:write`. The server validates the\ncaptured task version and source column but never changes the task or\napplies the recommendation. Repeating the same finding is idempotent\nat the resource level; send `Idempotency-Key` for safe HTTP retries.\n",
+        "tags": [
+          "Audits"
+        ],
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/IdempotencyKey"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AuditFindingCreateRequest"
+              },
+              "example": {
+                "task_id": "task_42",
+                "captured_version": 7,
+                "source_column": "col_backlog",
+                "verdict": "move_proposed",
+                "proposed_semantic_destination": "ready",
+                "confidence": 0.9,
+                "reason": "Move to Ready after triage.",
+                "evidence_refs": [
+                  "/api/v1/tasks/task_42"
+                ]
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "Finding appended; no task changes are made.",
+            "headers": {
+              "X-Request-ID": {
+                "$ref": "#/components/headers/XRequestID"
+              },
+              "X-Roadmap-Revision": {
+                "$ref": "#/components/headers/XRoadmapRevision"
+              },
+              "Location": {
+                "$ref": "#/components/headers/Location"
+              },
+              "ETag": {
+                "$ref": "#/components/headers/ETag"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AuditFindingMutationResponse"
+                },
+                "examples": {
+                  "finding": {
+                    "$ref": "#/components/examples/AuditFindingExample"
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "413": {
+            "$ref": "#/components/responses/RequestTooLarge"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalServerError"
+          },
+          "503": {
+            "$ref": "#/components/responses/ServiceUnavailable"
+          },
+          "507": {
+            "$ref": "#/components/responses/InsufficientStorage"
+          }
+        }
+      }
+    },
+    "/api/v1/audits/{audit}/finalize": {
+      "parameters": [
+        {
+          "$ref": "#/components/parameters/AuditPath"
+        }
+      ],
+      "post": {
+        "operationId": "finalizeAudit",
+        "summary": "Finalize an audit run",
+        "description": "Closes a queued or running audit with `complete`, `partial`, or\n`failed`. Audit writes require `tasks:write`. Finalization changes\nonly audit-run lifecycle metadata; findings remain review-only and no\ntask move is applied. Send `Idempotency-Key` for safe retries.\n",
+        "tags": [
+          "Audits"
+        ],
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/IdempotencyKey"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AuditFinalizeRequest"
+              },
+              "example": {
+                "status": "complete"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Finalized audit-run summary; findings remain unchanged.",
+            "headers": {
+              "X-Request-ID": {
+                "$ref": "#/components/headers/XRequestID"
+              },
+              "X-Roadmap-Revision": {
+                "$ref": "#/components/headers/XRoadmapRevision"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AuditRun"
+                },
+                "examples": {
+                  "audit": {
+                    "$ref": "#/components/examples/AuditRunExample"
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "413": {
+            "$ref": "#/components/responses/RequestTooLarge"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalServerError"
+          },
+          "503": {
+            "$ref": "#/components/responses/ServiceUnavailable"
+          },
+          "507": {
+            "$ref": "#/components/responses/InsufficientStorage"
+          }
+        }
+      }
+    },
+    "/api/v1/audit-findings/{finding}": {
+      "parameters": [
+        {
+          "$ref": "#/components/parameters/AuditFindingPath"
+        }
+      ],
+      "patch": {
+        "operationId": "reviewAuditFinding",
+        "summary": "Review an audit finding",
+        "description": "Updates only the finding review state and, when supplied, its proposed\nsemantic destination. Audit writes require `tasks:write`. The captured\ntask snapshot, captured version, source column, verdict, confidence,\nreason, and evidence remain immutable. Supply the finding's strong\nETag as `If-Match`; use `Idempotency-Key` for safe retries. Reviewing a\nfinding never moves or otherwise changes its task. Approval is\naccepted only after the run is finalized as `complete` or `partial`\nand while the captured task version and source column still match.\n",
+        "tags": [
+          "Audits"
+        ],
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/IfMatch"
+          },
+          {
+            "$ref": "#/components/parameters/IdempotencyKey"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AuditFindingReviewRequest"
+              },
+              "examples": {
+                "approve": {
+                  "value": {
+                    "review_state": "approved"
+                  }
+                },
+                "dismiss": {
+                  "value": {
+                    "review_state": "dismissed"
+                  }
+                },
+                "changeDestination": {
+                  "value": {
+                    "review_state": "approved",
+                    "proposed_semantic_destination": "ready"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Updated finding; no task changes are made.",
+            "headers": {
+              "X-Request-ID": {
+                "$ref": "#/components/headers/XRequestID"
+              },
+              "X-Roadmap-Revision": {
+                "$ref": "#/components/headers/XRoadmapRevision"
+              },
+              "ETag": {
+                "$ref": "#/components/headers/ETag"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AuditFindingMutationResponse"
+                },
+                "examples": {
+                  "finding": {
+                    "$ref": "#/components/examples/AuditFindingExample"
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "413": {
+            "$ref": "#/components/responses/RequestTooLarge"
+          },
+          "428": {
+            "$ref": "#/components/responses/PreconditionRequired"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalServerError"
+          },
+          "503": {
+            "$ref": "#/components/responses/ServiceUnavailable"
+          },
+          "507": {
+            "$ref": "#/components/responses/InsufficientStorage"
+          }
+        }
+      }
+    },
     "/api/v1/issues": {
       "get": {
         "operationId": "listIssues",
@@ -1816,6 +2397,106 @@
               },
               "X-Roadmap-Revision": {
                 "$ref": "#/components/headers/XRoadmapRevision"
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "#/components/responses/TaskMutationConflict"
+          },
+          "413": {
+            "$ref": "#/components/responses/RequestTooLarge"
+          },
+          "428": {
+            "$ref": "#/components/responses/PreconditionRequired"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalServerError"
+          },
+          "503": {
+            "$ref": "#/components/responses/ServiceUnavailable"
+          },
+          "507": {
+            "$ref": "#/components/responses/InsufficientStorage"
+          }
+        }
+      }
+    },
+    "/api/v1/tasks/{task}/move": {
+      "parameters": [
+        {
+          "$ref": "#/components/parameters/TaskPath"
+        }
+      ],
+      "post": {
+        "operationId": "moveTask",
+        "summary": "Apply a guarded task move",
+        "description": "Moves an unfinished task to a backlog or ready column only. Task\nmoves require `tasks:write`, the exact current task ETag in `If-Match`,\nand an `Idempotency-Key`. The expected source column is guarded in the\nsame transaction as the task version and active-claim check; any live\nclaim, including the caller's own, rejects the move. The server\ncomputes the destination position atomically, so `position` is not a\nrequest field. A successful move emits a `task.moved` event. This is\nthe explicit apply step after a client has reviewed an audit finding;\naudit reads and finding review never apply moves.\n",
+        "tags": [
+          "Tasks"
+        ],
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/IfMatch"
+          },
+          {
+            "$ref": "#/components/parameters/IdempotencyKey"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/TaskMoveRequest"
+              },
+              "example": {
+                "destination_column_id": "col_ready",
+                "expected_source_column_id": "col_backlog",
+                "source": "board_audit",
+                "reason": "Approved board-audit recommendation."
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Moved task; the server allocated its destination position and emitted task.moved.",
+            "headers": {
+              "X-Request-ID": {
+                "$ref": "#/components/headers/XRequestID"
+              },
+              "X-Roadmap-Revision": {
+                "$ref": "#/components/headers/XRoadmapRevision"
+              },
+              "ETag": {
+                "$ref": "#/components/headers/ETag"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TaskMutationResponse"
+                },
+                "examples": {
+                  "task": {
+                    "$ref": "#/components/examples/TaskExample"
+                  }
+                }
               }
             }
           },
@@ -3875,7 +4556,7 @@
     },
     "headers": {
       "ETag": {
-        "description": "Strong task version validator. Send this value as If-Match on the next mutation.",
+        "description": "Strong task or audit-finding version validator. Send this value as If-Match on the next mutation of that resource.",
         "schema": {
           "type": "string",
           "pattern": "^\"v[1-9][0-9]*\"$"
@@ -3945,6 +4626,26 @@
           "$ref": "#/components/schemas/Identifier"
         },
         "example": "task_42"
+      },
+      "AuditPath": {
+        "name": "audit",
+        "in": "path",
+        "required": true,
+        "description": "Opaque audit-run ID.",
+        "schema": {
+          "$ref": "#/components/schemas/Identifier"
+        },
+        "example": "audit_42"
+      },
+      "AuditFindingPath": {
+        "name": "finding",
+        "in": "path",
+        "required": true,
+        "description": "Opaque audit-finding ID.",
+        "schema": {
+          "$ref": "#/components/schemas/Identifier"
+        },
+        "example": "finding_42"
       },
       "LabelPath": {
         "name": "label",
@@ -4027,7 +4728,7 @@
         "name": "If-Match",
         "in": "header",
         "required": true,
-        "description": "Exact last observed task ETag. The value must be quoted as \"vN\" with\nN a positive decimal version. Missing If-Match returns 428, malformed\nvalues return 400, and a stale version returns 409 with the current\ntask in error.details.current (reduced to id/version for bearer tokens\nwithout tasks:read).\n",
+        "description": "Exact last observed task or audit-finding ETag. The value must be\nquoted as \"vN\" with N a positive decimal version. Missing If-Match\nreturns 428, malformed values return 400, and a stale task version\nreturns 409 with the current task in error.details.current (reduced to\nid/version for bearer tokens without tasks:read).\n",
         "schema": {
           "type": "string",
           "pattern": "^\"v[1-9][0-9]*\"$"
@@ -4647,6 +5348,44 @@
           "completed"
         ]
       },
+      "AuditRunStatus": {
+        "type": "string",
+        "enum": [
+          "queued",
+          "running",
+          "complete",
+          "partial",
+          "failed"
+        ],
+        "description": "Audit lifecycle state. Queued and running are non-terminal; the remaining values are terminal."
+      },
+      "AuditTerminalStatus": {
+        "type": "string",
+        "enum": [
+          "complete",
+          "partial",
+          "failed"
+        ],
+        "description": "Terminal outcome accepted by the audit finalize endpoint."
+      },
+      "AuditVerdict": {
+        "type": "string",
+        "enum": [
+          "correct",
+          "needs_attention",
+          "move_proposed"
+        ],
+        "description": "Auditor conclusion for the captured task snapshot."
+      },
+      "AuditReviewState": {
+        "type": "string",
+        "enum": [
+          "pending",
+          "approved",
+          "dismissed"
+        ],
+        "description": "Human or agent review state for an audit finding."
+      },
       "Priority": {
         "type": "string",
         "enum": [
@@ -5203,6 +5942,478 @@
             "$ref": "#/components/schemas/ColumnMutationSummary"
           }
         ]
+      },
+      "AuditRun": {
+        "type": "object",
+        "required": [
+          "id",
+          "project_id",
+          "actor_id",
+          "scope",
+          "status",
+          "started_at",
+          "created_at",
+          "updated_at",
+          "finding_count",
+          "findings"
+        ],
+        "description": "Bounded metadata for one board-audit run. The server returns\n`findings: []` on this resource; findings are never expanded here and\nmust be fetched through the cursor-paginated findings collection.\n",
+        "properties": {
+          "id": {
+            "$ref": "#/components/schemas/Identifier"
+          },
+          "project_id": {
+            "$ref": "#/components/schemas/Identifier"
+          },
+          "actor_id": {
+            "$ref": "#/components/schemas/Identifier"
+          },
+          "scope": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 200
+          },
+          "status": {
+            "$ref": "#/components/schemas/AuditRunStatus"
+          },
+          "started_at": {
+            "$ref": "#/components/schemas/Timestamp"
+          },
+          "finalized_at": {
+            "$ref": "#/components/schemas/NullableTimestamp"
+          },
+          "created_at": {
+            "$ref": "#/components/schemas/Timestamp"
+          },
+          "updated_at": {
+            "$ref": "#/components/schemas/Timestamp"
+          },
+          "finding_count": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "findings": {
+            "type": "array",
+            "description": "Always empty on the summary resource; use the findings collection for data.",
+            "items": {
+              "$ref": "#/components/schemas/AuditFinding"
+            }
+          }
+        },
+        "additionalProperties": false
+      },
+      "AuditRunCreateRequest": {
+        "type": "object",
+        "required": [
+          "scope"
+        ],
+        "description": "Start a queued or running audit run. Creating it never mutates tasks.",
+        "properties": {
+          "scope": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 200,
+            "description": "Opaque audit selection label, such as `board` or `open_tasks`."
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "queued",
+              "running"
+            ],
+            "default": "running",
+            "description": "Initial lifecycle state; omitted values default to `running`."
+          }
+        },
+        "additionalProperties": false
+      },
+      "AuditFinding": {
+        "type": "object",
+        "required": [
+          "id",
+          "audit_id",
+          "task_id",
+          "captured_version",
+          "source_column",
+          "verdict",
+          "confidence",
+          "reason",
+          "evidence_refs",
+          "review_state",
+          "version",
+          "changed_since_audit",
+          "created_at",
+          "updated_at"
+        ],
+        "description": "Immutable observation of one task at the time of an audit. The server\ncomputes `changed_since_audit` at read time by comparing the current\ntask version and source column with this finding's captured values.\n",
+        "properties": {
+          "id": {
+            "$ref": "#/components/schemas/Identifier"
+          },
+          "audit_id": {
+            "$ref": "#/components/schemas/Identifier"
+          },
+          "task_id": {
+            "$ref": "#/components/schemas/Identifier"
+          },
+          "captured_version": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 1
+          },
+          "source_column": {
+            "$ref": "#/components/schemas/Identifier",
+            "description": "Opaque column ID captured by the auditor."
+          },
+          "verdict": {
+            "$ref": "#/components/schemas/AuditVerdict"
+          },
+          "proposed_semantic_destination": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/SemanticState"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Suggested semantic destination for a move proposal; omitted when none was captured."
+          },
+          "confidence": {
+            "type": "number",
+            "format": "double",
+            "minimum": 0,
+            "maximum": 1
+          },
+          "reason": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 2000
+          },
+          "evidence_refs": {
+            "type": "array",
+            "maxItems": 100,
+            "uniqueItems": true,
+            "items": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 512,
+              "pattern": "^[A-Za-z0-9/][A-Za-z0-9._:/+~-]*$"
+            },
+            "description": "Safe, non-duplicated evidence identifiers without query strings, fragments, or executable/data URLs."
+          },
+          "review_state": {
+            "$ref": "#/components/schemas/AuditReviewState"
+          },
+          "version": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 1,
+            "description": "Finding review version used by If-Match."
+          },
+          "changed_since_audit": {
+            "type": "boolean",
+            "description": "True when the task version or source column differs from the captured snapshot."
+          },
+          "created_at": {
+            "$ref": "#/components/schemas/Timestamp"
+          },
+          "updated_at": {
+            "$ref": "#/components/schemas/Timestamp"
+          }
+        },
+        "additionalProperties": false
+      },
+      "AuditFindingCreateRequest": {
+        "type": "object",
+        "required": [
+          "task_id",
+          "captured_version",
+          "verdict",
+          "confidence",
+          "reason"
+        ],
+        "description": "Append one finding to a queued or running audit. Supply either\n`source_column` or its accepted alias `source_column_id`; when both\nare supplied they must match. `review_state` defaults to `pending`.\nThe server validates the snapshot but never changes the task.\n",
+        "properties": {
+          "task_id": {
+            "$ref": "#/components/schemas/Identifier"
+          },
+          "captured_version": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 1
+          },
+          "source_column": {
+            "$ref": "#/components/schemas/Identifier",
+            "description": "Canonical opaque source column ID."
+          },
+          "source_column_id": {
+            "$ref": "#/components/schemas/Identifier",
+            "description": "Compatibility alias for `source_column`."
+          },
+          "verdict": {
+            "$ref": "#/components/schemas/AuditVerdict"
+          },
+          "proposed_semantic_destination": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/SemanticState"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Required for `move_proposed`; forbidden for other verdicts."
+          },
+          "confidence": {
+            "type": "number",
+            "format": "double",
+            "minimum": 0,
+            "maximum": 1
+          },
+          "reason": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 2000
+          },
+          "evidence_refs": {
+            "type": "array",
+            "maxItems": 100,
+            "uniqueItems": true,
+            "items": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 512,
+              "pattern": "^[A-Za-z0-9/][A-Za-z0-9._:/+~-]*$"
+            },
+            "description": "Safe, non-duplicated evidence identifiers without query strings, fragments, or executable/data URLs."
+          },
+          "review_state": {
+            "type": "string",
+            "enum": [
+              "pending"
+            ],
+            "default": "pending",
+            "description": "Findings always begin pending; approval and dismissal use the versioned review endpoint."
+          }
+        },
+        "anyOf": [
+          {
+            "required": [
+              "source_column"
+            ]
+          },
+          {
+            "required": [
+              "source_column_id"
+            ]
+          }
+        ],
+        "additionalProperties": false
+      },
+      "AuditFindingReviewRequest": {
+        "type": "object",
+        "required": [
+          "review_state"
+        ],
+        "description": "Change only review metadata. Omitting\n`proposed_semantic_destination` preserves the existing suggestion;\nsending null clears it. The captured task snapshot remains immutable.\nApproval requires a `complete` or `partial` run and an unchanged task\nsnapshot.\n",
+        "properties": {
+          "review_state": {
+            "$ref": "#/components/schemas/AuditReviewState"
+          },
+          "proposed_semantic_destination": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/SemanticState"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Optional replacement destination, or null to clear it."
+          }
+        },
+        "additionalProperties": false
+      },
+      "AuditFindingMutationSummary": {
+        "type": "object",
+        "description": "Reduced audit-finding mutation response for bearer tokens without tasks:read.",
+        "required": [
+          "id",
+          "version"
+        ],
+        "properties": {
+          "id": {
+            "$ref": "#/components/schemas/Identifier"
+          },
+          "version": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 1
+          }
+        },
+        "additionalProperties": false
+      },
+      "AuditFindingMutationResponse": {
+        "description": "Full finding for humans and tasks:read tokens, or id/version metadata for write-only bearer tokens.",
+        "oneOf": [
+          {
+            "$ref": "#/components/schemas/AuditFinding"
+          },
+          {
+            "$ref": "#/components/schemas/AuditFindingMutationSummary"
+          }
+        ]
+      },
+      "AuditFinalizeRequest": {
+        "type": "object",
+        "required": [
+          "status"
+        ],
+        "properties": {
+          "status": {
+            "$ref": "#/components/schemas/AuditTerminalStatus"
+          }
+        },
+        "additionalProperties": false
+      },
+      "TaskMoveRequest": {
+        "type": "object",
+        "required": [
+          "source"
+        ],
+        "description": "Guarded raw board move intent. Supply one or more agreeing aliases\nfrom each destination/source group; canonical names are\n`destination_column_id` and `expected_source_column_id`. `source` is\nrequired provenance and `reason` is optional. The server assigns the\ndestination position atomically, so `position` and other fields are\nrejected. Only backlog and ready destination columns are allowed.\n",
+        "properties": {
+          "destination_column_id": {
+            "$ref": "#/components/schemas/Identifier"
+          },
+          "destination_column": {
+            "$ref": "#/components/schemas/Identifier",
+            "description": "Alias for `destination_column_id`."
+          },
+          "to_column_id": {
+            "$ref": "#/components/schemas/Identifier",
+            "description": "Alias for `destination_column_id`."
+          },
+          "to_column": {
+            "$ref": "#/components/schemas/Identifier",
+            "description": "Alias for `destination_column_id`."
+          },
+          "column_id": {
+            "$ref": "#/components/schemas/Identifier",
+            "description": "Alias for `destination_column_id`."
+          },
+          "column": {
+            "$ref": "#/components/schemas/Identifier",
+            "description": "Alias for `destination_column_id`."
+          },
+          "expected_source_column_id": {
+            "$ref": "#/components/schemas/Identifier"
+          },
+          "source_column_id": {
+            "$ref": "#/components/schemas/Identifier",
+            "description": "Alias for `expected_source_column_id`."
+          },
+          "from_column_id": {
+            "$ref": "#/components/schemas/Identifier",
+            "description": "Alias for `expected_source_column_id`."
+          },
+          "expected_column_id": {
+            "$ref": "#/components/schemas/Identifier",
+            "description": "Alias for `expected_source_column_id`."
+          },
+          "source_column": {
+            "$ref": "#/components/schemas/Identifier",
+            "description": "Alias for `expected_source_column_id`."
+          },
+          "from_column": {
+            "$ref": "#/components/schemas/Identifier",
+            "description": "Alias for `expected_source_column_id`."
+          },
+          "source": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 200,
+            "description": "Required bounded provenance label, for example `board_audit`."
+          },
+          "reason": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 10000,
+            "description": "Optional bounded explanation; when supplied it must not be empty."
+          }
+        },
+        "allOf": [
+          {
+            "anyOf": [
+              {
+                "required": [
+                  "destination_column_id"
+                ]
+              },
+              {
+                "required": [
+                  "destination_column"
+                ]
+              },
+              {
+                "required": [
+                  "to_column_id"
+                ]
+              },
+              {
+                "required": [
+                  "to_column"
+                ]
+              },
+              {
+                "required": [
+                  "column_id"
+                ]
+              },
+              {
+                "required": [
+                  "column"
+                ]
+              }
+            ]
+          },
+          {
+            "anyOf": [
+              {
+                "required": [
+                  "expected_source_column_id"
+                ]
+              },
+              {
+                "required": [
+                  "source_column_id"
+                ]
+              },
+              {
+                "required": [
+                  "from_column_id"
+                ]
+              },
+              {
+                "required": [
+                  "expected_column_id"
+                ]
+              },
+              {
+                "required": [
+                  "source_column"
+                ]
+              },
+              {
+                "required": [
+                  "from_column"
+                ]
+              }
+            ]
+          }
+        ],
+        "additionalProperties": false
       },
       "Task": {
         "type": "object",
@@ -6439,7 +7650,7 @@
           "type": {
             "type": "string",
             "minLength": 1,
-            "description": "Event type, for example task.claimed, task.progressed, task.completed, bug.triaged, bug.resolved, bug.duplicated, or bug.reopened.",
+            "description": "Event type, for example task.claimed, task.progressed, task.moved, task.completed, bug.triaged, bug.resolved, bug.duplicated, or bug.reopened.",
             "example": "task.claimed"
           },
           "actor_id": {
@@ -6915,6 +8126,46 @@
         },
         "additionalProperties": false
       },
+      "AuditRunCollection": {
+        "type": "object",
+        "required": [
+          "data",
+          "next_cursor"
+        ],
+        "properties": {
+          "data": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/AuditRun"
+            }
+          },
+          "next_cursor": {
+            "type": "string",
+            "description": "Empty string when there is no next page."
+          }
+        },
+        "additionalProperties": false
+      },
+      "AuditFindingCollection": {
+        "type": "object",
+        "required": [
+          "data",
+          "next_cursor"
+        ],
+        "properties": {
+          "data": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/AuditFinding"
+            }
+          },
+          "next_cursor": {
+            "type": "string",
+            "description": "Empty string when there is no next page."
+          }
+        },
+        "additionalProperties": false
+      },
       "CommentCollection": {
         "type": "object",
         "required": [
@@ -7095,6 +8346,92 @@
             }
           ],
           "comment_count": 1
+        }
+      },
+      "AuditRunExample": {
+        "summary": "Completed board-audit summary",
+        "value": {
+          "id": "audit_42",
+          "project_id": "proj_ops",
+          "actor_id": "agent_ada",
+          "scope": "board",
+          "status": "complete",
+          "started_at": "2026-08-27T10:30:00Z",
+          "finalized_at": "2026-08-27T10:31:00Z",
+          "created_at": "2026-08-27T10:30:00Z",
+          "updated_at": "2026-08-27T10:31:00Z",
+          "finding_count": 1,
+          "findings": []
+        }
+      },
+      "AuditFindingExample": {
+        "summary": "Move recommendation captured by an audit",
+        "value": {
+          "id": "finding_42",
+          "audit_id": "audit_42",
+          "task_id": "task_42",
+          "captured_version": 7,
+          "source_column": "col_backlog",
+          "verdict": "move_proposed",
+          "proposed_semantic_destination": "ready",
+          "confidence": 0.9,
+          "reason": "Move to Ready after triage.",
+          "evidence_refs": [
+            "/api/v1/tasks/task_42"
+          ],
+          "review_state": "pending",
+          "version": 1,
+          "changed_since_audit": false,
+          "created_at": "2026-08-27T10:30:30Z",
+          "updated_at": "2026-08-27T10:30:30Z"
+        }
+      },
+      "AuditRunCollectionExample": {
+        "summary": "Board-audit run collection",
+        "value": {
+          "data": [
+            {
+              "id": "audit_42",
+              "project_id": "proj_ops",
+              "actor_id": "agent_ada",
+              "scope": "board",
+              "status": "complete",
+              "started_at": "2026-08-27T10:30:00Z",
+              "finalized_at": "2026-08-27T10:31:00Z",
+              "created_at": "2026-08-27T10:30:00Z",
+              "updated_at": "2026-08-27T10:31:00Z",
+              "finding_count": 1,
+              "findings": []
+            }
+          ],
+          "next_cursor": ""
+        }
+      },
+      "AuditFindingCollectionExample": {
+        "summary": "Audit-finding collection",
+        "value": {
+          "data": [
+            {
+              "id": "finding_42",
+              "audit_id": "audit_42",
+              "task_id": "task_42",
+              "captured_version": 7,
+              "source_column": "col_backlog",
+              "verdict": "move_proposed",
+              "proposed_semantic_destination": "ready",
+              "confidence": 0.9,
+              "reason": "Move to Ready after triage.",
+              "evidence_refs": [
+                "/api/v1/tasks/task_42"
+              ],
+              "review_state": "pending",
+              "version": 1,
+              "changed_since_audit": false,
+              "created_at": "2026-08-27T10:30:30Z",
+              "updated_at": "2026-08-27T10:30:30Z"
+            }
+          ],
+          "next_cursor": ""
         }
       },
       "TaskProgressedExample": {
@@ -7499,6 +8836,46 @@
             "state": "working",
             "completed": 1,
             "total": 2
+          }
+        }
+      },
+      "TaskMovedEventExample": {
+        "summary": "Guarded task move event",
+        "value": {
+          "cursor": 45,
+          "id": "event_45",
+          "type": "task.moved",
+          "actor_id": "agent_ada",
+          "project_id": "proj_ops",
+          "task_id": "task_42",
+          "created_at": "2026-08-27T10:35:00Z",
+          "payload": {
+            "from": {
+              "id": "col_backlog",
+              "name": "Backlog",
+              "semantic_state": "backlog"
+            },
+            "to": {
+              "id": "col_ready",
+              "name": "Ready",
+              "semantic_state": "ready"
+            },
+            "from_column_id": "col_backlog",
+            "to_column_id": "col_ready",
+            "from_column": "Backlog",
+            "to_column": "Ready",
+            "from_semantic_state": "backlog",
+            "to_semantic_state": "ready",
+            "from_column_state": "backlog",
+            "to_column_state": "ready",
+            "old_position": 3,
+            "new_position": 5,
+            "version": 8,
+            "resulting_version": 8,
+            "actor": "agent_ada",
+            "actor_id": "agent_ada",
+            "source": "board_audit",
+            "reason": "Approved board-audit recommendation."
           }
         }
       },

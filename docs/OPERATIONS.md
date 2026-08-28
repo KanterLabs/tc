@@ -229,6 +229,25 @@ that copy reaches the candidate's latest schema does the installer stop the
 connector and application and atomically switch `/var/lib/roadmap/current` to
 the new release. The production database remains at
 `/var/lib/roadmap/data/roadmap.db` and is never used as the preflight target.
+After all of those gates pass, the installer emits one sanitized line on the
+deploy stream before stopping either service:
+
+```text
+pre_upgrade_backup=roadmap-<timestamp>-<sha>.db source_schema=<n> candidate_schema=<n> latest_schema=<n> migration_digest=<64-hex> checksum=valid integrity=ok fk=ok preflight=ok
+```
+
+The backup value is only the retained basename (or `none` on a fresh install);
+no credentials or filesystem paths are included. The root gateway leaves this
+guest output attached, and the SSH/deploy-ci stream carries the proof into the
+CI log. A fresh install runs the same candidate preflight against a disposable
+empty SQLite source and reports source schema `0`. A failed backup, predicate,
+digest, or preflight check aborts before the proof is emitted, before either
+service is stopped, and before the release link changes. Binary rollback still
+switches only the release link and never restores the database.
+Automatic upgrades require the current `/var/lib/roadmap/data/roadmap.db`
+layout. An obsolete `/var/lib/roadmap/roadmap.db` layout is refused before
+either service is stopped; migrating that legacy pathname is an explicit
+offline maintenance operation and is never folded into a normal deployment.
 The state root, retained releases, and backups are root-owned; only the
 dedicated data directory is writable by `roadmap`. Failed health or connector
 checks automatically switch back and restart the previous release without

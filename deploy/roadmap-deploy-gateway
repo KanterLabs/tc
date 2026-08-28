@@ -485,6 +485,11 @@ done
 pct exec "$CTID" -- true || fail 'Roadmap CT did not become ready'
 
 pct push "$CTID" "$ARCHIVE" /root/roadmap-release.tar.gz --perms 0600
+# Keep guest installer stdout/stderr attached to this gateway process. The
+# installer emits one sanitized `pre_upgrade_backup=...` proof line only after
+# its online backup and candidate preflight gates; SSH/deploy-ci therefore
+# forwards that line into the CI log. Do not redirect or summarize this
+# invocation.
 pct exec "$CTID" -- bash -c '
 	set -Eeuo pipefail
 	rm -rf -- /root/roadmap-release

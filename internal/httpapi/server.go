@@ -570,6 +570,8 @@ func (s *Server) dispatchAuthed(w http.ResponseWriter, r *http.Request, identity
 				s.labels(w, r, identity, parts[1])
 			case "roadmap":
 				s.roadmap(w, r, identity, parts[1], true)
+			case "audits":
+				s.audits(w, r, identity, parts[1], true)
 			default:
 				s.writeError(w, http.StatusNotFound, "not_found", "route not found", nil)
 			}
@@ -593,6 +595,8 @@ func (s *Server) dispatchAuthed(w http.ResponseWriter, r *http.Request, identity
 				s.taskProgress(w, r, identity, parts[1])
 			case "heartbeat":
 				s.taskHeartbeat(w, r, identity, parts[1])
+			case "move":
+				s.taskMove(w, r, identity, parts[1])
 			case "claim":
 				s.taskAction(w, r, identity, parts[1], "claim")
 			case "renew":
@@ -610,6 +614,27 @@ func (s *Server) dispatchAuthed(w http.ResponseWriter, r *http.Request, identity
 			}
 			return
 		}
+	}
+	if parts[0] == "audits" && len(parts) >= 2 {
+		if len(parts) == 2 {
+			s.audit(w, r, identity, parts[1])
+			return
+		}
+		if len(parts) == 3 {
+			switch parts[2] {
+			case "findings":
+				s.auditFindings(w, r, identity, parts[1])
+			case "finalize":
+				s.auditFinalize(w, r, identity, parts[1])
+			default:
+				s.writeError(w, http.StatusNotFound, "not_found", "route not found", nil)
+			}
+			return
+		}
+	}
+	if parts[0] == "audit-findings" && len(parts) == 2 {
+		s.auditFinding(w, r, identity, parts[1])
+		return
 	}
 	if parts[0] == "labels" && len(parts) == 2 && r.Method == http.MethodDelete {
 		s.deleteLabel(w, r, identity, parts[1])
@@ -1020,9 +1045,21 @@ func isBodyBearingMethod(method string) bool {
 }
 
 func (s *Server) mutation(w http.ResponseWriter, r *http.Request, identity auth.Identity, fn func() (int, []byte, string, error)) {
+	s.mutationWithAdmission(w, r, identity, s.admitMutation, fn)
+}
+
+// mutationRateOnly retains ordinary idempotent replay and short-lived rate
+// limiting without charging the persistent agent storage allowance. Use it
+// only for bounded lifecycle metadata changes that do not add user-sized
+// content, events, comments, or task state.
+func (s *Server) mutationRateOnly(w http.ResponseWriter, r *http.Request, identity auth.Identity, fn func() (int, []byte, string, error)) {
+	s.mutationWithAdmission(w, r, identity, s.admitMutationRate, fn)
+}
+
+func (s *Server) mutationWithAdmission(w http.ResponseWriter, r *http.Request, identity auth.Identity, admit func(http.ResponseWriter, *http.Request, auth.Identity) bool, fn func() (int, []byte, string, error)) {
 	key := strings.TrimSpace(r.Header.Get("Idempotency-Key"))
 	if key == "" {
-		if !s.admitMutation(w, r, identity) {
+		if !admit(w, r, identity) {
 			return
 		}
 		status, body, etag, err := fn()
@@ -1054,7 +1091,7 @@ func (s *Server) mutation(w http.ResponseWriter, r *http.Request, identity auth.
 		s.writeRaw(w, record.Status, record.ResponseBody, record.ETag)
 		return
 	}
-	if !s.admitMutation(w, r, identity) {
+	if !admit(w, r, identity) {
 		return
 	}
 	status, body, etag, err := fn()
@@ -1226,6 +1263,13 @@ func redactTaskConflictDetails(identity auth.Identity, details any) any {
 			return details
 		}
 		redacted = redactedTaskConflictCurrent(*task)
+	case store.AuditFinding:
+		redacted = map[string]any{"id": task.ID, "version": task.Version}
+	case *store.AuditFinding:
+		if task == nil {
+			return details
+		}
+		redacted = map[string]any{"id": task.ID, "version": task.Version}
 	default:
 		return details
 	}

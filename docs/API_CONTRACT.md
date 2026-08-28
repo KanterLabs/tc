@@ -155,6 +155,117 @@ the current owner may renew or release an active lease. A non-owner cannot
 complete or block a task with an active claim (`403`), except for a human
 administrator explicitly overriding that claim.
 
+### Board audits and guarded moves
+
+Board audits are durable, read-first snapshots. The routes are:
+
+- `GET|POST /api/v1/projects/{project}/audits`
+- `GET /api/v1/audits/{audit}`
+- `GET|POST /api/v1/audits/{audit}/findings`
+- `POST /api/v1/audits/{audit}/finalize`
+- `PATCH /api/v1/audit-findings/{finding}`
+- `POST /api/v1/tasks/{task}/move`
+
+Audit reads (`GET` on the project run collection, run summary, or findings)
+require `tasks:read`. Audit writes (creating a run, appending a finding,
+finalizing a run, or reviewing a finding) require `tasks:write`. These are the
+existing task scopes; audits do not introduce a separate permission scope.
+Project-scoped bearer tokens may access only runs in their permitted project.
+Collections use the normal cursor pagination (`limit` defaults to 50 and is
+capped at 200).
+
+Creating a run requires `scope` and accepts optional `status` (`queued` or
+`running`, default `running`). A run uses exactly these lifecycle states:
+`queued`, `running`, `complete`, `partial`, and `failed`. Finalization requires
+one terminal `status`: `complete`, `partial`, or `failed`; timestamps and all
+lifecycle transitions are server-owned. A run response contains
+`id`, `project_id`, `actor_id`, `scope`, `status`, `started_at`, optional
+`finalized_at`, `created_at`, `updated_at`, `finding_count`, and `findings`.
+The run detail endpoint is intentionally a summary: `findings` is always an
+empty array there. Fetch findings through the paginated findings endpoint.
+Each project retains at most 1,000 audit runs and each run at most 10,000
+findings. Reaching a ceiling rejects new data; the server never silently
+deletes older audits.
+
+Appending a finding requires the following JSON fields:
+
+```json
+{
+  "task_id": "task_42",
+  "captured_version": 7,
+  "source_column": "col_backlog",
+  "verdict": "move_proposed",
+  "proposed_semantic_destination": "ready",
+  "confidence": 0.9,
+  "reason": "Move to Ready after triage.",
+  "evidence_refs": ["/api/v1/tasks/task_42"]
+}
+```
+
+`source_column_id` is accepted as an alias for `source_column`; if both are
+sent they must match. `verdict` is `correct`, `needs_attention`, or
+`move_proposed`. A `move_proposed` finding requires
+`proposed_semantic_destination`; other verdicts must omit it. The destination
+is one of the five semantic states (`backlog`, `ready`, `active`, `blocked`,
+or `completed`). `confidence` is from 0 through 1, `reason` is 1–2,000
+characters, and `evidence_refs` contains at most 100 unique safe identifiers
+(each at most 512 characters; query strings, fragments, executable URLs, and
+data URLs are rejected). New findings always begin with `review_state` set to
+`pending`; approval or dismissal is accepted only through the versioned review
+endpoint. A returned finding contains its immutable snapshot fields plus
+`version` (starting at 1), timestamps, and the read-time boolean
+`changed_since_audit`, which is true when the task version or source column no
+longer matches the captured snapshot. Repeating the same finding for the same
+task is safe; changing its snapshot returns `409`.
+
+`PATCH /api/v1/audit-findings/{finding}` requires the finding's strong quoted
+`If-Match: "vN"` and a body containing `review_state`. It may also contain
+`proposed_semantic_destination`; omission preserves the existing value and
+explicit `null` clears it. Only review metadata changes. The response carries
+the incremented finding `ETag`; stale versions return `409` with the normal
+conflict envelope. `Idempotency-Key` is supported on all audit writes and
+should be sent for retries.
+Approval is accepted only after the agent finalizes the run as `complete` or
+`partial`. Approving a queued/running/failed run, or a finding whose task
+version or source column has already changed, returns `409`; the finding
+remains pending.
+
+Audit reads, finding appends, finalization, and finding review never move or
+otherwise mutate a task. A client should show the captured source,
+destination, evidence, confidence, and current drift state in a read-only
+preview, then require an explicit confirmation before calling the separate
+task-move endpoint. Approving a finding is not an apply operation.
+
+`POST /api/v1/tasks/{task}/move` is the only audit reconciliation apply step.
+It requires `tasks:write`, `If-Match` for the current task version, and a
+non-empty `Idempotency-Key`. Its canonical request shape is:
+
+```json
+{
+  "destination_column_id": "col_ready",
+  "expected_source_column_id": "col_backlog",
+  "source": "board_audit",
+  "reason": "Approved board-audit recommendation."
+}
+```
+
+The destination and expected-source fields also accept the compatibility
+aliases `destination_column`, `to_column_id`, `to_column`, `column_id`,
+`column`, and `source_column_id`, `from_column_id`, `expected_column_id`,
+`source_column`, `from_column`, respectively; multiple aliases must agree.
+`source` is required and capped at 200 characters; `reason` is optional and
+capped at 10,000 characters. `position` is not accepted: the server computes
+the destination position atomically. Only columns with semantic state
+`backlog` or `ready` are valid destinations. The expected source column,
+current task version, unfinished state, and claim state are guarded in the
+same transaction. Any live claim—including the caller's own—returns `409`
+`task_already_claimed`; stale version or source returns `409` (`stale_task` or
+`conflict`) and does not move the task. A successful move increments the task
+version, returns the normal full Task or `{ "id": "...", "version": N }`
+write-only response, sets the strong task `ETag`, and emits a `task.moved`
+event containing the from/to columns, old/new position, resulting version,
+actor, source, and reason. An idempotent retry replays the original response.
+
 ### Live agent work
 
 `POST /api/v1/tasks/{task}/progress` publishes the current live-work snapshot

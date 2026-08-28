@@ -42,6 +42,7 @@
   } from './lib/types';
   import AgentPulse, { type AgentWorkLike } from './lib/components/AgentPulse.svelte';
   import AgentWorkPanel from './lib/components/AgentWorkPanel.svelte';
+  import AuditReview from './lib/components/AuditReview.svelte';
   import LiveWorkRow from './lib/components/LiveWorkRow.svelte';
   import {
     mergeAuthoritativeTask,
@@ -52,7 +53,7 @@
     type TaskMutationScope
   } from './lib/liveness';
 
-  type View = 'board' | 'issues' | 'my-work' | 'roadmap' | 'settings';
+  type View = 'board' | 'issues' | 'my-work' | 'roadmap' | 'audits' | 'settings';
   type AuthView = 'login' | 'setup';
   type ToastKind = 'success' | 'error' | 'info';
   type CommandChoice = {
@@ -118,6 +119,7 @@
   let view: View = 'board';
   let projects: Project[] = [];
   let activeProjectSlug = '';
+  let auditIdFromRoute = '';
   let recentProjectIds: string[] = [];
   let projectsLoading = false;
   let projectsError = '';
@@ -212,6 +214,7 @@
   let roadmapProjectId: string | undefined;
   let roadmapLoading = false;
   let roadmapError = '';
+  let auditRefreshToken = 0;
 
   let agents: Agent[] = [];
   let agentsLoading = false;
@@ -732,6 +735,7 @@
     issueRequest += 1;
     if (drawerTask) closeDrawer();
     activeProjectSlug = '';
+    auditIdFromRoute = '';
     roadmapProjectId = undefined;
     projects = [];
     columns = [];
@@ -816,6 +820,10 @@
         roadmapProjectId = undefined;
         view = 'settings';
         await loadAgents();
+      } else if (routeSlug && isProjectAuditLocation()) {
+        roadmapProjectId = undefined;
+        auditIdFromRoute = getAuditIdFromLocation();
+        view = 'audits';
       } else if (routeSlug && isProjectRoadmapLocation()) {
         roadmapProjectId = target?.id;
         view = 'roadmap';
@@ -1058,6 +1066,7 @@
     const refreshes: Promise<boolean>[] = [];
     if (view === 'board') refreshes.push(refreshBoardTasks());
     if (view === 'my-work') refreshes.push(refreshMyWorkTasks());
+    if (view === 'audits') auditRefreshToken += 1;
     if (drawerTask) refreshes.push(refreshDrawerTask(drawerTask.id));
     await Promise.all(refreshes).catch(() => undefined);
   }
@@ -1217,6 +1226,15 @@
     return /^\/p\/[^/]+\/roadmap\/?$/.test(window.location.pathname);
   }
 
+  function isProjectAuditLocation(): boolean {
+    return /^\/p\/[^/]+\/audits(?:\/[^/]+)?\/?$/.test(window.location.pathname);
+  }
+
+  function getAuditIdFromLocation(): string {
+    const match = window.location.pathname.match(/^\/p\/[^/]+\/audits\/([^/]+)\/?$/);
+    return match ? decodeURIComponent(match[1]) : '';
+  }
+
   function navigate(path: string, replace = false) {
     if (window.location.pathname !== path) {
       window.history[replace ? 'replaceState' : 'pushState']({}, '', path);
@@ -1227,6 +1245,7 @@
     projectSwitchVersion += 1;
     if (drawerTask) closeDrawer();
     activeProjectSlug = project.slug;
+    auditIdFromRoute = '';
     roadmapProjectId = undefined;
     columns = [];
     tasks = [];
@@ -1256,6 +1275,14 @@
       roadmapProjectId = undefined;
       if (push) navigate('/roadmap');
       await loadRoadmap();
+    } else if (next === 'audits' && activeProject) {
+      roadmapProjectId = undefined;
+      auditIdFromRoute = '';
+      if (push) navigate(`/p/${encodeURIComponent(activeProject.slug)}/audits`);
+      // Audit apply needs the current task/column snapshot. Board data is
+      // already warm in the common path; this guarded read fills it for a
+      // direct project-audit navigation as well.
+      if (!columns.length || !tasks.length) await loadBoard();
     } else if (next === 'settings') {
       if (push) navigate('/settings');
       await loadAgents();
@@ -1269,7 +1296,20 @@
     const slug = getProjectSlugFromLocation();
     if (slug) {
       const project = projects.find((item) => item.slug === slug);
-      if (project && isProjectRoadmapLocation()) {
+      if (project && isProjectAuditLocation()) {
+        const projectChanged = activeProjectSlug !== project.slug;
+        projectSwitchVersion += 1;
+        activeProjectSlug = project.slug;
+        auditIdFromRoute = getAuditIdFromLocation();
+        roadmapProjectId = undefined;
+        view = 'audits';
+        if (projectChanged || !columns.length || !tasks.length) {
+          columns = [];
+          tasks = [];
+          labels = [];
+          void loadBoard();
+        }
+      } else if (project && isProjectRoadmapLocation()) {
         projectSwitchVersion += 1;
         activeProjectSlug = project.slug;
         roadmapProjectId = project.id;
@@ -1416,6 +1456,22 @@
     view = 'roadmap';
     navigate(`/p/${encodeURIComponent(activeProject.slug)}/roadmap`);
     await loadRoadmap(activeProject.id);
+  }
+
+  async function openProjectAudits() {
+    if (!activeProject) return;
+    auditIdFromRoute = '';
+    roadmapProjectId = undefined;
+    view = 'audits';
+    navigate(`/p/${encodeURIComponent(activeProject.slug)}/audits`);
+    if (!columns.length || !tasks.length) await loadBoard();
+  }
+
+  function navigateAudit(path: string) {
+    const match = path.match(/^\/p\/[^/]+\/audits(?:\/([^/]+))?\/?$/);
+    auditIdFromRoute = match?.[1] ? decodeURIComponent(match[1]) : '';
+    view = 'audits';
+    navigate(path);
   }
 
   function openProjectModal() {
@@ -2477,7 +2533,7 @@
           {#if activeProject}
             <section class="page-heading board-heading">
               <div><div class="breadcrumbs"><span>Workspace</span><span>/</span><span>{activeProject.key}</span></div><div class="heading-title-row"><span class="heading-project-dot" style={`--project-color: ${activeProject.color || '#6d5efc'}`}></span><h1>{activeProject.name}</h1><button class="icon-button favorite-heading" class:starred={activeProject.favorite} type="button" aria-label={activeProject.favorite ? 'Remove from favorites' : 'Add to favorites'} on:click={(event) => toggleFavorite(event, activeProject)}>{activeProject.favorite ? '★' : '☆'}</button></div><p>{activeProject.description || 'A focused space for turning ideas into shipped work.'}</p></div>
-              <div class="heading-actions"><button class="button quiet-button" type="button" on:click={openProjectRoadmap}><span aria-hidden="true">◒</span> Progress</button><button class="button quiet-button" type="button" data-report-bug-trigger on:click={openBugModal}><span aria-hidden="true">⚠</span> Report bug</button><button class="button primary" type="button" data-task-modal-trigger on:click={openTaskModal}><span aria-hidden="true">＋</span> New task</button></div>
+              <div class="heading-actions"><button class="button quiet-button" type="button" on:click={openProjectRoadmap}><span aria-hidden="true">◒</span> Progress</button><button class="button quiet-button" type="button" on:click={openProjectAudits}><span aria-hidden="true">◎</span> Audits</button><button class="button quiet-button" type="button" data-report-bug-trigger on:click={openBugModal}><span aria-hidden="true">⚠</span> Report bug</button><button class="button primary" type="button" data-task-modal-trigger on:click={openTaskModal}><span aria-hidden="true">＋</span> New task</button></div>
             </section>
 
             <section class="board-toolbar" aria-label="Board filters">
@@ -2527,6 +2583,22 @@
             {/if}
           {:else}
             <div class="empty-state welcome-state"><div class="welcome-orbit"><span>R</span></div><span class="eyebrow">Your workspace is ready</span><h1>Start with a project.</h1><p>Projects give your ideas a home. Create one, invite your agents, and keep the next step clear.</p><button class="button primary button-large" type="button" on:click={openProjectModal}>＋ Create your first project</button></div>
+          {/if}
+        {:else if view === 'audits'}
+          {#if activeProject}
+            <AuditReview
+              project={activeProject}
+              {columns}
+              {tasks}
+              initialAuditId={auditIdFromRoute}
+              {sessionGeneration}
+              refreshToken={auditRefreshToken}
+              onNavigate={navigateAudit}
+              onNotice={toast}
+              onTaskUpdated={(updated) => replaceTask(updated, true)}
+            />
+          {:else}
+            <div class="empty-state welcome-state"><div class="welcome-orbit"><span>R</span></div><span class="eyebrow">Choose a project</span><h1>Audits live with a board.</h1><p>Select a project first, then review its captured board audits.</p><button class="button primary button-large" type="button" on:click={() => setView('board')}>Browse projects</button></div>
           {/if}
         {:else if view === 'issues'}
           <section class="page-heading issues-heading">

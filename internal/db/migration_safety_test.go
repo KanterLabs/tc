@@ -8,6 +8,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"testing"
 
 	_ "modernc.org/sqlite"
@@ -18,8 +19,8 @@ func TestEmbeddedSchemaIdentityIsStable(t *testing.T) {
 	if err != nil {
 		t.Fatalf("embedded schema: %v", err)
 	}
-	if version < 8 {
-		t.Fatalf("latest schema version = %d, want at least 8", version)
+	if version < 10 {
+		t.Fatalf("latest schema version = %d, want at least 10", version)
 	}
 	if len(digest) != 64 {
 		t.Fatalf("migration digest length = %d, want 64", len(digest))
@@ -51,6 +52,7 @@ func TestMigrationVersionValidation(t *testing.T) {
 	}{
 		{name: "001_init.sql", want: 1},
 		{name: "009_additive_change.sql", want: 9},
+		{name: "010_board_audits.sql", want: 10},
 	} {
 		if got, err := migrationVersion(test.name); err != nil || got != test.want {
 			t.Errorf("migrationVersion(%q) = %d, %v; want %d", test.name, got, err, test.want)
@@ -75,6 +77,7 @@ func TestProductionShapedPrefixesMigrateWithoutChangingStableData(t *testing.T) 
 			applyMigrationPrefix(t, ctx, database, migrations, prefix)
 			populateProductionFixture(t, ctx, database, prefix)
 			before := readStableFixture(t, ctx, database, prefix)
+			beforeAudits := readAuditFixture(t, ctx, database)
 			if err := Migrate(ctx, database); err != nil {
 				database.Close()
 				t.Fatalf("migrate prefix %d: %v", prefix, err)
@@ -95,6 +98,13 @@ func TestProductionShapedPrefixesMigrateWithoutChangingStableData(t *testing.T) 
 			if got := after.counts["events"]; got != 1 {
 				t.Fatalf("event count = %d, want 1", got)
 			}
+			afterAudits := readAuditFixture(t, ctx, database)
+			if afterAudits.runs == "<absent>" || afterAudits.findings == "<absent>" {
+				t.Fatalf("migration %d did not create audit tables: %#v", prefix, afterAudits)
+			}
+			if prefix >= 10 && !reflect.DeepEqual(beforeAudits, afterAudits) {
+				t.Fatalf("audit fixture changed during migration %d:\nbefore=%#v\nafter=%#v", prefix, beforeAudits, afterAudits)
+			}
 			inspection, err := InspectSchema(ctx, database)
 			if err != nil {
 				t.Fatalf("inspect migrated schema: %v", err)
@@ -111,11 +121,81 @@ func TestProductionShapedPrefixesMigrateWithoutChangingStableData(t *testing.T) 
 				t.Fatalf("rerun migration: %v", err)
 			}
 			afterRerun := readStableFixture(t, ctx, database, latest)
-			if afterRerun.counts["schema_migrations"] != appliedBefore || !reflect.DeepEqual(after.stable, afterRerun.stable) {
+			afterRerunAudits := readAuditFixture(t, ctx, database)
+			if afterRerun.counts["schema_migrations"] != appliedBefore || !reflect.DeepEqual(after.stable, afterRerun.stable) || !reflect.DeepEqual(afterAudits, afterRerunAudits) {
 				t.Fatalf("rerun changed migration/data state: before=%#v after=%#v", after, afterRerun)
 			}
 		})
 	}
+}
+
+func TestInspectSchemaReportsLatestPendingAndUnknownVersions(t *testing.T) {
+	ctx := context.Background()
+	latest, _, err := EmbeddedSchema()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if latest < 10 {
+		t.Fatalf("latest schema version = %d, want schema 10", latest)
+	}
+
+	t.Run("latest", func(t *testing.T) {
+		database := newRawDatabase(t)
+		if err := Migrate(ctx, database); err != nil {
+			t.Fatalf("migrate latest schema: %v", err)
+		}
+		inspection, err := InspectSchema(ctx, database)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if inspection.SchemaVersion != latest || !reflect.DeepEqual(inspection.AppliedVersions, versionsThrough(latest)) || len(inspection.PendingVersions) != 0 || len(inspection.UnknownVersions) != 0 {
+			t.Fatalf("latest schema inspection = %#v", inspection)
+		}
+	})
+
+	t.Run("pending", func(t *testing.T) {
+		database := newRawDatabase(t)
+		migrations, err := embeddedMigrations()
+		if err != nil {
+			t.Fatal(err)
+		}
+		applyMigrationPrefix(t, ctx, database, migrations, latest-1)
+		inspection, err := InspectSchema(ctx, database)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if inspection.SchemaVersion != latest-1 || !reflect.DeepEqual(inspection.AppliedVersions, versionsThrough(latest-1)) || !reflect.DeepEqual(inspection.PendingVersions, []int{latest}) || len(inspection.UnknownVersions) != 0 {
+			t.Fatalf("pending schema inspection = %#v", inspection)
+		}
+	})
+
+	t.Run("unknown", func(t *testing.T) {
+		database := newRawDatabase(t)
+		migrations, err := embeddedMigrations()
+		if err != nil {
+			t.Fatal(err)
+		}
+		applyMigrationPrefix(t, ctx, database, migrations, latest)
+		const unknownVersion = 999
+		if _, err := database.ExecContext(ctx, `INSERT INTO schema_migrations(version, applied_at) VALUES (?, 'future')`, unknownVersion); err != nil {
+			t.Fatal(err)
+		}
+		inspection, err := InspectSchema(ctx, database)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if inspection.SchemaVersion != unknownVersion || !reflect.DeepEqual(inspection.AppliedVersions, append(versionsThrough(latest), unknownVersion)) || len(inspection.PendingVersions) != 0 || !reflect.DeepEqual(inspection.UnknownVersions, []int{unknownVersion}) {
+			t.Fatalf("unknown schema inspection = %#v", inspection)
+		}
+	})
+}
+
+func versionsThrough(latest int) []int {
+	versions := make([]int, latest)
+	for index := range versions {
+		versions[index] = index + 1
+	}
+	return versions
 }
 
 func TestMigrateLeavesUnknownNewerVersionForRollbackCompatibility(t *testing.T) {
@@ -207,14 +287,14 @@ func TestPre009QueriesAndPostUpgradeWritesSurviveBinaryOnlyRollback(t *testing.T
 	}
 }
 
-func TestRetainedBinaryProcessAgainstSchema9(t *testing.T) {
+func TestRetainedBinaryProcessAgainstSchema10(t *testing.T) {
 	ctx := context.Background()
 	migrations, err := embeddedMigrations()
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(migrations) < 9 {
-		t.Skip("migration 009 is not present")
+	if len(migrations) < 10 {
+		t.Skip("migration 010 is not present")
 	}
 	dir := t.TempDir()
 	path := filepath.Join(dir, "roadmap.db")
@@ -225,10 +305,19 @@ func TestRetainedBinaryProcessAgainstSchema9(t *testing.T) {
 	applyMigrationPrefix(t, ctx, database, migrations, 8)
 	populateProductionFixture(t, ctx, database, 8)
 	if err := Migrate(ctx, database); err != nil {
-		t.Fatalf("upgrade to schema 9: %v", err)
+		t.Fatalf("upgrade to schema 10: %v", err)
 	}
 	if _, err := database.ExecContext(ctx, `INSERT INTO task_agent_work(task_id, operation_id, actor_id, state, phase, summary, next_action, checkpoint_refs, started_at, updated_at) VALUES ('task-1', 'retained-run', 'agent', 'working', 'old binary', 'Existing pulse', 'Keep going', '[]', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')`); err != nil {
 		t.Fatal(err)
+	}
+	populateAuditFixture(t, ctx, database)
+	beforeAudits := readAuditFixture(t, ctx, database)
+	inspection, err := InspectSchema(ctx, database)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if inspection.SchemaVersion != 10 || len(inspection.PendingVersions) != 0 || len(inspection.UnknownVersions) != 0 {
+		t.Fatalf("upgraded schema inspection = %#v", inspection)
 	}
 	if err := database.Close(); err != nil {
 		t.Fatal(err)
@@ -260,7 +349,272 @@ func TestRetainedBinaryProcessAgainstSchema9(t *testing.T) {
 	if operationID != "retained-run" {
 		t.Fatalf("post-upgrade agent work row changed by retained process: %q", operationID)
 	}
+	afterAudits := readAuditFixture(t, ctx, retained)
+	if !reflect.DeepEqual(beforeAudits, afterAudits) {
+		t.Fatalf("retained process changed audit rows:\nbefore=%#v\nafter=%#v", beforeAudits, afterAudits)
+	}
+	inspection, err = InspectSchema(ctx, retained)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if inspection.SchemaVersion != 10 || len(inspection.PendingVersions) != 0 || len(inspection.UnknownVersions) != 0 {
+		t.Fatalf("retained process changed schema inspection = %#v", inspection)
+	}
+	if err := CheckIntegrity(ctx, retained); err != nil {
+		t.Fatalf("retained process integrity: %v", err)
+	}
 }
+
+func TestSchema10AuditDDLIntegrityAndConstraintRejections(t *testing.T) {
+	ctx := context.Background()
+	migrations, err := embeddedMigrations()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(migrations) < 10 {
+		t.Skip("migration 010 is not present")
+	}
+	database := newRawDatabase(t)
+	applyMigrationPrefix(t, ctx, database, migrations, len(migrations))
+	populateProductionFixture(t, ctx, database, 10)
+
+	for _, table := range []string{"audit_runs", "audit_findings"} {
+		var count int
+		if err := database.QueryRowContext(ctx, `SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?`, table).Scan(&count); err != nil {
+			t.Fatal(err)
+		}
+		if count != 1 {
+			t.Fatalf("audit table %q count = %d, want 1", table, count)
+		}
+	}
+	for _, index := range []string{
+		"audit_runs_project_started_idx",
+		"audit_runs_actor_started_idx",
+		"audit_findings_audit_created_idx",
+		"audit_findings_task_idx",
+		"audit_findings_verdict_idx",
+	} {
+		var count int
+		if err := database.QueryRowContext(ctx, `SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name=?`, index).Scan(&count); err != nil {
+			t.Fatal(err)
+		}
+		if count != 1 {
+			t.Fatalf("audit index %q count = %d, want 1", index, count)
+		}
+	}
+	if err := CheckIntegrity(ctx, database); err != nil {
+		t.Fatalf("populated audit schema integrity: %v", err)
+	}
+
+	if _, err := database.ExecContext(ctx, `INSERT INTO audit_runs(id, project_id, actor_id, scope, started_at, created_at, updated_at) VALUES ('audit-default', 'project', 'owner', 'default values', '2026-01-02T00:00:00Z', '2026-01-02T00:00:00Z', '2026-01-02T00:00:00Z')`); err != nil {
+		t.Fatalf("insert audit run with defaults: %v", err)
+	}
+	var status string
+	if err := database.QueryRowContext(ctx, `SELECT status FROM audit_runs WHERE id='audit-default'`).Scan(&status); err != nil || status != "running" {
+		t.Fatalf("audit run default status = %q, %v; want running", status, err)
+	}
+	if _, err := database.ExecContext(ctx, `INSERT INTO audit_findings(id, audit_id, task_id, captured_version, source_column, verdict, confidence, reason, created_at, updated_at) VALUES ('finding-default', 'audit-default', 'task-1', 3, 'todo', 'correct', 1, 'No issue', '2026-01-02T00:00:00Z', '2026-01-02T00:00:00Z')`); err != nil {
+		t.Fatalf("insert audit finding with defaults: %v", err)
+	}
+	var evidenceRefs, reviewState string
+	var findingVersion int
+	if err := database.QueryRowContext(ctx, `SELECT evidence_refs, review_state, version FROM audit_findings WHERE id='finding-default'`).Scan(&evidenceRefs, &reviewState, &findingVersion); err != nil {
+		t.Fatal(err)
+	}
+	if evidenceRefs != "[]" || reviewState != "pending" || findingVersion != 1 {
+		t.Fatalf("audit finding defaults = %q/%q/%d; want []/pending/1", evidenceRefs, reviewState, findingVersion)
+	}
+
+	auditRunCases := []struct {
+		name  string
+		query string
+		args  []any
+	}{
+		{
+			name:  "project foreign key",
+			query: `INSERT INTO audit_runs(id, project_id, actor_id, scope, started_at, created_at, updated_at) VALUES (?, 'missing-project', 'owner', 'scope', '2026-01-02T00:00:00Z', '2026-01-02T00:00:00Z', '2026-01-02T00:00:00Z')`,
+			args:  []any{"audit-bad-project"},
+		},
+		{
+			name:  "actor foreign key",
+			query: `INSERT INTO audit_runs(id, project_id, actor_id, scope, started_at, created_at, updated_at) VALUES (?, 'project', 'missing-actor', 'scope', '2026-01-02T00:00:00Z', '2026-01-02T00:00:00Z', '2026-01-02T00:00:00Z')`,
+			args:  []any{"audit-bad-actor"},
+		},
+		{
+			name:  "empty scope",
+			query: `INSERT INTO audit_runs(id, project_id, actor_id, scope, started_at, created_at, updated_at) VALUES (?, 'project', 'owner', ?, '2026-01-02T00:00:00Z', '2026-01-02T00:00:00Z', '2026-01-02T00:00:00Z')`,
+			args:  []any{"audit-bad-scope-empty", "  "},
+		},
+		{
+			name:  "scope too long",
+			query: `INSERT INTO audit_runs(id, project_id, actor_id, scope, started_at, created_at, updated_at) VALUES (?, 'project', 'owner', ?, '2026-01-02T00:00:00Z', '2026-01-02T00:00:00Z', '2026-01-02T00:00:00Z')`,
+			args:  []any{"audit-bad-scope-long", strings.Repeat("s", 201)},
+		},
+		{
+			name:  "status enum",
+			query: `INSERT INTO audit_runs(id, project_id, actor_id, scope, status, started_at, created_at, updated_at) VALUES (?, 'project', 'owner', 'scope', 'unknown', '2026-01-02T00:00:00Z', '2026-01-02T00:00:00Z', '2026-01-02T00:00:00Z')`,
+			args:  []any{"audit-bad-status"},
+		},
+		{
+			name:  "finalized running run",
+			query: `INSERT INTO audit_runs(id, project_id, actor_id, scope, finalized_at, started_at, created_at, updated_at) VALUES (?, 'project', 'owner', 'scope', '2026-01-02T01:00:00Z', '2026-01-02T00:00:00Z', '2026-01-02T00:00:00Z', '2026-01-02T00:00:00Z')`,
+			args:  []any{"audit-bad-finalized"},
+		},
+		{
+			name:  "terminal run missing finalized timestamp",
+			query: `INSERT INTO audit_runs(id, project_id, actor_id, scope, status, started_at, created_at, updated_at) VALUES (?, 'project', 'owner', 'scope', 'complete', '2026-01-02T00:00:00Z', '2026-01-02T00:00:00Z', '2026-01-02T00:00:00Z')`,
+			args:  []any{"audit-bad-terminal-timestamp"},
+		},
+	}
+	for _, test := range auditRunCases {
+		t.Run("audit_runs/"+test.name, func(t *testing.T) {
+			if _, err := database.ExecContext(ctx, test.query, test.args...); err == nil {
+				t.Fatalf("invalid audit run unexpectedly succeeded")
+			}
+		})
+	}
+
+	longSourceColumn := strings.Repeat("c", 201)
+	longReason := strings.Repeat("r", 2001)
+	longReviewState := strings.Repeat("v", 33)
+	auditFindingCases := []struct {
+		name  string
+		query string
+		args  []any
+	}{
+		{
+			name:  "audit foreign key",
+			query: validAuditFindingInsert,
+			args:  []any{"finding-bad-audit", "missing-audit", "task-1", 3, "todo", "correct", nil, 0.5, "reason", "[]", "pending", 1},
+		},
+		{
+			name:  "task foreign key",
+			query: validAuditFindingInsert,
+			args:  []any{"finding-bad-task", "audit-1", "missing-task", 3, "todo", "correct", nil, 0.5, "reason", "[]", "pending", 1},
+		},
+		{
+			name:  "captured version positive",
+			query: validAuditFindingInsert,
+			args:  []any{"finding-bad-captured-version", "audit-1", "task-1", 0, "todo", "correct", nil, 0.5, "reason", "[]", "pending", 1},
+		},
+		{
+			name:  "source column nonempty",
+			query: validAuditFindingInsert,
+			args:  []any{"finding-bad-source-empty", "audit-1", "task-1", 3, " ", "correct", nil, 0.5, "reason", "[]", "pending", 1},
+		},
+		{
+			name:  "source column length",
+			query: validAuditFindingInsert,
+			args:  []any{"finding-bad-source-long", "audit-1", "task-1", 3, longSourceColumn, "correct", nil, 0.5, "reason", "[]", "pending", 1},
+		},
+		{
+			name:  "verdict enum",
+			query: validAuditFindingInsert,
+			args:  []any{"finding-bad-verdict", "audit-1", "task-1", 3, "todo", "wrong", nil, 0.5, "reason", "[]", "pending", 1},
+		},
+		{
+			name:  "destination enum",
+			query: validAuditFindingInsert,
+			args:  []any{"finding-bad-destination", "audit-1", "task-1", 3, "todo", "move_proposed", "invalid", 0.5, "reason", "[]", "pending", 1},
+		},
+		{
+			name:  "confidence lower bound",
+			query: validAuditFindingInsert,
+			args:  []any{"finding-bad-confidence-low", "audit-1", "task-1", 3, "todo", "correct", nil, -0.01, "reason", "[]", "pending", 1},
+		},
+		{
+			name:  "confidence upper bound",
+			query: validAuditFindingInsert,
+			args:  []any{"finding-bad-confidence-high", "audit-1", "task-1", 3, "todo", "correct", nil, 1.01, "reason", "[]", "pending", 1},
+		},
+		{
+			name:  "reason nonempty",
+			query: validAuditFindingInsert,
+			args:  []any{"finding-bad-reason-empty", "audit-1", "task-1", 3, "todo", "correct", nil, 0.5, " ", "[]", "pending", 1},
+		},
+		{
+			name:  "reason length",
+			query: validAuditFindingInsert,
+			args:  []any{"finding-bad-reason-long", "audit-1", "task-1", 3, "todo", "correct", nil, 0.5, longReason, "[]", "pending", 1},
+		},
+		{
+			name:  "evidence refs JSON",
+			query: validAuditFindingInsert,
+			args:  []any{"finding-bad-evidence-json", "audit-1", "task-1", 3, "todo", "correct", nil, 0.5, "reason", "not-json", "pending", 1},
+		},
+		{
+			name:  "evidence refs array",
+			query: validAuditFindingInsert,
+			args:  []any{"finding-bad-evidence-object", "audit-1", "task-1", 3, "todo", "correct", nil, 0.5, "reason", "{}", "pending", 1},
+		},
+		{
+			name:  "review state nonempty",
+			query: validAuditFindingInsert,
+			args:  []any{"finding-bad-review-empty", "audit-1", "task-1", 3, "todo", "correct", nil, 0.5, "reason", "[]", " ", 1},
+		},
+		{
+			name:  "review state length",
+			query: validAuditFindingInsert,
+			args:  []any{"finding-bad-review-long", "audit-1", "task-1", 3, "todo", "correct", nil, 0.5, "reason", "[]", longReviewState, 1},
+		},
+		{
+			name:  "review state enum",
+			query: validAuditFindingInsert,
+			args:  []any{"finding-bad-review-enum", "audit-1", "task-1", 3, "todo", "correct", nil, 0.5, "reason", "[]", "reviewed", 1},
+		},
+		{
+			name:  "finding version positive",
+			query: validAuditFindingInsert,
+			args:  []any{"finding-bad-version", "audit-1", "task-1", 3, "todo", "correct", nil, 0.5, "reason", "[]", "pending", 0},
+		},
+		{
+			name:  "audit task unique",
+			query: validAuditFindingInsert,
+			args:  []any{"finding-duplicate", "audit-1", "task-1", 3, "todo", "correct", nil, 0.5, "reason", "[]", "pending", 1},
+		},
+	}
+	for _, test := range auditFindingCases {
+		t.Run("audit_findings/"+test.name, func(t *testing.T) {
+			if _, err := database.ExecContext(ctx, test.query, test.args...); err == nil {
+				t.Fatalf("invalid audit finding unexpectedly succeeded")
+			}
+		})
+	}
+
+	if _, err := database.ExecContext(ctx, `DELETE FROM audit_runs WHERE id='audit-default'`); err != nil {
+		t.Fatalf("delete audit run for cascade test: %v", err)
+	}
+	var findings int
+	if err := database.QueryRowContext(ctx, `SELECT COUNT(*) FROM audit_findings WHERE audit_id='audit-default'`).Scan(&findings); err != nil {
+		t.Fatal(err)
+	}
+	if findings != 0 {
+		t.Fatalf("audit finding cascade count = %d, want 0", findings)
+	}
+	if _, err := database.ExecContext(ctx, `INSERT INTO actors(id, kind, name, email, password_hash, admin, created_at, updated_at) VALUES ('audit-actor', 'agent', 'Audit actor', 'audit-actor@example.test', 'hash', 0, '2026-01-02T00:00:00Z', '2026-01-02T00:00:00Z')`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := database.ExecContext(ctx, `INSERT INTO audit_runs(id, project_id, actor_id, scope, started_at, created_at, updated_at) VALUES ('audit-restrict-actor', 'project', 'audit-actor', 'scope', '2026-01-02T00:00:00Z', '2026-01-02T00:00:00Z', '2026-01-02T00:00:00Z')`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := database.ExecContext(ctx, `DELETE FROM actors WHERE id='audit-actor'`); err == nil {
+		t.Fatal("actor referenced by audit run was deleted")
+	}
+	if _, err := database.ExecContext(ctx, `INSERT INTO tasks(id, project_id, number, column_id, kind, title, description, priority, position, version, created_at, updated_at) VALUES ('audit-task', 'project', 99, 'todo', 'task', 'Audit task', '', 'normal', 99, 1, '2026-01-02T00:00:00Z', '2026-01-02T00:00:00Z')`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := database.ExecContext(ctx, validAuditFindingInsert, "finding-restrict-task", "audit-1", "audit-task", 1, "todo", "correct", nil, 1.0, "retained", "[]", "pending", 1); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := database.ExecContext(ctx, `DELETE FROM tasks WHERE id='audit-task'`); err == nil {
+		t.Fatal("task referenced by audit finding was deleted")
+	}
+	if err := CheckIntegrity(ctx, database); err != nil {
+		t.Fatalf("audit schema integrity after constraint checks: %v", err)
+	}
+}
+
+const validAuditFindingInsert = `INSERT INTO audit_findings(id, audit_id, task_id, captured_version, source_column, verdict, proposed_semantic_destination, confidence, reason, evidence_refs, review_state, version, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '2026-01-02T00:00:00Z', '2026-01-02T00:00:00Z')`
 
 const retainedBinarySource = `package main
 
@@ -425,6 +779,11 @@ type stableFixture struct {
 	counts map[string]int
 }
 
+type auditFixture struct {
+	runs     string
+	findings string
+}
+
 func newRawDatabase(t *testing.T) *sql.DB {
 	t.Helper()
 	path := filepath.Join(t.TempDir(), "roadmap.db")
@@ -503,6 +862,19 @@ func populateProductionFixture(t *testing.T, ctx context.Context, database *sql.
 	if prefix >= 3 {
 		exec(`INSERT OR REPLACE INTO project_counters(project_id, next_number) VALUES ('project', 3)`)
 	}
+	if prefix >= 10 {
+		populateAuditFixture(t, ctx, database)
+	}
+}
+
+func populateAuditFixture(t *testing.T, ctx context.Context, database *sql.DB) {
+	t.Helper()
+	if _, err := database.ExecContext(ctx, `INSERT INTO audit_runs(id, project_id, actor_id, scope, status, started_at, finalized_at, created_at, updated_at) VALUES ('audit-1', 'project', 'owner', 'board', 'complete', '2026-01-01T00:00:00Z', '2026-01-01T00:05:00Z', '2026-01-01T00:00:00Z', '2026-01-01T00:05:00Z')`); err != nil {
+		t.Fatalf("populate audit run: %v", err)
+	}
+	if _, err := database.ExecContext(ctx, `INSERT INTO audit_findings(id, audit_id, task_id, captured_version, source_column, verdict, proposed_semantic_destination, confidence, reason, evidence_refs, review_state, version, created_at, updated_at) VALUES ('finding-1', 'audit-1', 'task-1', 3, 'todo', 'move_proposed', 'active', 0.87, 'Task belongs in active work', '["event-1"]', 'pending', 2, '2026-01-01T00:01:00Z', '2026-01-01T00:01:00Z')`); err != nil {
+		t.Fatalf("populate audit finding: %v", err)
+	}
 }
 
 func assertMigratedAdditiveValues(t *testing.T, ctx context.Context, database *sql.DB, prefix int) {
@@ -578,6 +950,30 @@ func readStableFixture(t *testing.T, ctx context.Context, database *sql.DB, sche
 	// prefix/latest distinction explicit at the call site.
 	_ = schemaVersion
 	return stableFixture{stable: stable, counts: counts}
+}
+
+func readAuditFixture(t *testing.T, ctx context.Context, database *sql.DB) auditFixture {
+	t.Helper()
+	fixture := auditFixture{}
+	queries := map[string]*string{
+		"runs":     &fixture.runs,
+		"findings": &fixture.findings,
+	}
+	statements := map[string]string{
+		"runs":     `SELECT group_concat(value, '|') FROM (SELECT id || ':' || project_id || ':' || actor_id || ':' || scope || ':' || status || ':' || started_at || ':' || COALESCE(finalized_at, '') || ':' || created_at || ':' || updated_at AS value FROM audit_runs ORDER BY id)`,
+		"findings": `SELECT group_concat(value, '|') FROM (SELECT id || ':' || audit_id || ':' || task_id || ':' || captured_version || ':' || source_column || ':' || verdict || ':' || COALESCE(proposed_semantic_destination, '') || ':' || confidence || ':' || reason || ':' || evidence_refs || ':' || review_state || ':' || version || ':' || created_at || ':' || updated_at AS value FROM audit_findings ORDER BY id)`,
+	}
+	for name, destination := range queries {
+		var value sql.NullString
+		if err := database.QueryRowContext(ctx, statements[name]).Scan(&value); err != nil {
+			*destination = "<absent>"
+			continue
+		}
+		if value.Valid {
+			*destination = value.String
+		}
+	}
+	return fixture
 }
 
 func containsInt(values []int, wanted int) bool {

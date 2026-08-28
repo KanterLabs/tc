@@ -29,6 +29,8 @@ Trello-compatible API or a full team-suite replacement.
 - Coordinate safely through atomic leased claims, renew/release/complete/block
   actions, bug triage/resolve/reopen actions, optimistic versions
   (`ETag`/`If-Match`), idempotency keys, and a cursor-based event feed.
+- Capture read-only board audits, review immutable findings, and explicitly
+  preview and apply guarded recommendations without moving work implicitly.
 - Create agents and issue project-scoped bearer tokens with independently
   selected read, write, claim, and event scopes.
 - Keep the live view current through bounded polling. The responsive browser
@@ -184,6 +186,30 @@ task collections with `agent_state` or `action_needed=true`, and use
 `/api/v1/my-work?view=live` for the Live Work view. Unscoped human identities
 may see live work across their visible projects; a project-scoped bearer token
 must include a permitted `project` query value.
+
+Board-audit workflow:
+
+1. List or start a project audit with `GET|POST
+   /api/v1/projects/{project}/audits`. Audit reads require `tasks:read`; audit
+   writes require `tasks:write`. Starting a run only captures audit metadata.
+2. Read the bounded run summary and cursor-paginated findings with
+   `GET /api/v1/audits/{audit}` and `GET
+   /api/v1/audits/{audit}/findings`. The summary's `findings` array is always
+   empty, and findings expose `changed_since_audit` drift.
+3. Review a finding with `PATCH /api/v1/audit-findings/{finding}` using its
+   `If-Match` ETag. Approval, dismissal, finalization, and all audit reads are
+   task read/review operations; none moves a task.
+4. After a separate read-only preview and explicit confirmation, call
+   `POST /api/v1/tasks/{task}/move` with the current task `If-Match`, expected
+   source column, provenance, and an `Idempotency-Key`. Only backlog and ready
+   destinations are allowed, active claims reject the move, the server
+   computes position atomically, and success emits `task.moved`. See
+   [`docs/API_CONTRACT.md`](docs/API_CONTRACT.md) for exact finding, review,
+   and move request fields and aliases.
+
+The UI's Run audit action creates a queued run for an agent. The bundled
+TC Roadmap skill processes that same run with `submit --audit AUDIT_ID`, so a
+UI request is not duplicated before its findings are finalized for review.
 
 ```sh
 # Contract and liveness checks

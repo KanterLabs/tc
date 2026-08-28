@@ -344,6 +344,484 @@ class CommandTests(unittest.TestCase):
             self.assertEqual(result["operation_id"], "heartbeat-1")
             self.assertIsNotNone(store.load().last_heartbeat_at)  # type: ignore[union-attr]
 
+    def test_audit_parser_supports_default_and_repeatable_semantic_states(self) -> None:
+        default = helper.build_parser().parse_args(["audit", "--project", "TC"])
+        self.assertIsNone(default.states)
+        self.assertEqual(default.page_size, 200)
+        self.assertEqual(default.evidence_limit, helper.AUDIT_MAX_EVIDENCE_ITEMS)
+
+        selected = helper.build_parser().parse_args(
+            [
+                "audit",
+                "--project",
+                "TC",
+                "--state",
+                "ready",
+                "--semantic-state",
+                "blocked",
+                "--limit",
+                "2",
+                "--evidence-limit",
+                "1",
+            ]
+        )
+        self.assertEqual(selected.states, ["ready", "blocked"])
+        self.assertEqual(selected.page_size, 2)
+        self.assertEqual(selected.evidence_limit, 1)
+
+    def test_audit_follows_every_task_page_and_uses_get_only(self) -> None:
+        calls: list[tuple[str, str, dict[str, object]]] = []
+        backlog_one = {"id": "backlog-1", "key": "TC-1", "column_id": "column-backlog", "version": 3, "title": "One", "description": "Goal: one", "priority": "normal"}
+        backlog_two = {"id": "backlog-2", "key": "TC-2", "column_id": "column-backlog", "version": 4, "title": "Two", "description": "Goal: two", "priority": "high"}
+        active = {"id": "active-1", "key": "TC-3", "column_id": "column-active", "version": 5, "title": "Three", "description": "Goal: three", "priority": "urgent"}
+
+        class StubClient:
+            def call(self, method: str, path: str, **kwargs):  # type: ignore[no-untyped-def]
+                calls.append((method, path, kwargs))
+                if path == "/projects?limit=200":
+                    return {"data": [{"id": "project-1", "key": "TC"}]}, {}
+                if path == "/projects/project-1/columns?limit=1":
+                    return {
+                        "data": [
+                            {"id": "column-backlog", "project_id": "project-1", "name": "Backlog", "semantic_state": "backlog"},
+                            {"id": "column-active", "project_id": "project-1", "name": "In Progress", "semantic_state": "active"},
+                        ]
+                    }, {}
+                if "state=backlog" in path and "cursor=" not in path:
+                    return {"data": [backlog_one], "next_cursor": "backlog-page-2"}, {}
+                if "state=backlog" in path and "cursor=backlog-page-2" in path:
+                    return {"data": [backlog_two], "next_cursor": ""}, {}
+                if "state=active" in path:
+                    return {"data": [active], "next_cursor": ""}, {}
+                if path.startswith("/tasks/") and "/comments" in path:
+                    return {"data": [], "next_cursor": ""}, {}
+                raise AssertionError(f"unexpected audit path: {path}")
+
+        result = helper.cmd_audit(
+            StubClient(), argparse.Namespace(project="TC", states=None, page_size=1, evidence_limit=0)  # type: ignore[arg-type]
+        )
+        self.assertEqual([item["key"] for item in result["tasks"]], ["TC-1", "TC-2", "TC-3"])
+        self.assertEqual(result["states"], ["backlog", "active"])
+        self.assertTrue(result["read_only"])
+        self.assertTrue(any("cursor=backlog-page-2" in path for _, path, _ in calls))
+        self.assertTrue(calls)
+        self.assertTrue(all(method == "GET" for method, _path, _kwargs in calls))
+
+    def test_audit_redacts_and_bounds_task_and_comment_evidence(self) -> None:
+        calls: list[str] = []
+        secret = "super-secret-token-value"
+        task = {
+            "id": "task-1",
+            "key": "TC-1",
+            "column_id": "column-active",
+            "version": 9,
+            "title": "Inspect credentials",
+            "description": "Goal: Bearer " + secret + "\n\nAcceptance criteria\n- [ ] password=" + secret + "\n" + ("x" * 5000),
+            "priority": "normal",
+            "agent_work": {
+                "operation_id": "audit-1",
+                "actor_id": "agent-1",
+                "state": "working",
+                "summary": "Authorization: Bearer " + secret,
+                "updated_at": "2026-01-01T00:00:00Z",
+                "stale": True,
+                "checkpoint_refs": ["safe-ref"],
+            },
+        }
+        comments = [
+            {"id": f"comment-{index}", "actor_id": "agent-1", "created_at": f"2026-01-01T00:00:{index:02d}Z", "body": secret if index == 6 else f"evidence {index}"}
+            for index in range(7)
+        ]
+
+        class StubClient:
+            def call(self, method: str, path: str, **kwargs):  # type: ignore[no-untyped-def]
+                if method != "GET":
+                    raise AssertionError(f"audit used non-GET method: {method}")
+                calls.append(path)
+                if path == "/projects?limit=200":
+                    return {"data": [{"id": "project-1", "key": "TC"}]}, {}
+                if path == "/projects/project-1/columns?limit=2":
+                    return {"data": [{"id": "column-active", "project_id": "project-1", "name": "In Progress", "semantic_state": "active"}]}, {}
+                if "state=backlog" in path:
+                    return {"data": [], "next_cursor": ""}, {}
+                if "state=active" in path:
+                    return {"data": [task], "next_cursor": ""}, {}
+                if path.startswith("/tasks/task-1/comments?limit=2") and "cursor=" not in path:
+                    return {"data": comments[:2], "next_cursor": "comment-page-2"}, {}
+                if "cursor=comment-page-2" in path:
+                    return {"data": comments[2:4], "next_cursor": "comment-page-3"}, {}
+                if "cursor=comment-page-3" in path:
+                    return {"data": comments[4:], "next_cursor": ""}, {}
+                raise AssertionError(f"unexpected audit path: {path}")
+
+        result = helper.cmd_audit(
+            StubClient(), argparse.Namespace(project="TC", states=None, page_size=2, evidence_limit=2)  # type: ignore[arg-type]
+        )
+        audited = result["tasks"][0]
+        encoded = json.dumps(audited)
+        self.assertNotIn(secret, encoded)
+        self.assertNotIn("Authorization", encoded)
+        self.assertLessEqual(len(audited["evidence"]), helper.AUDIT_MAX_EVIDENCE_ITEMS)
+        self.assertLessEqual(len(audited["description"]), helper.AUDIT_MAX_TEXT)
+        self.assertLessEqual(len(audited["goal"]), helper.AUDIT_MAX_TEXT)
+        self.assertLessEqual(len(audited["acceptance_criteria"]), helper.AUDIT_MAX_EVIDENCE_REFS)
+        self.assertEqual(audited["liveness"]["state"], "stale")
+        self.assertIn("warning only", " ".join(audited["warnings"]))
+        self.assertTrue(calls)
+
+    def test_audit_rubric_states_and_conservative_liveness_verdicts(self) -> None:
+        future = "2999-01-01T00:00:00Z"
+        tasks = [
+            {
+                "id": "backlog-claimed",
+                "key": "TC-1",
+                "column_id": "column-backlog",
+                "version": 1,
+                "title": "Claimed",
+                "description": "Goal: claimed",
+                "priority": "high",
+                "claimed_by": "agent-1",
+                "claim_expires_at": future,
+                "agent_work": {"operation_id": "run-1", "actor_id": "agent-1", "state": "working", "summary": "Working", "updated_at": future, "stale": False},
+            },
+            {
+                "id": "active-stale",
+                "key": "TC-2",
+                "column_id": "column-active",
+                "version": 2,
+                "title": "Stale",
+                "description": "Goal: stale",
+                "priority": "normal",
+                "agent_work": {"operation_id": "run-2", "actor_id": "agent-2", "state": "working", "summary": "Old", "updated_at": "2026-01-01T00:00:00Z", "stale": True},
+            },
+            {
+                "id": "active-missing",
+                "key": "TC-3",
+                "column_id": "column-active",
+                "version": 3,
+                "title": "Missing",
+                "description": "Goal: missing",
+                "priority": "normal",
+            },
+        ]
+
+        class StubClient:
+            def call(self, method: str, path: str, **kwargs):  # type: ignore[no-untyped-def]
+                if method != "GET":
+                    raise AssertionError(f"audit used non-GET method: {method}")
+                if path == "/projects?limit=200":
+                    return {"data": [{"id": "project-1", "key": "TC"}]}, {}
+                if path == "/projects/project-1/columns?limit=200":
+                    return {
+                        "data": [
+                            {"id": "column-backlog", "name": "Backlog", "semantic_state": "backlog"},
+                            {"id": "column-active", "name": "In Progress", "semantic_state": "active"},
+                        ]
+                    }, {}
+                if "state=backlog" in path:
+                    return {"data": [tasks[0]], "next_cursor": ""}, {}
+                if "state=active" in path:
+                    return {"data": tasks[1:], "next_cursor": ""}, {}
+                raise AssertionError(f"unexpected audit path: {path}")
+
+        result = helper.cmd_audit(
+            StubClient(), argparse.Namespace(project="TC", states=None, page_size=200, evidence_limit=0)  # type: ignore[arg-type]
+        )
+        by_key = {task["key"]: task for task in result["tasks"]}
+        self.assertEqual(by_key["TC-1"]["verdict"], "move_proposed")
+        self.assertEqual(by_key["TC-1"]["suggested_semantic_state"], "active")
+        self.assertEqual(by_key["TC-2"]["verdict"], "needs_attention")
+        self.assertEqual(by_key["TC-2"]["suggested_semantic_state"], "active")
+        self.assertEqual(by_key["TC-3"]["verdict"], "needs_attention")
+        self.assertEqual(by_key["TC-3"]["suggested_semantic_state"], "active")
+        self.assertEqual(result["rubric"]["allowed_verdicts"], ["correct", "needs_attention", "move_proposed"])
+        self.assertTrue(any("stale or missing" in constraint.lower() for constraint in result["rubric"]["constraints"]))
+
+    def test_submit_creates_appends_and_finalizes_with_stable_idempotency(self) -> None:
+        calls: list[tuple[str, str, dict[str, object]]] = []
+        findings = [
+            {
+                "id": "task-1",
+                "version": 4,
+                "current_column": {"id": "column-backlog", "semantic_state": "backlog"},
+                "verdict": "move_proposed",
+                "suggested_semantic_state": "ready",
+                "confidence": 0.9,
+                "reason": "Ready for review",
+                "evidence_refs": ["comment:1"],
+                "review_state": "approved",
+            },
+            {
+                "id": "task-2",
+                "version": 5,
+                "current_column": {"id": "column-active", "semantic_state": "active"},
+                "verdict": "needs_attention",
+                "confidence": 0.6,
+                "reason": "Pulse needs review",
+            },
+        ]
+
+        class StubClient:
+            def call(self, method: str, path: str, **kwargs):  # type: ignore[no-untyped-def]
+                calls.append((method, path, kwargs))
+                if method == "GET" and path == "/projects?limit=200":
+                    return {"data": [{"id": "project-1", "key": "TC"}]}, {}
+                if method == "POST" and path == "/projects/project-1/audits":
+                    return {"id": "audit-1", "status": "running"}, {}
+                if method == "POST" and path == "/audits/audit-1/findings":
+                    return {"id": "finding-" + str(len([call for call in calls if call[1] == path]))}, {}
+                if method == "POST" and path == "/audits/audit-1/finalize":
+                    return {"id": "audit-1", "status": kwargs["body"]["status"]}, {}
+                raise AssertionError(f"unexpected submission call: {method} {path}")
+
+        result = helper.cmd_submit(
+            StubClient(),
+            argparse.Namespace(
+                project="TC",
+                findings={"tasks": findings},
+                scope="board",
+                status="complete",
+                operation_id="submit-1",
+            ),
+        )
+        self.assertEqual(result["audit_id"], "audit-1")
+        self.assertEqual(result["status"], "complete")
+        self.assertEqual(result["appended"], 2)
+        self.assertEqual([method for method, _path, _kwargs in calls], ["GET", "POST", "POST", "POST", "POST"])
+        self.assertEqual(calls[1][2]["body"], {"scope": "board"})
+        self.assertEqual(calls[2][2]["body"]["source_column"], "column-backlog")
+        self.assertEqual(calls[2][2]["body"]["review_state"], "pending")
+        self.assertNotIn("proposed_semantic_destination", calls[3][2]["body"] if isinstance(calls[3][2].get("body"), dict) else {})
+        self.assertNotEqual(calls[2][2]["idempotency_key"], calls[3][2]["idempotency_key"])
+
+    def test_submit_processes_the_existing_ui_queued_audit(self) -> None:
+        calls: list[tuple[str, str, dict[str, object]]] = []
+
+        class StubClient:
+            def call(self, method: str, path: str, **kwargs):  # type: ignore[no-untyped-def]
+                calls.append((method, path, kwargs))
+                if method == "GET" and path == "/projects?limit=200":
+                    return {"data": [{"id": "project-1", "key": "TC"}]}, {}
+                if method == "GET" and path == "/audits/audit-queued":
+                    return {"id": "audit-queued", "project_id": "project-1", "status": "queued"}, {}
+                if method == "POST" and path == "/audits/audit-queued/findings":
+                    return {"id": "finding-1"}, {}
+                if method == "POST" and path == "/audits/audit-queued/finalize":
+                    return {"id": "audit-queued", "status": "complete"}, {}
+                raise AssertionError(f"unexpected submission call: {method} {path}")
+
+        result = helper.cmd_submit(
+            StubClient(),
+            argparse.Namespace(
+                project="TC",
+                audit="audit-queued",
+                findings={
+                    "tasks": [
+                        {
+                            "id": "task-1",
+                            "version": 2,
+                            "current_column": {"id": "column-backlog", "semantic_state": "backlog"},
+                            "verdict": "correct",
+                            "confidence": 0.9,
+                            "reason": "Correctly placed",
+                        }
+                    ]
+                },
+                scope="board",
+                status="complete",
+                operation_id="submit-existing-1",
+            ),
+        )
+
+        self.assertEqual(result["audit_id"], "audit-queued")
+        self.assertEqual(result["status"], "complete")
+        self.assertEqual([method for method, _path, _kwargs in calls], ["GET", "GET", "POST", "POST"])
+        self.assertFalse(any(path == "/projects/project-1/audits" for _method, path, _kwargs in calls))
+
+    def test_submit_rejects_a_queued_audit_from_another_project(self) -> None:
+        class StubClient:
+            def call(self, method: str, path: str, **kwargs):  # type: ignore[no-untyped-def]
+                if method == "GET" and path == "/projects?limit=200":
+                    return {"data": [{"id": "project-1", "key": "TC"}]}, {}
+                if method == "GET" and path == "/audits/audit-other":
+                    return {"id": "audit-other", "project_id": "project-2", "status": "queued"}, {}
+                raise AssertionError(f"unexpected submission call: {method} {path}")
+
+        with self.assertRaisesRegex(helper.RoadmapError, "different project"):
+            helper.cmd_submit(
+                StubClient(),
+                argparse.Namespace(
+                    project="TC",
+                    audit="audit-other",
+                    findings={"tasks": []},
+                    scope="board",
+                    status="complete",
+                    operation_id="submit-existing-2",
+                ),
+            )
+
+    def test_reconcile_preview_fetches_paginated_findings_and_never_moves(self) -> None:
+        calls: list[tuple[str, str, dict[str, object]]] = []
+        findings = [
+            {"id": "finding-ready", "task_id": "task-ready", "captured_version": 7, "source_column": "column-backlog", "verdict": "move_proposed", "proposed_semantic_destination": "ready", "confidence": 0.9, "reason": "ready", "review_state": "approved"},
+            {"id": "finding-pending", "task_id": "task-pending", "captured_version": 4, "source_column": "column-backlog", "verdict": "move_proposed", "proposed_semantic_destination": "ready", "confidence": 0.8, "reason": "pending", "review_state": "pending"},
+            {"id": "finding-changed", "task_id": "task-changed", "captured_version": 2, "source_column": "column-backlog", "verdict": "move_proposed", "proposed_semantic_destination": "ready", "confidence": 0.8, "reason": "changed", "review_state": "approved"},
+            {"id": "finding-active", "task_id": "task-active", "captured_version": 3, "source_column": "column-backlog", "verdict": "move_proposed", "proposed_semantic_destination": "active", "confidence": 0.8, "reason": "claim", "review_state": "approved"},
+        ]
+        tasks = {
+            "task-ready": {"id": "task-ready", "version": 7, "column_id": "column-backlog"},
+            "task-pending": {"id": "task-pending", "version": 4, "column_id": "column-backlog"},
+            "task-changed": {"id": "task-changed", "version": 3, "column_id": "column-backlog"},
+            "task-active": {"id": "task-active", "version": 3, "column_id": "column-backlog", "claimed_by": "agent-1", "claim_expires_at": "2999-01-01T00:00:00Z"},
+        }
+
+        class StubClient:
+            def call(self, method: str, path: str, **kwargs):  # type: ignore[no-untyped-def]
+                calls.append((method, path, kwargs))
+                if method != "GET":
+                    raise AssertionError(f"preview used non-GET method: {method}")
+                if path == "/audits/audit-1":
+                    return {"id": "audit-1", "project_id": "project-1", "status": "complete"}, {}
+                if path == "/audits/audit-1/findings?limit=2":
+                    return {"data": findings[:2], "next_cursor": "findings-2"}, {}
+                if "findings-2" in path:
+                    return {"data": findings[2:], "next_cursor": ""}, {}
+                if path == "/projects/project-1/columns?limit=2":
+                    return {
+                        "data": [
+                            {"id": "column-backlog", "name": "Backlog", "semantic_state": "backlog"},
+                            {"id": "column-ready", "name": "Ready", "semantic_state": "ready"},
+                            {"id": "column-active", "name": "In Progress", "semantic_state": "active"},
+                        ]
+                    }, {}
+                if path.startswith("/tasks/"):
+                    return tasks[path.removeprefix("/tasks/")], {}
+                raise AssertionError(f"unexpected preview call: {path}")
+
+        result = helper.cmd_reconcile(
+            StubClient(), argparse.Namespace(audit="audit-1", apply=False, page_size=2, operation_id=None)  # type: ignore[arg-type]
+        )
+        by_id = {item["finding_id"]: item for item in result["findings"]}
+        self.assertEqual(by_id["finding-ready"]["status"], "preview")
+        self.assertEqual(by_id["finding-pending"]["action_required"], "review_finding")
+        self.assertEqual(by_id["finding-changed"]["action_required"], "rerun_audit")
+        self.assertEqual(by_id["finding-active"]["action_required"], "claim_or_resume")
+        self.assertEqual(result["summary"]["preview"], 1)
+        self.assertTrue(result["read_only"])
+        self.assertTrue(any("cursor=findings-2" in path for _method, path, _kwargs in calls))
+        self.assertTrue(all(method == "GET" for method, _path, _kwargs in calls))
+
+    def test_reconcile_apply_uses_guarded_move_and_deterministic_key(self) -> None:
+        calls: list[tuple[str, str, dict[str, object]]] = []
+
+        class StubClient:
+            def call(self, method: str, path: str, **kwargs):  # type: ignore[no-untyped-def]
+                calls.append((method, path, kwargs))
+                if path == "/audits/audit-1":
+                    return {"id": "audit-1", "project_id": "project-1", "status": "complete"}, {}
+                if path == "/audits/audit-1/findings?limit=200":
+                    return {"data": [{"id": "finding-1", "task_id": "task-1", "captured_version": 7, "source_column": "column-backlog", "verdict": "move_proposed", "proposed_semantic_destination": "ready", "confidence": 0.9, "reason": "approved", "review_state": "approved"}], "next_cursor": ""}, {}
+                if path == "/projects/project-1/columns?limit=200":
+                    return {"data": [{"id": "column-backlog", "semantic_state": "backlog"}, {"id": "column-ready", "semantic_state": "ready"}]}, {}
+                if path == "/tasks/task-1":
+                    return {"id": "task-1", "version": 7, "column_id": "column-backlog"}, {}
+                if path == "/tasks/task-1/move":
+                    return {"id": "task-1", "version": 8, "column_id": "column-ready"}, {}
+                raise AssertionError(f"unexpected apply call: {method} {path}")
+
+        result = helper.cmd_reconcile(
+            StubClient(), argparse.Namespace(audit="audit-1", apply=True, page_size=200, operation_id="reconcile-1")  # type: ignore[arg-type]
+        )
+        move = next((entry for entry in calls if entry[1] == "/tasks/task-1/move"), None)
+        self.assertIsNotNone(move)
+        self.assertEqual(move[0], "POST")  # type: ignore[union-attr]
+        self.assertEqual(move[2]["if_match"], 7)  # type: ignore[union-attr]
+        self.assertEqual(move[2]["body"], {  # type: ignore[union-attr]
+            "destination_column_id": "column-ready",
+            "expected_source_column_id": "column-backlog",
+            "source": "board_audit",
+            "reason": "approved",
+        })
+        self.assertEqual(result["summary"]["applied"], 1)
+        first_key = move[2]["idempotency_key"]  # type: ignore[union-attr]
+        calls.clear()
+        second = helper.cmd_reconcile(
+            StubClient(), argparse.Namespace(audit="audit-1", apply=True, page_size=200, operation_id="reconcile-1")  # type: ignore[arg-type]
+        )
+        second_move = next(entry for entry in calls if entry[1] == "/tasks/task-1/move")
+        self.assertEqual(second_move[2]["idempotency_key"], first_key)
+        self.assertEqual(second["summary"]["applied"], 1)
+
+    def test_reconcile_never_previews_or_applies_an_unfinished_audit(self) -> None:
+        methods_and_paths: list[tuple[str, str]] = []
+
+        class StubClient:
+            def call(self, method: str, path: str, **kwargs):  # type: ignore[no-untyped-def]
+                methods_and_paths.append((method, path))
+                if path == "/audits/audit-running":
+                    return {"id": "audit-running", "project_id": "project-1", "status": "running"}, {}
+                if path == "/audits/audit-running/findings?limit=200":
+                    return {"data": [{"id": "finding-1", "task_id": "task-1", "captured_version": 1, "source_column": "column-backlog", "verdict": "move_proposed", "proposed_semantic_destination": "ready", "review_state": "approved"}], "next_cursor": ""}, {}
+                if path == "/projects/project-1/columns?limit=200":
+                    return {"data": [{"id": "column-backlog", "semantic_state": "backlog"}, {"id": "column-ready", "semantic_state": "ready"}]}, {}
+                raise AssertionError(f"unfinished audit touched task or mutation route: {method} {path}")
+
+        result = helper.cmd_reconcile(
+            StubClient(), argparse.Namespace(audit="audit-running", apply=True, page_size=200, operation_id="reconcile-running")  # type: ignore[arg-type]
+        )
+        self.assertEqual(result["audit_status"], "running")
+        self.assertEqual(result["summary"], {"total": 1, "preview": 0, "applied": 0, "skipped": 1, "conflicted": 0, "errors": 0})
+        self.assertEqual(result["findings"][0]["action_required"], "wait_for_audit")
+        self.assertTrue(all(method == "GET" for method, _path in methods_and_paths))
+
+    def test_reconcile_partial_batch_reports_conflicts_and_skips_completed_retries(self) -> None:
+        moved = False
+        move_calls: list[str] = []
+        findings = [
+            {"id": "finding-applied", "task_id": "task-applied", "captured_version": 1, "source_column": "column-backlog", "verdict": "move_proposed", "proposed_semantic_destination": "ready", "confidence": 0.9, "reason": "apply", "review_state": "approved"},
+            {"id": "finding-pending", "task_id": "task-pending", "captured_version": 1, "source_column": "column-backlog", "verdict": "move_proposed", "proposed_semantic_destination": "ready", "confidence": 0.9, "reason": "wait", "review_state": "pending"},
+            {"id": "finding-conflict", "task_id": "task-conflict", "captured_version": 1, "source_column": "column-backlog", "verdict": "move_proposed", "proposed_semantic_destination": "ready", "confidence": 0.9, "reason": "race", "review_state": "approved"},
+        ]
+
+        class StubClient:
+            def call(self, method: str, path: str, **kwargs):  # type: ignore[no-untyped-def]
+                nonlocal moved
+                if path == "/audits/audit-batch":
+                    return {"id": "audit-batch", "project_id": "project-1", "status": "complete"}, {}
+                if path == "/audits/audit-batch/findings?limit=200":
+                    return {"data": findings, "next_cursor": ""}, {}
+                if path == "/projects/project-1/columns?limit=200":
+                    return {"data": [{"id": "column-backlog", "semantic_state": "backlog"}, {"id": "column-ready", "semantic_state": "ready"}], "next_cursor": ""}, {}
+                if path == "/tasks/task-applied":
+                    if moved:
+                        return {"id": "task-applied", "project_id": "project-1", "version": 2, "column_id": "column-ready"}, {}
+                    return {"id": "task-applied", "project_id": "project-1", "version": 1, "column_id": "column-backlog"}, {}
+                if path in {"/tasks/task-pending", "/tasks/task-conflict"}:
+                    return {"id": path.rsplit("/", 1)[-1], "project_id": "project-1", "version": 1, "column_id": "column-backlog"}, {}
+                if path == "/tasks/task-applied/move":
+                    move_calls.append(path)
+                    moved = True
+                    return {"id": "task-applied", "version": 2, "column_id": "column-ready"}, {}
+                if path == "/tasks/task-conflict/move":
+                    move_calls.append(path)
+                    raise helper.RoadmapError("conflict", status_code=409, error_code="stale_task")
+                raise AssertionError(f"unexpected batch call: {method} {path}")
+
+        first = helper.cmd_reconcile(
+            StubClient(), argparse.Namespace(audit="audit-batch", apply=True, page_size=200, operation_id="reconcile-batch")  # type: ignore[arg-type]
+        )
+        self.assertEqual(first["summary"], {"total": 3, "preview": 0, "applied": 1, "skipped": 1, "conflicted": 1, "errors": 0})
+        by_id = {item["finding_id"]: item for item in first["findings"]}
+        self.assertEqual(by_id["finding-conflict"]["error"]["code"], "stale_task")
+
+        move_calls.clear()
+        second = helper.cmd_reconcile(
+            StubClient(), argparse.Namespace(audit="audit-batch", apply=True, page_size=200, operation_id="reconcile-batch")  # type: ignore[arg-type]
+        )
+        self.assertNotIn("/tasks/task-applied/move", move_calls)
+        self.assertEqual(second["summary"]["applied"], 0)
+        self.assertEqual(second["summary"]["conflicted"], 1)
+
 
 class RetryTests(unittest.TestCase):
     class Response:

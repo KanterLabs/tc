@@ -64,6 +64,28 @@ install_release_env() {
 	mv -T -- "$temporary" "$CONFIG_DIR/roadmap.env" || return 1
 }
 
+single_kv_value() {
+	local path=$1 key=$2
+	awk -F= -v key="$key" '
+		$1 == key { count++; value = $2 }
+		END {
+			if (count != 1) exit 1
+			print value
+		}
+	' "$path"
+}
+
+single_output_value() {
+	local output=$1 key=$2
+	awk -F= -v key="$key" '
+		$1 == key { count++; value = $2 }
+		END {
+			if (count != 1) exit 1
+			print value
+		}
+	' <<<"$output"
+}
+
 [[ "$(id -u)" -eq 0 ]] || fail 'must run as root'
 [[ "$RELEASE_DIR" = /* && "$RELEASE_DIR" != *$'\n'* && "$RELEASE_DIR" != *$'\r'* ]] \
 	|| fail 'release directory must be an absolute path without control characters'
@@ -332,6 +354,9 @@ on_exit() {
 	# Recovery itself must not recursively invoke this EXIT transaction.
 	trap - EXIT
 	rm -f -- "$CONFIG_DIR/roadmap.env.new" || true
+	if [[ -n "${fresh_preflight_source:-}" ]]; then
+		rm -f -- "$fresh_preflight_source" || true
+	fi
 	if [[ "$status" -ne 0 && "$recovery_needed" -eq 1 && "$upgrade_transaction_started" -eq 1 && "$recovery_in_progress" -eq 0 && -n "$previous_target" ]]; then
 		recovery_in_progress=1
 		log 'deployment failed before completion; restoring the previous release'
@@ -344,31 +369,16 @@ trap on_exit EXIT
 
 migrate_previous_env
 
-# Normalize a legacy database location before taking the online snapshot. The
-# application uses DATA_DIR, while the move itself is only needed on old
-# installations that predate that directory.
+# Automatic upgrades support only the current data-directory layout. Moving a
+# live legacy SQLite pathname safely would require an offline maintenance
+# transaction and a rollback-environment rewrite. Refuse that obsolete layout
+# before stopping either service; an operator can then schedule an explicit,
+# separately backed-up maintenance migration without weakening the normal
+# pre-downtime backup/preflight guarantee.
 if [[ -e "$STATE_DIR/roadmap.db" ]]; then
 	[[ -f "$STATE_DIR/roadmap.db" ]] || fail 'legacy database path is not a regular file'
 	[[ ! -e "$DATA_DIR/roadmap.db" ]] || fail 'both legacy and data database paths exist'
-	# Moving a live SQLite pathname can race a process creating its WAL/SHM
-	# siblings. This legacy-only migration is therefore the one offline branch;
-	# normal DATA_DIR upgrades below keep the service online through backup.
-	upgrade_transaction_started=1
-	stop_unit cloudflared.service || fail 'could not stop cloudflared.service before legacy database move'
-	stop_unit roadmap.service || fail 'could not stop roadmap.service before legacy database move'
-	mv -T -- "$STATE_DIR/roadmap.db" "$DATA_DIR/roadmap.db"
-	for suffix in -wal -shm; do
-		if [[ -e "$STATE_DIR/roadmap.db$suffix" ]]; then
-			mv -T -- "$STATE_DIR/roadmap.db$suffix" "$DATA_DIR/roadmap.db$suffix"
-		fi
-	done
-	chown roadmap:roadmap "$DATA_DIR/roadmap.db"
-	for suffix in -wal -shm; do
-		if [[ -e "$DATA_DIR/roadmap.db$suffix" ]]; then
-			chown roadmap:roadmap "$DATA_DIR/roadmap.db$suffix"
-		fi
-	done
-	chmod 0640 "$DATA_DIR/roadmap.db"
+	fail 'legacy database layout requires an explicit offline maintenance migration; no services were stopped'
 fi
 
 # Take and verify the pre-upgrade backup while Roadmap is still online. The
@@ -376,6 +386,16 @@ fi
 # binary migrates a private copy of that exact backup before any service stop
 # or release-link switch.
 verified_backup=
+fresh_preflight_source=
+proof_backup=none
+proof_source_schema=
+proof_candidate_schema=
+proof_latest_schema=
+proof_migration_digest=
+proof_checksum=
+proof_integrity=
+proof_fk=
+proof_preflight=
 if [[ -f "$DATA_DIR/roadmap.db" && ! -L "$DATA_DIR/roadmap.db" ]]; then
 	# The candidate binary owns the metadata format. A retained prior binary
 	# may predate migration-info, especially on the first TC-33 deployment.
@@ -389,15 +409,123 @@ if [[ -f "$DATA_DIR/roadmap.db" && ! -L "$DATA_DIR/roadmap.db" ]]; then
 	verified_backup=${backup_output#backup=}
 	[[ "$verified_backup" = "$BACKUPS_DIR"/roadmap-*.db && -f "$verified_backup" && ! -L "$verified_backup" ]] \
 		|| fail 'verified backup path is invalid'
+	proof_backup=$(basename -- "$verified_backup")
+	[[ "$proof_backup" =~ ^roadmap-[0-9]{8}T[0-9]{6}Z-(manual|daily|pre-restore|[0-9a-f]{40})\.db$ ]] \
+		|| fail 'verified backup basename is invalid'
+	checksum_sidecar="$verified_backup.sha256"
+	metadata_sidecar="$verified_backup.metadata"
+	[[ -f "$checksum_sidecar" && ! -L "$checksum_sidecar" && -f "$metadata_sidecar" && ! -L "$metadata_sidecar" ]] \
+		|| fail 'verified backup sidecars are missing'
+	[[ "$(stat -c '%U:%G' -- "$checksum_sidecar")" = root:root && "$(stat -c '%a' -- "$checksum_sidecar")" = 600 ]] \
+		|| fail 'verified backup checksum sidecar ownership or mode is invalid'
+	[[ "$(stat -c '%U:%G' -- "$metadata_sidecar")" = root:root && "$(stat -c '%a' -- "$metadata_sidecar")" = 600 ]] \
+		|| fail 'verified backup metadata sidecar ownership or mode is invalid'
+	checksum_count=$(awk -v name="$proof_backup" 'NF == 2 && $2 == name { count++ } END { print count + 0 }' "$checksum_sidecar") \
+		|| fail 'verified backup checksum sidecar cannot be read'
+	[[ "$checksum_count" = 1 ]] || fail 'verified backup checksum sidecar names an unexpected file'
+	checksum_digest=$(awk -v name="$proof_backup" 'NF == 2 && $2 == name { print $1 }' "$checksum_sidecar") \
+		|| fail 'verified backup checksum sidecar cannot be read'
+	[[ "$checksum_digest" =~ ^[0-9a-f]{64}$ ]] || fail 'verified backup checksum is invalid'
+	(cd "$BACKUPS_DIR" && sha256sum --check --strict "$(basename -- "$checksum_sidecar")" >/dev/null) \
+		|| fail 'verified backup checksum validation failed'
+	proof_source_schema=$(single_kv_value "$metadata_sidecar" schema_version) \
+		|| fail 'verified backup source schema metadata is invalid'
+	source_migration_digest=$(single_kv_value "$metadata_sidecar" migration_digest) \
+		|| fail 'verified backup migration metadata is invalid'
+	[[ "$proof_source_schema" =~ ^[0-9]+$ ]] || fail 'verified backup source schema is invalid'
+	[[ "$source_migration_digest" =~ ^[0-9a-f]{64}$ ]] || fail 'verified backup migration digest is invalid'
+	[[ "$(sqlite3 "$verified_backup" 'PRAGMA integrity_check;')" = ok ]] \
+		|| fail 'verified backup integrity validation failed'
+	[[ -z "$(sqlite3 "$verified_backup" 'PRAGMA foreign_key_check;')" ]] \
+		|| fail 'verified backup foreign-key validation failed'
+	proof_checksum=valid
+	proof_integrity=ok
+	proof_fk=ok
 	preflight_output=$("$RELEASE_DIR/roadmap" schema-preflight "$verified_backup") \
 		|| fail 'candidate schema preflight failed'
-	grep -Fx 'status=ok' <<<"$preflight_output" >/dev/null \
-		|| fail 'candidate schema preflight did not complete successfully'
-	grep -Fx 'foreign_key_check=ok' <<<"$preflight_output" >/dev/null \
-		|| fail 'candidate schema preflight did not pass foreign-key validation'
+	proof_candidate_schema=$(single_output_value "$preflight_output" schema_version) \
+		|| fail 'candidate schema preflight returned an invalid schema'
+	proof_latest_schema=$(single_output_value "$preflight_output" latest_schema_version) \
+		|| fail 'candidate schema preflight returned an invalid latest schema'
+	preflight_digest=$(single_output_value "$preflight_output" migration_digest) \
+		|| fail 'candidate schema preflight returned an invalid migration digest'
+	preflight_integrity=$(single_output_value "$preflight_output" integrity_check) \
+		|| fail 'candidate schema preflight returned an invalid integrity result'
+	preflight_fk=$(single_output_value "$preflight_output" foreign_key_check) \
+		|| fail 'candidate schema preflight returned an invalid foreign-key result'
+	preflight_status=$(single_output_value "$preflight_output" status) \
+		|| fail 'candidate schema preflight returned an invalid status'
+	[[ "$proof_candidate_schema" =~ ^[0-9]+$ && "$proof_latest_schema" =~ ^[0-9]+$ ]] \
+		|| fail 'candidate schema preflight returned non-numeric schema versions'
+	[[ "$proof_candidate_schema" = "$proof_latest_schema" ]] \
+		|| fail 'candidate schema preflight did not reach the latest schema'
+	[[ "$preflight_digest" =~ ^[0-9a-f]{64}$ ]] \
+		|| fail 'candidate schema preflight migration digest is invalid'
+	# The backup sidecar identifies the retained source binary's migration set;
+	# the preflight digest identifies the candidate set. They are expected to
+	# differ when this deploy adds a migration, so the public proof records the
+	# candidate digest after both artifacts have been validated independently.
+	proof_migration_digest=$preflight_digest
+	[[ "$preflight_integrity" = ok && "$preflight_fk" = ok && "$preflight_status" = ok ]] \
+		|| fail 'candidate schema preflight integrity validation failed'
+	proof_preflight=ok
 elif [[ -e "$DATA_DIR/roadmap.db" ]]; then
 	fail 'database path is not a regular file'
+else
+	# A fresh guest has no online source to back up. Exercise the same candidate
+	# migration/preflight gate against a disposable empty SQLite database so the
+	# proof still records the candidate schema, digest, and integrity predicates.
+	fresh_preflight_source=$(mktemp "$STATE_DIR/.roadmap-preflight.XXXXXX") \
+		|| fail 'could not create fresh-install preflight source'
+	chmod 0600 "$fresh_preflight_source"
+	sqlite3 "$fresh_preflight_source" 'VACUUM;' \
+		|| fail 'could not initialize fresh-install preflight source'
+	proof_source_schema=0
+	[[ "$(sqlite3 "$fresh_preflight_source" 'PRAGMA integrity_check;')" = ok ]] \
+		|| fail 'fresh-install preflight source integrity validation failed'
+	[[ -z "$(sqlite3 "$fresh_preflight_source" 'PRAGMA foreign_key_check;')" ]] \
+		|| fail 'fresh-install preflight source foreign-key validation failed'
+	sha256sum "$fresh_preflight_source" >/dev/null \
+		|| fail 'could not checksum fresh-install preflight source'
+	proof_checksum=valid
+	proof_integrity=ok
+	proof_fk=ok
+	preflight_output=$("$RELEASE_DIR/roadmap" schema-preflight "$fresh_preflight_source") \
+		|| fail 'fresh-install candidate schema preflight failed'
+	proof_candidate_schema=$(single_output_value "$preflight_output" schema_version) \
+		|| fail 'fresh-install preflight returned an invalid schema'
+	proof_latest_schema=$(single_output_value "$preflight_output" latest_schema_version) \
+		|| fail 'fresh-install preflight returned an invalid latest schema'
+	preflight_digest=$(single_output_value "$preflight_output" migration_digest) \
+		|| fail 'fresh-install preflight returned an invalid migration digest'
+	preflight_integrity=$(single_output_value "$preflight_output" integrity_check) \
+		|| fail 'fresh-install preflight returned an invalid integrity result'
+	preflight_fk=$(single_output_value "$preflight_output" foreign_key_check) \
+		|| fail 'fresh-install preflight returned an invalid foreign-key result'
+	preflight_status=$(single_output_value "$preflight_output" status) \
+		|| fail 'fresh-install preflight returned an invalid status'
+	[[ "$proof_candidate_schema" =~ ^[0-9]+$ && "$proof_latest_schema" =~ ^[0-9]+$ ]] \
+		|| fail 'fresh-install preflight returned non-numeric schema versions'
+	[[ "$proof_candidate_schema" = "$proof_latest_schema" ]] \
+		|| fail 'fresh-install preflight did not reach the latest schema'
+	[[ "$preflight_digest" =~ ^[0-9a-f]{64}$ ]] \
+		|| fail 'fresh-install preflight migration digest is invalid'
+	proof_migration_digest=$preflight_digest
+	[[ "$preflight_integrity" = ok && "$preflight_fk" = ok && "$preflight_status" = ok ]] \
+		|| fail 'fresh-install preflight integrity validation failed'
+	proof_preflight=ok
 fi
+
+[[ "$proof_backup" = none || "$proof_backup" =~ ^roadmap-[0-9]{8}T[0-9]{6}Z-(manual|daily|pre-restore|[0-9a-f]{40})\.db$ ]] \
+	|| fail 'pre-upgrade backup proof has an invalid basename'
+[[ "$proof_source_schema" =~ ^[0-9]+$ && "$proof_candidate_schema" =~ ^[0-9]+$ && "$proof_latest_schema" =~ ^[0-9]+$ ]] \
+	|| fail 'pre-upgrade backup proof has invalid schema versions'
+[[ "$proof_migration_digest" =~ ^[0-9a-f]{64}$ ]] || fail 'pre-upgrade backup proof has an invalid migration digest'
+[[ "$proof_checksum" = valid && "$proof_integrity" = ok && "$proof_fk" = ok && "$proof_preflight" = ok ]] \
+	|| fail 'pre-upgrade backup proof predicates are incomplete'
+printf 'pre_upgrade_backup=%s source_schema=%s candidate_schema=%s latest_schema=%s migration_digest=%s checksum=%s integrity=%s fk=%s preflight=%s\n' \
+	"$proof_backup" "$proof_source_schema" "$proof_candidate_schema" "$proof_latest_schema" \
+	"$proof_migration_digest" "$proof_checksum" "$proof_integrity" "$proof_fk" "$proof_preflight"
 
 log 'Stopping the application before the atomic release switch'
 upgrade_transaction_started=1

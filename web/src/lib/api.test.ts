@@ -176,6 +176,95 @@ describe('public API client', () => {
     expect(nextQuery.get('action_needed')).toBe('true');
   });
 
+  it('lists and starts project-scoped audits without applying recommendations', async () => {
+    const fetchMock = vi.spyOn(globalThis, 'fetch')
+      .mockResolvedValueOnce(response({ data: [{ id: 'audit-1', project_id: 'project-1', status: 'complete' }], next_cursor: 'next' }))
+      .mockResolvedValueOnce(response({ data: [{ id: 'audit-2', project_id: 'project-1', status: 'running' }], next_cursor: null }))
+      .mockResolvedValueOnce(response({ id: 'audit-3', project_id: 'project-1', status: 'queued' }));
+
+    await expect(api.listAllAudits('project-1')).resolves.toMatchObject({
+      data: [
+        { id: 'audit-1', status: 'complete' },
+        { id: 'audit-2', status: 'running' }
+      ],
+      next_cursor: null
+    });
+    const firstQuery = new URL(String(fetchMock.mock.calls[0][0]), 'http://localhost').searchParams;
+    expect(firstQuery.get('limit')).toBe('200');
+    expect(firstQuery.get('cursor')).toBeNull();
+    expect(new URL(String(fetchMock.mock.calls[1][0]), 'http://localhost').searchParams.get('cursor')).toBe('next');
+
+    await api.createAudit('project-1', { scope: 'board', status: 'queued' });
+    const createCall = fetchMock.mock.calls[2];
+    expect(String(createCall[0])).toContain('/api/v1/projects/project-1/audits');
+    expect((createCall[1]?.method)).toBe('POST');
+    expect(JSON.parse(String((createCall[1] as RequestInit).body))).toEqual({ scope: 'board', status: 'queued' });
+    expect((createCall[1]?.headers as Headers).get('Idempotency-Key')).toMatch(/^roadmap-|^[0-9a-f-]{20,}$/);
+  });
+
+  it('loads audit metadata and every bounded finding page', async () => {
+    const fetchMock = vi.spyOn(globalThis, 'fetch')
+      .mockResolvedValueOnce(response({ id: 'audit-1', project_id: 'project-1', status: 'complete', finding_count: 2 }))
+      .mockResolvedValueOnce(response({ data: [{ id: 'finding-1', audit_id: 'audit-1' }], next_cursor: 'findings-next' }))
+      .mockResolvedValueOnce(response({ data: [{ id: 'finding-2', audit_id: 'audit-1' }], next_cursor: null }));
+
+    await expect(api.getAudit('audit-1')).resolves.toMatchObject({
+      id: 'audit-1',
+      finding_count: 2,
+      findings: [{ id: 'finding-1' }, { id: 'finding-2' }]
+    });
+    expect(String(fetchMock.mock.calls[0][0])).toContain('/api/v1/audits/audit-1');
+    const firstFindings = new URL(String(fetchMock.mock.calls[1][0]), 'http://localhost');
+    const secondFindings = new URL(String(fetchMock.mock.calls[2][0]), 'http://localhost');
+    expect(firstFindings.pathname).toContain('/api/v1/audits/audit-1/findings');
+    expect(firstFindings.searchParams.get('limit')).toBe('200');
+    expect(firstFindings.searchParams.get('cursor')).toBeNull();
+    expect(secondFindings.searchParams.get('cursor')).toBe('findings-next');
+  });
+
+  it('guards audit finding review and task reconciliation with versions', async () => {
+    const fetchMock = vi.spyOn(globalThis, 'fetch')
+      .mockResolvedValueOnce(response({ id: 'finding-1', review_state: 'approved', version: 4 }))
+      .mockResolvedValueOnce(response({ id: 'task-1', column_id: 'ready-column', version: 8 }));
+
+    await api.patchAuditFinding('finding-1', {
+      review_state: 'approved',
+      proposed_semantic_destination: 'ready'
+    }, 3);
+    await api.moveTask('task-1', {
+      destination_column_id: 'ready-column',
+      expected_source_column_id: 'backlog-column',
+      source: 'board_audit',
+      reason: 'Captured in the audit'
+    }, 7);
+
+    const reviewInit = fetchMock.mock.calls[0][1] as RequestInit;
+    expect(String(fetchMock.mock.calls[0][0])).toContain('/api/v1/audit-findings/finding-1');
+    expect(JSON.parse(String(reviewInit.body))).toEqual({ review_state: 'approved', proposed_semantic_destination: 'ready' });
+    expect((reviewInit.headers as Headers).get('If-Match')).toBe('"v3"');
+    expect((reviewInit.headers as Headers).get('Idempotency-Key')).toMatch(/^roadmap-|^[0-9a-f-]{20,}$/);
+
+    const moveInit = fetchMock.mock.calls[1][1] as RequestInit;
+    expect(String(fetchMock.mock.calls[1][0])).toContain('/api/v1/tasks/task-1/move');
+    expect(JSON.parse(String(moveInit.body))).toMatchObject({
+      destination_column_id: 'ready-column',
+      expected_source_column_id: 'backlog-column',
+      source: 'board_audit'
+    });
+    expect((moveInit.headers as Headers).get('If-Match')).toBe('"v7"');
+    expect((moveInit.headers as Headers).get('Idempotency-Key')).toMatch(/^roadmap-|^[0-9a-f-]{20,}$/);
+  });
+
+  it('finalizes an audit run as an explicit lifecycle mutation', async () => {
+    const fetchMock = vi.spyOn(globalThis, 'fetch').mockResolvedValue(response({ id: 'audit-1', status: 'partial' }));
+    await api.finalizeAudit('audit-1', 'partial');
+    const [url, init] = fetchMock.mock.calls[0];
+    expect(String(url)).toContain('/api/v1/audits/audit-1/finalize');
+    expect(init?.method).toBe('POST');
+    expect(JSON.parse(String((init as RequestInit).body))).toEqual({ status: 'partial' });
+    expect((init?.headers as Headers).get('Idempotency-Key')).toMatch(/^roadmap-|^[0-9a-f-]{20,}$/);
+  });
+
   it('turns the standard error envelope into ApiError', async () => {
     vi.spyOn(globalThis, 'fetch').mockResolvedValue(response({ error: { code: 'stale_task', message: 'Task is stale', details: { current: { version: 4 } } } }, 409));
     await expect(request('/tasks/task-1', { method: 'PATCH', body: { title: 'x' } })).rejects.toMatchObject({

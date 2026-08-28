@@ -148,10 +148,21 @@ contains 'stop_unit roadmap.service' "$INSTALL"
 contains 'ROADMAP_MIGRATION_INFO_BINARY' "$INSTALL"
 contains 'schema-preflight' "$INSTALL"
 contains 'verified pre-upgrade backup' "$INSTALL"
+contains "pre_upgrade_backup=%s source_schema=%s candidate_schema=%s latest_schema=%s migration_digest=%s checksum=%s integrity=%s fk=%s preflight=%s" "$INSTALL"
+contains 'proof_backup=$(basename -- "$verified_backup")' "$INSTALL"
+contains 'proof_migration_digest=$preflight_digest' "$INSTALL"
+not_contains 'preflight_digest" = "$proof_migration_digest' "$INSTALL"
+contains 'sha256sum --check --strict "$(basename -- "$checksum_sidecar")"' "$INSTALL"
+contains 'PRAGMA integrity_check;' "$INSTALL"
+contains 'PRAGMA foreign_key_check;' "$INSTALL"
+contains 'fresh-install candidate schema preflight' "$INSTALL"
+contains 'legacy database layout requires an explicit offline maintenance migration; no services were stopped' "$INSTALL"
 contains 'migration-info' "$BACKUP"
 contains 'migration-info' "$ROOT_DIR/cmd/roadmap/main.go"
 not_contains 'systemctl stop cloudflared.service 2>/dev/null || true' "$INSTALL"
 not_contains 'systemctl stop roadmap.service 2>/dev/null || true' "$INSTALL"
+contains 'Keep guest installer stdout/stderr attached' "$GATEWAY"
+contains 'pre_upgrade_backup=...' "$GATEWAY"
 
 # A retained binary may predate migration-info. The installer must ask the
 # candidate binary for metadata rather than selecting the retained executable
@@ -352,13 +363,28 @@ not_contains 'atomically move it to /var/lib/roadmap/roadmap.db' "$DOCS"
 # The candidate gate must complete while the application is still online and
 # before the installer stops either unit or switches the current release link.
 install_backup_line=$(grep -n 'roadmap-backup.sh" "\$SHA"' "$INSTALL" | cut -d: -f1 || true)
-install_preflight_line=$(grep -n 'schema-preflight' "$INSTALL" | cut -d: -f1 || true)
+install_preflight_line=$(grep -n 'schema-preflight' "$INSTALL" | sed -n '1p' | cut -d: -f1 || true)
+install_proof_line=$(grep -n "^printf 'pre_upgrade_backup=" "$INSTALL" | cut -d: -f1 || true)
 install_stop_line=$(grep -n '^stop_unit cloudflared\.service' "$INSTALL" | tail -n 1 | cut -d: -f1 || true)
 install_switch_line=$(grep -n '^atomic_switch "\$release_target"' "$INSTALL" | cut -d: -f1 || true)
-[[ -n "$install_backup_line" && -n "$install_preflight_line" && -n "$install_stop_line" && -n "$install_switch_line" ]] \
-	|| fail 'install migration-gate ordering checks could not find backup/preflight/stop/switch'
-[[ "$install_backup_line" -lt "$install_preflight_line" && "$install_preflight_line" -lt "$install_stop_line" && "$install_stop_line" -lt "$install_switch_line" ]] \
-	|| fail 'install does not gate the atomic switch on a preflight of the verified backup'
+legacy_refusal_line=$(grep -n 'legacy database layout requires an explicit offline maintenance migration' "$INSTALL" | cut -d: -f1 || true)
+[[ -n "$install_backup_line" && -n "$install_preflight_line" && -n "$install_proof_line" && -n "$install_stop_line" && -n "$install_switch_line" && -n "$legacy_refusal_line" ]] \
+	|| fail 'install migration-gate ordering checks could not find backup/preflight/proof/stop/switch'
+[[ "$install_backup_line" -lt "$install_preflight_line" && "$install_preflight_line" -lt "$install_proof_line" && "$install_proof_line" -lt "$install_stop_line" && "$install_stop_line" -lt "$install_switch_line" ]] \
+	|| fail 'install does not gate the proof and atomic switch on a verified preflight'
+[[ "$legacy_refusal_line" -lt "$install_stop_line" ]] \
+	|| fail 'legacy database refusal must occur before any normal deployment downtime'
+
+# The proof is deliberately one line, basename-only, and machine-parseable.
+# Keep this assertion in the deployment-security suite so a future change
+# cannot accidentally put credentials or broad guest paths on the CI stream.
+assert_proof_format() {
+	local proof=$1
+	[[ "$proof" =~ ^pre_upgrade_backup=(none|roadmap-[0-9]{8}T[0-9]{6}Z-(manual|daily|pre-restore|[0-9a-f]{40})\.db)[[:space:]]source_schema=[0-9]+[[:space:]]candidate_schema=[0-9]+[[:space:]]latest_schema=[0-9]+[[:space:]]migration_digest=[0-9a-f]{64}[[:space:]]checksum=valid[[:space:]]integrity=ok[[:space:]]fk=ok[[:space:]]preflight=ok$ ]] \
+		|| fail "invalid sanitized deployment proof: $proof"
+}
+assert_proof_format 'pre_upgrade_backup=roadmap-20260828T173000Z-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.db source_schema=9 candidate_schema=10 latest_schema=10 migration_digest=0000000000000000000000000000000000000000000000000000000000000000 checksum=valid integrity=ok fk=ok preflight=ok'
+assert_proof_format 'pre_upgrade_backup=none source_schema=0 candidate_schema=10 latest_schema=10 migration_digest=ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff checksum=valid integrity=ok fk=ok preflight=ok'
 not_contains 'roadmap.db' "$ROLLBACK"
 
 # Exercise the gateway cleanup predicate with a mocked pct boundary. A failed
