@@ -63,6 +63,7 @@ function formatCountdown(value: string, now: number): string {
  */
 export function agentPulseAccessibleLabel(task: Task, now: number, actorLabel = ''): string {
   const work = task.agent_work;
+  if (task.completed_at) return 'Completed task, no live agent work';
   const state = work?.state || '';
   const missing = !work;
   const baseLabel = stateLabels[state] || (missing ? 'No live pulse' : 'Agent update');

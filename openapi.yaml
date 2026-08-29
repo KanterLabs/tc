@@ -862,8 +862,10 @@ paths:
         `updated_after` can be combined. `agent_state` filters the latest
         structured agent-work snapshot; `stale` and `missing` identify
         read-time liveness conditions. `action_needed=true` selects waiting,
-        handoff, or stale snapshots. `action_needed=false` is accepted as an
-        explicit no-op filter for clients that build filters dynamically.
+        handoff, or stale snapshots among unfinished tasks; completed tasks
+        retain their snapshot as history but never match an agent-work filter.
+        `action_needed=false` is accepted as an explicit no-op filter for
+        clients that build filters dynamically.
         `state` filters by a column's semantic state. Supplied scalar filters
         are single-valued; empty identifier/enum/timestamp values and values
         outside their declared enum, format, or length are rejected with
@@ -1385,6 +1387,8 @@ paths:
         - $ref: '#/components/parameters/AssigneeFilter'
         - $ref: '#/components/parameters/ReporterFilter'
         - $ref: '#/components/parameters/IssueResolutionFilter'
+        - $ref: '#/components/parameters/AgentStateFilter'
+        - $ref: '#/components/parameters/ActionNeededFilter'
         - $ref: '#/components/parameters/SearchQuery'
         - $ref: '#/components/parameters/UpdatedAfter'
         - $ref: '#/components/parameters/Cursor'
@@ -3231,8 +3235,9 @@ components:
       description: |
         Filter by the latest agent-work state. `working`, `waiting`,
         `verifying`, and `handoff` are published states; `stale` and `missing`
-        are read-time liveness states. Values are lowercase and repeated or
-        invalid values return 400.
+        are read-time liveness states. Completed tasks retain their snapshot
+        as history but never match this filter. Values are lowercase and
+        repeated or invalid values return 400.
       schema:
         type: string
         enum:
@@ -3248,9 +3253,10 @@ components:
       in: query
       required: false
       description: |
-        Strict lowercase boolean. `true` selects waiting, handoff, or stale
-        agent-work snapshots; `false` leaves the result unfiltered. Empty,
-        malformed, or repeated values return 400.
+        Strict lowercase boolean. `true` selects unfinished waiting, handoff,
+        or stale agent-work snapshots; completed tasks never match. `false`
+        leaves the result unfiltered. Empty, malformed, or repeated values
+        return 400.
       schema:
         type: boolean
       example: true
@@ -4412,7 +4418,9 @@ components:
         The latest complete agent progress snapshot for a task. `stale` is
         derived when the snapshot has not been updated within the server's
         liveness window. `action_needed` is true for waiting, handoff, or stale
-        snapshots. Checkpoint counts are either both present or both omitted.
+        snapshots. A completed task retains this snapshot as history while
+        both liveness flags are false. Checkpoint counts are either both
+        present or both omitted.
       properties:
         operation_id:
           type: string

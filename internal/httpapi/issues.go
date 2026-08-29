@@ -77,6 +77,14 @@ func (s *Server) issues(w http.ResponseWriter, r *http.Request, identity auth.Id
 		s.writeError(w, http.StatusBadRequest, "invalid_request", err.Error(), nil)
 		return
 	}
+	if filter.AgentState, err = parseOptionalEnum(r, "agent_state", agentWorkStates); err != nil {
+		s.writeError(w, http.StatusBadRequest, "invalid_request", err.Error(), nil)
+		return
+	}
+	if filter.ActionNeeded, err = parseOptionalStrictBool(r, "action_needed"); err != nil {
+		s.writeError(w, http.StatusBadRequest, "invalid_request", err.Error(), nil)
+		return
+	}
 	if filter.Query, err = parseOptionalSearch(r); err != nil {
 		s.writeError(w, http.StatusBadRequest, "invalid_request", err.Error(), nil)
 		return

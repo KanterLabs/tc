@@ -296,6 +296,12 @@ func (s *Store) listMyWorkFiltered(ctx context.Context, actorID string, projectI
 		query += ` AND c.semantic_state=?`
 		args = append(args, filter.State)
 	}
+	// Assigned work may still show a completed task when unfiltered, preserving
+	// the legacy assignment view. Liveness filters only classify unfinished
+	// tasks, so a completed task with a retained snapshot must be excluded.
+	if !filter.LiveWork && (filter.AgentState != "" || filter.ActionNeeded) {
+		query += ` AND t.completed_at IS NULL`
+	}
 	if filter.AgentState != "" {
 		switch filter.AgentState {
 		case "missing":

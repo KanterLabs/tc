@@ -177,6 +177,7 @@ test('shows live agent work across the board, drawer, and My Work', async ({ pag
   let verifyingTask = await createTask(projectB, readyB, `Verifying pulse ${suffix}`);
   let staleTask = await createTask(projectB, activeB, `Stale pulse ${suffix}`);
   let staleWaitingTask = await createTask(projectB, activeB, `Stale dependency wait ${suffix}`);
+  let completedTask = await createTask(projectA, activeA, `Completed pulse ${suffix}`);
   const missingTask = await createTask(projectA, activeA, `Missing pulse ${suffix}`);
 
   const claimTask = async (task: Task): Promise<Task> =>
@@ -190,6 +191,7 @@ test('shows live agent work across the board, drawer, and My Work', async ({ pag
   verifyingTask = await claimTask(verifyingTask);
   staleTask = await claimTask(staleTask);
   staleWaitingTask = await claimTask(staleWaitingTask);
+  completedTask = await claimTask(completedTask);
 
   const publish = async (task: Task, state: AgentWork['state'], phase: string, summary: string, nextAction: string, refs: string[], completed: number, total: number): Promise<Task> =>
     postJSON<Task>(request, `/api/v1/tasks/${task.id}/progress`, {
@@ -256,6 +258,20 @@ test('shows live agent work across the board, drawer, and My Work', async ({ pag
     1,
     2
   );
+  completedTask = await publish(
+    completedTask,
+    'waiting',
+    'Finished work history',
+    'This retained snapshot must not remain live after completion.',
+    'No action remains.',
+    ['implementation', 'completion'],
+    2,
+    2
+  );
+  completedTask = await postJSON<Task>(request, `/api/v1/tasks/${completedTask.id}/complete`, {}, {
+    'If-Match': etagForVersion(completedTask.version),
+    'Idempotency-Key': mutationKey()
+  });
 
   const staleReadTimestamp = new Date(Date.now() - 16 * 60 * 1000).toISOString();
   const expiredClaimReadTimestamp = new Date(Date.now() - 60 * 1000).toISOString();
@@ -286,6 +302,7 @@ test('shows live agent work across the board, drawer, and My Work', async ({ pag
     if (isTaskRead) {
       ageTaskInPayload(payload, staleTask.id, staleReadTimestamp);
       ageTaskInPayload(payload, staleWaitingTask.id, staleReadTimestamp);
+      ageTaskInPayload(payload, completedTask.id, staleReadTimestamp);
       // The API has no clock-setting hook, so make this fixture's own claim
       // look expired only at the browser read boundary. This verifies that an
       // expired own claim offers Claim rather than Renew without waiting.
@@ -308,6 +325,9 @@ test('shows live agent work across the board, drawer, and My Work', async ({ pag
 
   const missingCard = board.locator('.task-card').filter({ hasText: missingTask.title });
   await expect(missingCard).toBeVisible();
+  const completedCard = board.locator('.task-card').filter({ hasText: completedTask.title });
+  await expect(completedCard).toBeVisible();
+  await expect(completedCard.locator('.agent-pulse'), 'completed cards hide retained live-work snapshots').toHaveCount(0);
   const boardWorkFilter = page.getByLabel('Filter by agent work');
   await boardWorkFilter.selectOption('working');
   await expect(workingCard).toBeVisible();
@@ -317,7 +337,20 @@ test('shows live agent work across the board, drawer, and My Work', async ({ pag
   await expect(missingCard.locator('.agent-pulse')).toContainText('No live pulse');
   await expect(missingCard.locator('.agent-pulse')).toHaveAttribute('aria-label', /No live pulse/);
   await expect(workingCard).toBeHidden();
+  await expect(completedCard).toBeHidden();
+  await boardWorkFilter.selectOption('stale');
+  await expect(completedCard, 'completed work does not match the stale filter').toBeHidden();
+  await boardWorkFilter.selectOption('action-needed');
+  await expect(completedCard, 'completed work does not match the action-needed filter').toBeHidden();
   await boardWorkFilter.selectOption('all');
+
+  await completedCard.locator('[data-task-trigger]').click();
+  const completedDrawer = page.locator('.task-drawer');
+  await expect(completedDrawer).toBeVisible();
+  await expect(completedDrawer.locator('.agent-work-panel'), 'completed drawers hide live-work details').toHaveCount(0);
+  await expect(completedDrawer.getByRole('button', { name: '✓ Completed', exact: true })).toBeDisabled();
+  await completedDrawer.getByRole('button', { name: 'Close task details', exact: true }).click();
+  await expect(completedDrawer).toBeHidden();
 
   await workingCard.locator('[data-task-trigger]').click();
   const drawer = page.locator('.task-drawer');

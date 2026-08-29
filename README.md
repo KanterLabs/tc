@@ -186,6 +186,9 @@ task collections with `agent_state` or `action_needed=true`, and use
 `/api/v1/my-work?view=live` for the Live Work view. Unscoped human identities
 may see live work across their visible projects; a project-scoped bearer token
 must include a permitted `project` query value.
+Completed tasks retain their last snapshot as history, but its `stale` and
+`action_needed` flags are inactive; completed tasks do not match live-work
+filters and the browser does not render their snapshot as a live pulse.
 
 Board-audit workflow:
 

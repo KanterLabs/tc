@@ -1352,7 +1352,7 @@
       "get": {
         "operationId": "listProjectTasks",
         "summary": "List tasks in a project",
-        "description": "Results are ordered by column position and task position. `state`,\n`column`, `kind`, `priority`, `severity`, `label`, `assignee`,\n`reporter`, `resolution`, `agent_state`, `action_needed`, `q`, and\n`updated_after` can be combined. `agent_state` filters the latest\nstructured agent-work snapshot; `stale` and `missing` identify\nread-time liveness conditions. `action_needed=true` selects waiting,\nhandoff, or stale snapshots. `action_needed=false` is accepted as an\nexplicit no-op filter for clients that build filters dynamically.\n`state` filters by a column's semantic state. Supplied scalar filters\nare single-valued; empty identifier/enum/timestamp values and values\noutside their declared enum, format, or length are rejected with\n`400`.\n",
+        "description": "Results are ordered by column position and task position. `state`,\n`column`, `kind`, `priority`, `severity`, `label`, `assignee`,\n`reporter`, `resolution`, `agent_state`, `action_needed`, `q`, and\n`updated_after` can be combined. `agent_state` filters the latest\nstructured agent-work snapshot; `stale` and `missing` identify\nread-time liveness conditions. `action_needed=true` selects waiting,\nhandoff, or stale snapshots among unfinished tasks; completed tasks\nretain their snapshot as history but never match an agent-work filter.\n`action_needed=false` is accepted as an explicit no-op filter for\nclients that build filters dynamically.\n`state` filters by a column's semantic state. Supplied scalar filters\nare single-valued; empty identifier/enum/timestamp values and values\noutside their declared enum, format, or length are rejected with\n`400`.\n",
         "tags": [
           "Tasks"
         ],
@@ -2165,6 +2165,12 @@
           },
           {
             "$ref": "#/components/parameters/IssueResolutionFilter"
+          },
+          {
+            "$ref": "#/components/parameters/AgentStateFilter"
+          },
+          {
+            "$ref": "#/components/parameters/ActionNeededFilter"
           },
           {
             "$ref": "#/components/parameters/SearchQuery"
@@ -4887,7 +4893,7 @@
         "name": "agent_state",
         "in": "query",
         "required": false,
-        "description": "Filter by the latest agent-work state. `working`, `waiting`,\n`verifying`, and `handoff` are published states; `stale` and `missing`\nare read-time liveness states. Values are lowercase and repeated or\ninvalid values return 400.\n",
+        "description": "Filter by the latest agent-work state. `working`, `waiting`,\n`verifying`, and `handoff` are published states; `stale` and `missing`\nare read-time liveness states. Completed tasks retain their snapshot\nas history but never match this filter. Values are lowercase and\nrepeated or invalid values return 400.\n",
         "schema": {
           "type": "string",
           "enum": [
@@ -4905,7 +4911,7 @@
         "name": "action_needed",
         "in": "query",
         "required": false,
-        "description": "Strict lowercase boolean. `true` selects waiting, handoff, or stale\nagent-work snapshots; `false` leaves the result unfiltered. Empty,\nmalformed, or repeated values return 400.\n",
+        "description": "Strict lowercase boolean. `true` selects unfinished waiting, handoff,\nor stale agent-work snapshots; completed tasks never match. `false`\nleaves the result unfiltered. Empty, malformed, or repeated values\nreturn 400.\n",
         "schema": {
           "type": "boolean"
         },
@@ -6545,7 +6551,7 @@
           "stale",
           "action_needed"
         ],
-        "description": "The latest complete agent progress snapshot for a task. `stale` is\nderived when the snapshot has not been updated within the server's\nliveness window. `action_needed` is true for waiting, handoff, or stale\nsnapshots. Checkpoint counts are either both present or both omitted.\n",
+        "description": "The latest complete agent progress snapshot for a task. `stale` is\nderived when the snapshot has not been updated within the server's\nliveness window. `action_needed` is true for waiting, handoff, or stale\nsnapshots. A completed task retains this snapshot as history while\nboth liveness flags are false. Checkpoint counts are either both\npresent or both omitted.\n",
         "properties": {
           "operation_id": {
             "type": "string",

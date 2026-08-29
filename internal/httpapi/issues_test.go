@@ -151,6 +151,63 @@ func TestGlobalIssuesHonorsProjectCeilingAndFilters(t *testing.T) {
 	}
 }
 
+func TestGlobalIssuesLivenessFiltersExcludeCompletedSnapshots(t *testing.T) {
+	server, data := testServer(t, "disabled")
+	ctx := context.Background()
+	actor, err := data.EnsureDisabledActor(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	project, err := data.CreateProject(ctx, store.ProjectInput{Key: stringPtr("DONEWORK"), Name: stringPtr("Completed work")}, actor.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	actual := "The old pulse remains stored."
+	bug, err := data.CreateTask(ctx, project.ID, store.TaskInput{
+		Title: stringPtr("Completed issue with retained pulse"),
+		Kind:  stringPtr("bug"),
+		Bug:   &store.BugInput{ActualBehavior: &actual},
+	}, actor.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	claimed, err := data.ClaimTask(ctx, bug.ID, actor.ID, 0, bug.Version)
+	if err != nil {
+		t.Fatal(err)
+	}
+	published, err := data.PublishAgentWork(ctx, bug.ID, store.AgentWorkInput{
+		OperationID: "issues/completed-filter",
+		State:       "handoff",
+		Summary:     "Retain this snapshot as history.",
+	}, claimed.Version, actor.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	completed, err := data.ResolveBug(ctx, bug.ID, store.ResolveBugInput{Resolution: "fixed"}, published.Version, actor.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if completed.AgentWork == nil || completed.AgentWork.ActionNeeded || completed.AgentWork.Stale {
+		t.Fatalf("completed work = %+v, want retained inactive snapshot", completed.AgentWork)
+	}
+
+	for _, query := range []string{"agent_state=handoff", "action_needed=true"} {
+		response := request(t, server, http.MethodGet, "/api/v1/issues?"+query, nil, nil)
+		if response.Code != http.StatusOK {
+			t.Fatalf("issues %s = %d, body=%s", query, response.Code, response.Body.String())
+		}
+		var collection struct {
+			Data []store.Task `json:"data"`
+		}
+		if err := json.Unmarshal(response.Body.Bytes(), &collection); err != nil {
+			t.Fatal(err)
+		}
+		if len(collection.Data) != 0 {
+			t.Fatalf("issues %s included completed task: %#v", query, collection.Data)
+		}
+	}
+}
+
 func stateColumnForTest(t *testing.T, columns []store.Column, state string) store.Column {
 	t.Helper()
 	for _, column := range columns {

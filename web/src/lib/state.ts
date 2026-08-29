@@ -23,14 +23,56 @@ export function actorName(value: Task['assignee'] | Task['claimed_by']): string 
   return typeof value === 'string' ? value : value.name;
 }
 
-export type AgentWorkDisplayStatus = AgentWorkState | 'stale' | 'missing';
+/** Runtime agent-work payloads are intentionally read defensively. */
+export type AgentWorkLike = Partial<AgentWork> & { updated_at?: string };
+
+/** Filters exposed by the board and cross-project live-work views. */
+export type AgentWorkFilter = 'all' | 'action-needed' | AgentWorkState | 'stale' | 'missing';
+
+export type AgentWorkDisplayStatus = AgentWorkState | 'stale' | 'missing' | 'completed';
 export type LiveWorkGroup = 'stale' | 'waiting' | 'handoff' | 'verifying' | 'working' | 'missing';
+export type AgentWorkBucket = LiveWorkGroup | 'completed';
+
+export interface AgentWorkStatusCounts {
+  actionNeeded: number;
+  working: number;
+  waiting: number;
+  verifying: number;
+  stale: number;
+  handoff: number;
+  missing: number;
+}
 
 type TimeValue = Date | number | string;
-type AgentWorkLike = Partial<AgentWork> & { updated_at?: string };
 type AgentWorkSource = AgentWork | AgentWorkLike | Task | null | undefined;
 
 const AGENT_WORK_STALE_AFTER_MS = 15 * 60 * 1000;
+
+/** Completion is deliberately independent from agent_work. A task may retain
+ * its last published work snapshot after completion so reopening can restore
+ * that context, while all live-work presentation stays suppressed meanwhile.
+ */
+export function isTaskCompleted(task: Pick<Task, 'completed_at'> | null | undefined, semanticState = ''): boolean {
+  return Boolean(task?.completed_at) || semanticState === 'completed';
+}
+
+/** Return the last published agent snapshot without mutating or clearing it. */
+export function agentWorkForTask(task: Pick<Task, 'agent_work'> | null | undefined): AgentWorkLike | null {
+  const candidate = task?.agent_work;
+  return candidate && typeof candidate === 'object' ? candidate as AgentWorkLike : null;
+}
+
+function taskSource(value: AgentWorkSource): Task | null {
+  if (!value || typeof value !== 'object') return null;
+  // `completed_at` is optional in older task payloads, so project/column IDs
+  // provide a second runtime discriminator for tasks that omit it.
+  if ('completed_at' in value || ('project_id' in value && 'column_id' in value)) return value as Task;
+  return null;
+}
+
+function sourceIsCompleted(value: AgentWorkSource): boolean {
+  return isTaskCompleted(taskSource(value));
+}
 
 function milliseconds(value: TimeValue | undefined | null): number | null {
   if (value instanceof Date) {
@@ -45,7 +87,13 @@ function milliseconds(value: TimeValue | undefined | null): number | null {
 
 function workValue(value: AgentWorkSource): AgentWorkLike | null {
   if (!value) return null;
-  if ('agent_work' in value) return value.agent_work ?? null;
+  if (typeof value !== 'object') return null;
+  // Tasks can omit `agent_work` when no pulse has ever been published. Do not
+  // mistake the task object itself for a partial work snapshot in that case.
+  if ('agent_work' in value || ('project_id' in value && 'column_id' in value)) {
+    const candidate = 'agent_work' in value ? (value as { agent_work?: unknown }).agent_work : null;
+    return candidate && typeof candidate === 'object' ? candidate as AgentWorkLike : null;
+  }
   return value as AgentWorkLike;
 }
 
@@ -55,6 +103,7 @@ function workUpdatedAt(value: AgentWorkSource): string | undefined {
 }
 
 function hasStaleWork(value: AgentWorkSource, now?: TimeValue): boolean {
+  if (sourceIsCompleted(value)) return false;
   const work = workValue(value);
   if (!work) return false;
   // The API's flag is useful when a response was produced on the server
@@ -72,6 +121,7 @@ function hasStaleWork(value: AgentWorkSource, now?: TimeValue): boolean {
  * boundary without changing the process clock.
  */
 export function isAgentWorkStale(value: AgentWorkSource | string, now: TimeValue = Date.now()): boolean {
+  if (typeof value !== 'string' && sourceIsCompleted(value)) return false;
   const updatedAt = typeof value === 'string' ? value : workUpdatedAt(value);
   const updated = milliseconds(updatedAt);
   const current = milliseconds(now);
@@ -93,6 +143,7 @@ export const agentWorkIsStale = isAgentWorkStale;
  * action-needed helper supplies the attention signal.
  */
 export function displayAgentWorkStatus(value: AgentWorkSource, now: TimeValue = Date.now()): AgentWorkDisplayStatus {
+  if (sourceIsCompleted(value)) return 'completed';
   const work = workValue(value);
   if (!work) return 'missing';
   if (work.state === 'waiting') return 'waiting';
@@ -109,9 +160,17 @@ export const classifyAgentWork = displayAgentWorkStatus;
 export const agentWorkDisplayStatus = displayAgentWorkStatus;
 
 /** Return whether a human should inspect or respond to the published work. */
-export function agentWorkActionNeeded(value: AgentWorkSource, now: TimeValue = Date.now()): boolean {
+export function agentWorkActionNeeded(
+  value: AgentWorkSource,
+  now: TimeValue = Date.now(),
+  semanticState = ''
+): boolean {
+  if (sourceIsCompleted(value) || semanticState === 'completed') return false;
   const work = workValue(value);
-  if (!work) return false;
+  if (!work) {
+    const task = taskSource(value);
+    return Boolean(task?.claimed_by && ['active', 'blocked'].includes(semanticState));
+  }
   return work.action_needed === true || hasStaleWork(value, now) || work.state === 'waiting' || work.state === 'handoff';
 }
 
@@ -129,6 +188,7 @@ function count(value: unknown): number | null {
  * counts produce an empty label instead of inventing progress.
  */
 export function agentWorkProgressLabel(value: AgentWorkSource): string {
+  if (sourceIsCompleted(value)) return '';
   const work = workValue(value);
   if (!work) return '';
   const completed = count(work.checkpoint_completed);
@@ -147,6 +207,7 @@ export const progressLabel = agentWorkProgressLabel;
 
 /** Determine the sort bucket used by the live-work view. */
 export function liveWorkGroup(value: AgentWorkSource, now: TimeValue = Date.now()): LiveWorkGroup {
+  if (sourceIsCompleted(value)) return 'missing';
   const work = workValue(value);
   if (!work) return 'missing';
   if (work.state === 'waiting') return 'waiting';
@@ -155,6 +216,77 @@ export function liveWorkGroup(value: AgentWorkSource, now: TimeValue = Date.now(
   if (work.state === 'verifying') return 'verifying';
   if (work.state === 'working') return 'working';
   return 'stale';
+}
+
+/** Return the live-work bucket, with completion kept distinct from missing. */
+export function agentWorkBucket(value: AgentWorkSource, now: TimeValue = Date.now()): AgentWorkBucket {
+  if (sourceIsCompleted(value)) return 'completed';
+  const work = workValue(value);
+  if (!work) return 'missing';
+  // Board filters historically group every aged snapshot as stale, including
+  // waiting work. Live Work keeps waiting as a separate presentation group.
+  if (hasStaleWork(value, now)) return 'stale';
+  if (work.state === 'waiting') return 'waiting';
+  if (work.state === 'handoff') return 'handoff';
+  if (work.state === 'verifying') return 'verifying';
+  if (work.state === 'working') return 'working';
+  return 'stale';
+}
+
+/** The compact status helpers use the same task-aware work snapshot. */
+export function agentWorkState(value: AgentWorkSource): string {
+  return workValue(value)?.state || '';
+}
+
+export function agentWorkUpdatedAt(value: AgentWorkSource): string {
+  return workValue(value)?.updated_at || '';
+}
+
+/** A missing pulse is actionable only for unfinished claimed/active work. */
+export function isMissingAgentWorkCandidate(task: Task, semanticState = ''): boolean {
+  if (isTaskCompleted(task, semanticState)) return false;
+  return !agentWorkForTask(task) && Boolean(
+    task.claimed_by || ['active', 'blocked'].includes(semanticState)
+  );
+}
+
+/** Whether the board/drawer should mount any compact agent-work indicator. */
+export function shouldShowAgentPulse(task: Task, semanticState = ''): boolean {
+  if (isTaskCompleted(task, semanticState)) return false;
+  return Boolean(agentWorkForTask(task) || isMissingAgentWorkCandidate(task, semanticState));
+}
+
+/** Completed tasks remain visible in the `all` view but never match a live
+ * agent-work bucket, including missing/action-needed candidates. */
+export function matchesAgentWorkFilter(
+  task: Task,
+  filter: AgentWorkFilter,
+  now: TimeValue = Date.now(),
+  semanticState = ''
+): boolean {
+  if (filter === 'all') return true;
+  if (isTaskCompleted(task, semanticState)) return false;
+  if (filter === 'action-needed') return agentWorkActionNeeded(task, now, semanticState);
+  if (filter === 'missing') return isMissingAgentWorkCandidate(task, semanticState);
+  return agentWorkBucket(task, now) === filter;
+}
+
+/** Count only unfinished tasks so retained completed snapshots stay inert. */
+export function agentWorkStatusCounts(
+  tasks: Task[],
+  now: TimeValue = Date.now(),
+  semanticStateForTask: (task: Task) => string = () => ''
+): AgentWorkStatusCounts {
+  const unfinished = tasks.filter((task) => !isTaskCompleted(task, semanticStateForTask(task)));
+  return {
+    actionNeeded: unfinished.filter((task) => agentWorkActionNeeded(task, now, semanticStateForTask(task))).length,
+    working: unfinished.filter((task) => agentWorkBucket(task, now) === 'working').length,
+    waiting: unfinished.filter((task) => agentWorkBucket(task, now) === 'waiting').length,
+    verifying: unfinished.filter((task) => agentWorkBucket(task, now) === 'verifying').length,
+    stale: unfinished.filter((task) => agentWorkBucket(task, now) === 'stale').length,
+    handoff: unfinished.filter((task) => agentWorkBucket(task, now) === 'handoff').length,
+    missing: unfinished.filter((task) => isMissingAgentWorkCandidate(task, semanticStateForTask(task))).length
+  };
 }
 
 const liveWorkRank: Record<LiveWorkGroup, number> = {
@@ -177,6 +309,7 @@ function liveWorkTimestamp(task: Task): number | null {
  */
 export function sortLiveWork(tasks: Task[], now: TimeValue = Date.now()): Task[] {
   return tasks
+    .filter((task) => !isTaskCompleted(task))
     .map((task, index) => ({ task, index, group: liveWorkGroup(task, now), updated: liveWorkTimestamp(task) }))
     .sort((a, b) => {
       const groupDelta = liveWorkRank[a.group] - liveWorkRank[b.group];

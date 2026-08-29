@@ -75,4 +75,15 @@ describe('AgentPulse accessible state text', () => {
     expect(pulse).toContain('Working update is stale');
     expect(pulse).toContain('Stale');
   });
+
+  it('never describes a retained completed snapshot as stale or actionable', () => {
+    const completed = {
+      ...task({ updated_at: '2026-08-28T10:00:00Z', stale: true, action_needed: true }),
+      completed_at: '2026-08-28T11:00:00Z'
+    };
+    const pulse = render(completed);
+    expect(pulse).toContain('Completed');
+    expect(pulse).not.toContain('Stale');
+    expect(pulse).not.toContain('action needed');
+  });
 });

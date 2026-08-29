@@ -1,7 +1,9 @@
 import { describe, expect, it } from 'vitest';
 import {
+  agentWorkBucket,
   agentWorkActionNeeded,
   agentWorkProgressLabel,
+  agentWorkStatusCounts,
   bugReporterId,
   bugResolution,
   bugSeverity,
@@ -12,11 +14,14 @@ import {
   formatDate,
   groupLiveWork,
   isAgentWorkStale,
+  isMissingAgentWorkCandidate,
   liveWorkGroup,
+  matchesAgentWorkFilter,
   moveTaskLocal,
   nextPosition,
   projectInitials,
   sortLiveWork,
+  shouldShowAgentPulse,
   toInputDate
 } from './state';
 import type { AgentWork, Column, Task } from './types';
@@ -126,12 +131,52 @@ describe('board state helpers', () => {
     expect(displayAgentWorkStatus(fresh, workNow)).toBe('working');
     expect(displayAgentWorkStatus(stale, workNow)).toBe('stale');
     expect(displayAgentWorkStatus(waiting, workNow)).toBe('waiting');
+    expect(agentWorkBucket(waiting, workNow)).toBe('stale');
     expect(agentWorkActionNeeded(stale, workNow)).toBe(true);
     expect(agentWorkActionNeeded(waiting, workNow)).toBe(true);
     expect(agentWorkActionNeeded(handoff, workNow)).toBe(true);
     expect(displayAgentWorkStatus(missing, workNow)).toBe('missing');
     expect(agentWorkActionNeeded(missing, workNow)).toBe(false);
     expect(displayAgentWorkStatus(liveTask('bad', { updated_at: 'bad' }), workNow)).toBe('working');
+  });
+
+  it('keeps retained completed snapshots out of every live-work surface', () => {
+    const completed = {
+      ...liveTask('completed', {
+        state: 'waiting',
+        updated_at: '2026-08-28T10:00:00Z',
+        stale: true,
+        action_needed: true
+      }),
+      completed_at: '2026-08-28T11:00:00Z'
+    };
+
+    expect(isAgentWorkStale(completed, workNow)).toBe(false);
+    expect(agentWorkActionNeeded(completed, workNow, 'completed')).toBe(false);
+    expect(agentWorkBucket(completed, workNow)).toBe('completed');
+    expect(shouldShowAgentPulse(completed, 'completed')).toBe(false);
+    expect(isMissingAgentWorkCandidate({ ...completed, agent_work: null }, 'completed')).toBe(false);
+    for (const filter of ['action-needed', 'working', 'waiting', 'verifying', 'stale', 'handoff', 'missing'] as const) {
+      expect(matchesAgentWorkFilter(completed, filter, workNow, 'completed')).toBe(false);
+    }
+    expect(matchesAgentWorkFilter(completed, 'all', workNow, 'completed')).toBe(true);
+    expect(agentWorkStatusCounts([completed], workNow, () => 'completed')).toEqual({
+      actionNeeded: 0,
+      working: 0,
+      waiting: 0,
+      verifying: 0,
+      stale: 0,
+      handoff: 0,
+      missing: 0
+    });
+    expect(sortLiveWork([completed], workNow)).toEqual([]);
+    expect(completed.agent_work?.summary).toBe('Update');
+  });
+
+  it('uses completed semantic state when a legacy payload omits completed_at', () => {
+    const legacyCompleted = liveTask('legacy-completed', { state: 'working' });
+    expect(shouldShowAgentPulse(legacyCompleted, 'completed')).toBe(false);
+    expect(matchesAgentWorkFilter(legacyCompleted, 'working', workNow, 'completed')).toBe(false);
   });
 
   it('formats checkpoint progress and refuses malformed or partial counts', () => {

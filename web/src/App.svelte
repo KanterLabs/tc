@@ -4,6 +4,12 @@
   import {
     actorId,
     actorName,
+    agentWorkActionNeeded,
+    agentWorkBucket as workBucket,
+    agentWorkForTask as agentWorkFor,
+    agentWorkState as workState,
+    agentWorkStatusCounts,
+    agentWorkUpdatedAt as workUpdatedAt,
     bugReporterId,
     bugResolution,
     bugSeverity,
@@ -13,12 +19,16 @@
     formatDate,
     formatRelative,
     isDueSoon,
+    isAgentWorkStale as isWorkStale,
+    isMissingAgentWorkCandidate,
     isOverdue,
     loadRecentProjects,
+    matchesAgentWorkFilter,
     moveTaskLocal,
     nextPosition,
     projectInitials,
     rememberProject,
+    shouldShowAgentPulse,
     sortTasks,
     toInputDate,
     type BoardFilters
@@ -40,7 +50,7 @@
     type Task,
     type Priority
   } from './lib/types';
-  import AgentPulse, { type AgentWorkLike } from './lib/components/AgentPulse.svelte';
+  import AgentPulse from './lib/components/AgentPulse.svelte';
   import AgentWorkPanel from './lib/components/AgentWorkPanel.svelte';
   import AuditReview from './lib/components/AuditReview.svelte';
   import LiveWorkRow from './lib/components/LiveWorkRow.svelte';
@@ -98,7 +108,6 @@
   const resolutionOptions: BugResolution[] = ['fixed', 'duplicate', 'not_planned', 'cannot_reproduce', 'works_as_designed'];
   const labelPalette = ['#6d5efc', '#2ea879', '#d49534', '#dc626f', '#4b9cf5'];
   const scopeOptions = ['projects:read', 'projects:write', 'tasks:read', 'tasks:write', 'tasks:claim', 'events:read'];
-  const staleAfterMs = 15 * 60 * 1000;
   const livenessRefreshIntervalMs = 60 * 1000;
 
   let booting = true;
@@ -289,15 +298,7 @@
 
   $: activeProject = projects.find((project) => project.slug === activeProjectSlug);
   $: visibleTasks = filterTasks(tasks, columns, filters).filter((task) => matchesWorkFilter(task, boardWorkFilter, pulseClock));
-  $: boardWorkCounts = {
-    actionNeeded: tasks.filter((task) => isActionNeeded(task, pulseClock)).length,
-    working: tasks.filter((task) => workBucket(task, pulseClock) === 'working').length,
-    waiting: tasks.filter((task) => workBucket(task, pulseClock) === 'waiting').length,
-    verifying: tasks.filter((task) => workBucket(task, pulseClock) === 'verifying').length,
-    stale: tasks.filter((task) => workBucket(task, pulseClock) === 'stale').length,
-    handoff: tasks.filter((task) => workBucket(task, pulseClock) === 'handoff').length,
-    missing: tasks.filter((task) => isMissingPulseCandidate(task)).length
-  };
+  $: boardWorkCounts = agentWorkStatusCounts(tasks, pulseClock, (task) => semanticStateForTask(task));
   $: visibleIssues = filterTasks(
     issueTasks.filter((task) => issueProjectFilter === 'all' || task.project_id === issueProjectFilter),
     issueColumns,
@@ -424,50 +425,12 @@
     return { destroy: () => node.removeEventListener('keydown', handleKeydown) };
   }
 
-  function agentWorkFor(task: Task): AgentWorkLike | null {
-    const candidate = (task as Task & { agent_work?: unknown }).agent_work;
-    return candidate && typeof candidate === 'object' ? candidate as AgentWorkLike : null;
-  }
-
-  function workState(task: Task): string {
-    return agentWorkFor(task)?.state || '';
-  }
-
-  function workUpdatedAt(task: Task): string {
-    return agentWorkFor(task)?.updated_at || '';
-  }
-
-  function isWorkStale(task: Task, now = pulseClock): boolean {
-    const work = agentWorkFor(task);
-    if (!work) return false;
-    if (Boolean(work.stale)) return true;
-    const updated = Date.parse(workUpdatedAt(task));
-    return !Number.isNaN(updated) && now - updated >= staleAfterMs;
-  }
-
   function isActionNeeded(task: Task, now = pulseClock): boolean {
-    const work = agentWorkFor(task);
-    if (!work) return Boolean(task.claimed_by && ['active', 'blocked'].includes(semanticStateForTask(task)));
-    return Boolean(work && (work.action_needed || isWorkStale(task, now) || work.state === 'waiting' || work.state === 'handoff'));
-  }
-
-  function workBucket(task: Task, now = pulseClock): 'stale' | 'waiting' | 'handoff' | 'verifying' | 'working' | 'missing' {
-    const work = agentWorkFor(task);
-    if (!work) return 'missing';
-    if (isWorkStale(task, now)) return 'stale';
-    if (work.state === 'waiting') return 'waiting';
-    if (work.state === 'handoff') return 'handoff';
-    if (work.state === 'verifying') return 'verifying';
-    return 'working';
+    return agentWorkActionNeeded(task, now, semanticStateForTask(task));
   }
 
   function matchesWorkFilter(task: Task, filter: WorkFilter, now = pulseClock): boolean {
-    if (filter === 'all') return true;
-    if (filter === 'action-needed') return isActionNeeded(task, now);
-    if (filter === 'missing') return isMissingPulseCandidate(task);
-    if (filter === 'stale') return workBucket(task, now) === 'stale';
-    if (filter === 'handoff') return workBucket(task, now) === 'handoff';
-    return workBucket(task, now) === filter;
+    return matchesAgentWorkFilter(task, filter, now, semanticStateForTask(task));
   }
 
   function sortWorkRows(rows: MyWorkRow[]): MyWorkRow[] {
@@ -519,16 +482,11 @@
   }
 
   function isMissingPulseCandidate(task: Task, localColumns = columns): boolean {
-    return !agentWorkFor(task) && Boolean(
-      task.claimed_by || ['active', 'blocked'].includes(semanticStateForTask(task, localColumns))
-    );
+    return isMissingAgentWorkCandidate(task, semanticStateForTask(task, localColumns));
   }
 
   function showAgentPulse(task: Task, localColumns = columns): boolean {
-    return Boolean(
-      agentWorkFor(task)
-      || isMissingPulseCandidate(task, localColumns)
-    );
+    return shouldShowAgentPulse(task, semanticStateForTask(task, localColumns));
   }
 
   function claimIsActive(task: Task, now = pulseClock): boolean {
@@ -566,6 +524,7 @@
   }
 
   function workTransitionKey(task: Task): string {
+    if (!showAgentPulse(task)) return '';
     const work = agentWorkFor(task);
     if (!work) return '';
     return `${work.state || ''}:${isWorkStale(task)}:${Boolean(work.action_needed)}`;
@@ -1830,7 +1789,9 @@
     } else if (keepInMyWork) {
       myWorkTasks = [...myWorkTasks, nextTask];
     }
-    if (previous && workTransitionKey(previous) && workTransitionKey(previous) !== workTransitionKey(nextTask)) {
+    const previousTransition = previous ? workTransitionKey(previous) : '';
+    const nextTransition = workTransitionKey(nextTask);
+    if (previousTransition && nextTransition && previousTransition !== nextTransition) {
       const status = isWorkStale(nextTask) && workState(nextTask) !== 'waiting' ? 'stale' : workState(nextTask) || 'updated';
       announce(`${nextTask.key} is now ${status}${isActionNeeded(nextTask) ? ' · action needed' : ''}.`);
     }
@@ -2720,7 +2681,7 @@
         {#if blockReasonOpen}
           <section class="block-reason-form" aria-labelledby="block-reason-heading"><label id="block-reason-heading">Why is this task blocked?<textarea rows="3" bind:value={blockReasonDraft} placeholder="Describe the dependency or decision needed." required></textarea></label><div class="form-actions"><button class="text-button" type="button" on:click={() => { blockReasonOpen = false; blockReasonDraft = ''; }}>Cancel</button><button class="button danger-button" type="button" disabled={!blockReasonDraft.trim() || taskActionLoading === drawerTask.id} on:click={() => runTaskAction('block', blockReasonDraft)}>Block task</button></div></section>
         {/if}
-              <div class="drawer-scroll"><label class="drawer-title-label"><span class="sr-only">Task title</span><input id="drawer-title" class="drawer-title-input" data-dialog-initial-focus bind:value={draftTitle} /></label><div class="drawer-meta"><span class="task-project-marker" style={`--project-color: ${projectForTask(drawerTask)?.color || '#6d5efc'}`}></span><span>{projectForTask(drawerTask)?.name || 'Project'}</span><span>·</span><span>Updated {formatRelative(drawerTask?.updated_at)}</span></div><div class="drawer-actions"><button class="button quiet-button" type="button" disabled={taskActionLoading === drawerTask?.id} on:click={() => runTaskAction(claimAction(drawerTask))}>{drawerTask.claimed_by && actorId(drawerTask.claimed_by) === user?.id && claimIsActive(drawerTask, pulseClock) ? '↻ Renew claim' : drawerTask.claimed_by && claimConflict(drawerTask, pulseClock) ? `Claimed by ${actorName(drawerTask.claimed_by) || 'agent'}` : '⚑ Claim task'}</button>{#if drawerTask.claimed_by && actorId(drawerTask.claimed_by) === user?.id && claimIsActive(drawerTask, pulseClock)}<button class="button quiet-button" type="button" disabled={taskActionLoading === drawerTask?.id} on:click={() => runTaskAction('release')}>Release</button>{/if}<button class="button complete-button" type="button" disabled={Boolean(drawerTask.completed_at) || taskActionLoading === drawerTask?.id} on:click={() => runTaskAction('complete')}>{drawerTask.completed_at ? '✓ Completed' : '✓ Complete'}</button></div>{#if agentWorkFor(drawerTask) || showAgentPulse(drawerTask)}<AgentWorkPanel task={drawerTask} now={pulseClock} actorLabel={agentLabelForTask(drawerTask)} />{/if}<section class="drawer-section"><div class="drawer-field-grid"><label>Priority<select bind:value={draftPriority}><option value="urgent">Urgent</option><option value="high">High</option><option value="normal">Normal</option><option value="low">Low</option></select></label><label>Due date<input type="date" bind:value={draftDueDate} /></label></div><label>Assignee<input bind:value={draftAssignee} placeholder="Actor ID (optional)" /></label><label>Labels <span class="optional">Comma separated</span><input bind:value={draftLabels} placeholder="frontend, design" /></label>{#if labels.filter((label) => label.project_id === drawerTask?.project_id).length}<div class="drawer-label-picker"><span class="optional">Project labels</span><div class="drawer-label-options">{#each labels.filter((label) => label.project_id === drawerTask?.project_id) as label (label.id)}<span class="drawer-label-option" style={`--label-color: ${label.color || '#8b7cf6'}`}><span>{label.name}</span><button class="icon-button tiny danger-button" type="button" aria-label={`Delete label ${label.name}`} disabled={labelDeleting === label.id} on:click|stopPropagation={() => deleteProjectLabel(label)}>×</button></span>{/each}</div></div>{/if}</section><section class="drawer-section description-section"><div class="section-heading-inline"><h2>Description</h2><span class="markdown-hint">Markdown supported</span></div><textarea class="description-input" rows="7" bind:value={draftDescription} placeholder="What does success look like?"></textarea></section><button class="button primary save-task-button" type="button" disabled={drawerSaving || !draftTitle.trim()} on:click={saveTask}>{#if drawerSaving}<span class="button-spinner"></span>{/if}Save changes</button><section class="drawer-section activity-section"><div class="section-heading-inline"><h2>Comments &amp; activity</h2><span class="activity-count">{comments.length + drawerActivity.length}</span></div><form class="comment-form" on:submit|preventDefault={postComment}><span class="avatar mini-user-avatar">{projectInitials({ name: user.name, key: user.name })}</span><textarea rows="2" bind:value={commentBody} placeholder="Leave a note for your team…"></textarea><button class="icon-button comment-send" type="submit" disabled={!commentBody.trim() || commentSending} aria-label="Add comment">↑</button></form><div class="activity-list">{#if !comments.length && !drawerActivity.length}<div class="activity-empty">No updates yet. Be the first to leave context.</div>{:else}{#each comments as comment}<article class="activity-item"><span class="activity-avatar" class:agent={typeof comment.author !== 'object' && typeof comment.actor !== 'object'}>{(commentAuthor(comment).slice(0, 1) || '?').toUpperCase()}</span><div><p><strong>{commentAuthor(comment)}</strong><span> commented</span></p><div class="comment-body">{comment.body}</div><time datetime={comment.created_at}>{formatRelative(comment.created_at)}</time></div></article>{/each}{#each drawerActivity as event}<article class="activity-item system-activity"><span class="activity-avatar event-avatar">✦</span><div><p><strong>{eventAuthor(event)}</strong><span> {displayEvent(event).toLowerCase()}</span></p><time datetime={event.created_at}>{formatRelative(event.created_at)}</time></div></article>{/each}{/if}</div></section></div>
+              <div class="drawer-scroll"><label class="drawer-title-label"><span class="sr-only">Task title</span><input id="drawer-title" class="drawer-title-input" data-dialog-initial-focus bind:value={draftTitle} /></label><div class="drawer-meta"><span class="task-project-marker" style={`--project-color: ${projectForTask(drawerTask)?.color || '#6d5efc'}`}></span><span>{projectForTask(drawerTask)?.name || 'Project'}</span><span>·</span><span>Updated {formatRelative(drawerTask?.updated_at)}</span></div><div class="drawer-actions"><button class="button quiet-button" type="button" disabled={taskActionLoading === drawerTask?.id} on:click={() => runTaskAction(claimAction(drawerTask))}>{drawerTask.claimed_by && actorId(drawerTask.claimed_by) === user?.id && claimIsActive(drawerTask, pulseClock) ? '↻ Renew claim' : drawerTask.claimed_by && claimConflict(drawerTask, pulseClock) ? `Claimed by ${actorName(drawerTask.claimed_by) || 'agent'}` : '⚑ Claim task'}</button>{#if drawerTask.claimed_by && actorId(drawerTask.claimed_by) === user?.id && claimIsActive(drawerTask, pulseClock)}<button class="button quiet-button" type="button" disabled={taskActionLoading === drawerTask?.id} on:click={() => runTaskAction('release')}>Release</button>{/if}<button class="button complete-button" type="button" disabled={Boolean(drawerTask.completed_at) || taskActionLoading === drawerTask.id} on:click={() => runTaskAction('complete')}>{drawerTask.completed_at ? '✓ Completed' : '✓ Complete'}</button></div>{#if showAgentPulse(drawerTask)}<AgentWorkPanel task={drawerTask} now={pulseClock} actorLabel={agentLabelForTask(drawerTask)} />{/if}<section class="drawer-section"><div class="drawer-field-grid"><label>Priority<select bind:value={draftPriority}><option value="urgent">Urgent</option><option value="high">High</option><option value="normal">Normal</option><option value="low">Low</option></select></label><label>Due date<input type="date" bind:value={draftDueDate} /></label></div><label>Assignee<input bind:value={draftAssignee} placeholder="Actor ID (optional)" /></label><label>Labels <span class="optional">Comma separated</span><input bind:value={draftLabels} placeholder="frontend, design" /></label>{#if labels.filter((label) => label.project_id === drawerTask?.project_id).length}<div class="drawer-label-picker"><span class="optional">Project labels</span><div class="drawer-label-options">{#each labels.filter((label) => label.project_id === drawerTask?.project_id) as label (label.id)}<span class="drawer-label-option" style={`--label-color: ${label.color || '#8b7cf6'}`}><span>{label.name}</span><button class="icon-button tiny danger-button" type="button" aria-label={`Delete label ${label.name}`} disabled={labelDeleting === label.id} on:click|stopPropagation={() => deleteProjectLabel(label)}>×</button></span>{/each}</div></div>{/if}</section><section class="drawer-section description-section"><div class="section-heading-inline"><h2>Description</h2><span class="markdown-hint">Markdown supported</span></div><textarea class="description-input" rows="7" bind:value={draftDescription} placeholder="What does success look like?"></textarea></section><button class="button primary save-task-button" type="button" disabled={drawerSaving || !draftTitle.trim()} on:click={saveTask}>{#if drawerSaving}<span class="button-spinner"></span>{/if}Save changes</button><section class="drawer-section activity-section"><div class="section-heading-inline"><h2>Comments &amp; activity</h2><span class="activity-count">{comments.length + drawerActivity.length}</span></div><form class="comment-form" on:submit|preventDefault={postComment}><span class="avatar mini-user-avatar">{projectInitials({ name: user.name, key: user.name })}</span><textarea rows="2" bind:value={commentBody} placeholder="Leave a note for your team…"></textarea><button class="icon-button comment-send" type="submit" disabled={!commentBody.trim() || commentSending} aria-label="Add comment">↑</button></form><div class="activity-list">{#if !comments.length && !drawerActivity.length}<div class="activity-empty">No updates yet. Be the first to leave context.</div>{:else}{#each comments as comment}<article class="activity-item"><span class="activity-avatar" class:agent={typeof comment.author !== 'object' && typeof comment.actor !== 'object'}>{(commentAuthor(comment).slice(0, 1) || '?').toUpperCase()}</span><div><p><strong>{commentAuthor(comment)}</strong><span> commented</span></p><div class="comment-body">{comment.body}</div><time datetime={comment.created_at}>{formatRelative(comment.created_at)}</time></div></article>{/each}{#each drawerActivity as event}<article class="activity-item system-activity"><span class="activity-avatar event-avatar">✦</span><div><p><strong>{eventAuthor(event)}</strong><span> {displayEvent(event).toLowerCase()}</span></p><time datetime={event.created_at}>{formatRelative(event.created_at)}</time></div></article>{/each}{/if}</div></section></div>
         <div class="drawer-delete-wrap"><button class="button danger-button" type="button" disabled={drawerSaving || taskActionLoading === drawerTask?.id} on:click={deleteDrawerTask}>Delete task</button></div>
       </div>
     {/if}

@@ -230,6 +230,11 @@ func appendIssueFilters(query string, args []any, filter TaskFilter, readAt time
 			args = append(args, filter.Resolution)
 		}
 	}
+	// A completed bug can retain its last agent snapshot for history, but it
+	// no longer participates in liveness filtering until reopened.
+	if filter.AgentState != "" || filter.ActionNeeded {
+		query += ` AND t.completed_at IS NULL`
+	}
 	staleCutoff := agentWorkStaleCutoff(readAt)
 	if filter.AgentState != "" {
 		switch filter.AgentState {

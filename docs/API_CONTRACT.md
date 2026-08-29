@@ -317,7 +317,10 @@ inclusive boundary. It is deterministic and is not a task failure: the server
 does not mark the task failed or release its claim merely because a pulse is
 stale. `action_needed` is true when the state is `waiting` or `handoff`, or
 when the pulse is stale. These are response/filter signals, not additional
-writeable states.
+writeable states. Completion preserves the latest snapshot as historical
+context while forcing both liveness flags to false. Completed tasks are
+excluded from every `agent_state` and `action_needed=true` result; reopening a
+task restores ordinary read-time classification of the retained snapshot.
 
 Publishing is atomic. Alongside the snapshot, the server appends a
 `task.progressed` event whose payload is bounded safe metadata (`version`,
@@ -386,7 +389,7 @@ projects; project-scoped bearer tokens may also omit `project` to search the
 union of their permitted projects. An optional `project` ID, key, or slug
 narrows the result to one permitted project. Optional filters are `project`,
 `state`, `column`, `priority`, `severity`, `label`, `assignee`, `reporter`,
-`resolution`, `q`,
+`resolution`, `agent_state`, `action_needed`, `q`,
 `updated_after`, `cursor`, and `limit`. Use `severity=untriaged` and
 `resolution=unresolved` to find bugs whose corresponding lifecycle field is
 unset. Pagination and validation follow the existing collection contract.
@@ -413,7 +416,9 @@ without a snapshot; `stale` selects snapshots whose 15-minute liveness window
 has elapsed. `action_needed`
 is a boolean filter and `action_needed=true` matches a snapshot whose state is
 `waiting`/`handoff` or whose 15-minute liveness window has elapsed. These
-filters are evaluated against the server's current time. Column names and
+filters classify unfinished work only; completed tasks never match them even
+though their last snapshot remains available on the Task response. Filters
+are evaluated against the server's current time. Column names and
 label names are matched case-insensitively. Enum values must use the
 documented lowercase spelling; mixed-case values are rejected. Enum,
 identifier, boolean, and timestamp filters reject empty, malformed, repeated,

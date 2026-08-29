@@ -444,6 +444,12 @@ func (s *Store) listTasks(ctx context.Context, projectID string, filter TaskFilt
 			args = append(args, filter.Resolution)
 		}
 	}
+	// Completion suppresses the liveness classification of a retained
+	// snapshot. Keep completed tasks visible in ordinary board listings, but
+	// never let them satisfy an agent-state/action-needed filter.
+	if filter.AgentState != "" || filter.ActionNeeded {
+		query += ` AND t.completed_at IS NULL`
+	}
 	if filter.AgentState != "" {
 		switch filter.AgentState {
 		case "missing":

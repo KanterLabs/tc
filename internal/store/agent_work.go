@@ -107,7 +107,8 @@ func scanAgentWork(scanner interface{ Scan(...any) error }) (AgentWork, error) {
 	var refsJSON string
 	var completed, total sql.NullInt64
 	var stale int
-	if err := scanner.Scan(&work.OperationID, &work.ActorID, &work.State, &work.Phase, &work.Summary, &work.NextAction, &refsJSON, &completed, &total, &work.StartedAt, &work.UpdatedAt, &stale); err != nil {
+	var taskCompleted int
+	if err := scanner.Scan(&work.OperationID, &work.ActorID, &work.State, &work.Phase, &work.Summary, &work.NextAction, &refsJSON, &completed, &total, &work.StartedAt, &work.UpdatedAt, &stale, &taskCompleted); err != nil {
 		return AgentWork{}, err
 	}
 	if err := json.Unmarshal([]byte(refsJSON), &work.CheckpointRefs); err != nil {
@@ -124,8 +125,16 @@ func scanAgentWork(scanner interface{ Scan(...any) error }) (AgentWork, error) {
 		value := int(total.Int64)
 		work.CheckpointTotal = &value
 	}
-	work.Stale = stale != 0
-	work.ActionNeeded = work.Stale || work.State == "waiting" || work.State == "handoff"
+	completedTask := taskCompleted != 0
+	if completedTask {
+		// A completed task is not actionable or stale, even when its retained
+		// snapshot is old or was waiting/handoff at completion time.
+		work.Stale = false
+		work.ActionNeeded = false
+	} else {
+		work.Stale = stale != 0
+		work.ActionNeeded = work.Stale || work.State == "waiting" || work.State == "handoff"
+	}
 	return work, nil
 }
 
@@ -139,7 +148,7 @@ func (s *Store) agentWork(ctx context.Context, taskID string) (*AgentWork, error
 // fractional-second handling at the inclusive 15-minute boundary.
 func (s *Store) agentWorkAt(ctx context.Context, taskID string, at time.Time) (*AgentWork, error) {
 	cutoff := agentWorkStaleCutoff(at)
-	row := s.DB.QueryRowContext(ctx, `SELECT operation_id, actor_id, state, phase, summary, next_action, checkpoint_refs, checkpoint_completed, checkpoint_total, started_at, updated_at, CASE WHEN julianday(updated_at) <= julianday(?) THEN 1 ELSE 0 END FROM task_agent_work WHERE task_id=?`, cutoff, taskID)
+	row := s.DB.QueryRowContext(ctx, `SELECT aw.operation_id, aw.actor_id, aw.state, aw.phase, aw.summary, aw.next_action, aw.checkpoint_refs, aw.checkpoint_completed, aw.checkpoint_total, aw.started_at, aw.updated_at, CASE WHEN julianday(aw.updated_at) <= julianday(?) THEN 1 ELSE 0 END, CASE WHEN t.completed_at IS NOT NULL THEN 1 ELSE 0 END FROM task_agent_work aw JOIN tasks t ON t.id=aw.task_id WHERE aw.task_id=? AND t.deleted_at IS NULL`, cutoff, taskID)
 	work, err := scanAgentWork(row)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
