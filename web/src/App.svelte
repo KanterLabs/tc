@@ -27,7 +27,9 @@
     moveTaskLocal,
     nextPosition,
     projectInitials,
+    parseTaskRoute,
     rememberProject,
+    taskDeepLink,
     shouldShowAgentPulse,
     sortTasks,
     toInputDate,
@@ -43,17 +45,24 @@
     type BugResolution,
     type BugSeverity,
     type Column,
-    type Comment,
     type Label,
     type Project,
+    type RoadmapActivityFilter,
     type RoadmapSummary,
     type Task,
+    type TaskTimelineFilter,
+    type TaskTimelineKind,
+    type TaskTimelineItem,
+    type TaskRouteIntent,
     type Priority
   } from './lib/types';
   import AgentPulse from './lib/components/AgentPulse.svelte';
   import AgentWorkPanel from './lib/components/AgentWorkPanel.svelte';
   import AuditReview from './lib/components/AuditReview.svelte';
   import LiveWorkRow from './lib/components/LiveWorkRow.svelte';
+  import RoadmapActivity from './lib/components/RoadmapActivity.svelte';
+  import RoadmapLiveWork from './lib/components/RoadmapLiveWork.svelte';
+  import TaskActivityTimeline from './lib/components/TaskActivityTimeline.svelte';
   import {
     mergeAuthoritativeTask,
     mergeAuthoritativeTaskList,
@@ -77,6 +86,7 @@
   };
   type WorkFilter = 'all' | 'action-needed' | 'working' | 'waiting' | 'verifying' | 'stale' | 'handoff' | 'missing';
   type MyWorkView = 'live' | 'assigned';
+  type DrawerView = 'details' | 'activity';
   type MyWorkRow = { task: Task; project?: Project; column?: Column };
 
   const priorityLabels: Record<Priority, string> = {
@@ -181,12 +191,24 @@
   let dialogReturnFocus: { element: HTMLElement | null; fallbackSelector: string } | null = null;
 
   let drawerTask: Task | null = null;
+  // The route intent is kept separate from drawer rendering so the drawer can
+  // add its Activity tab without changing dashboard link semantics.
+  let taskRouteIntent: TaskRouteIntent = 'details';
+  let taskRouteOrigin = '';
+  let drawerView: DrawerView = 'details';
   let drawerLoading = false;
   let drawerSaving = false;
   let drawerError = '';
-  let comments: Comment[] = [];
   let commentBody = '';
   let commentSending = false;
+  let drawerTimelineItems: TaskTimelineItem[] = [];
+  let drawerTimelineNextCursor = '';
+  let drawerTimelineLoading = false;
+  let drawerTimelineLoadingOlder = false;
+  let drawerTimelineError = '';
+  let drawerTimelineFilter: TaskTimelineFilter = 'all';
+  let drawerTimelineTaskId = '';
+  let drawerTimelineRequest = 0;
   let draftTitle = '';
   let draftDescription = '';
   let draftPriority: Priority = 'normal';
@@ -223,6 +245,19 @@
   let roadmapProjectId: string | undefined;
   let roadmapLoading = false;
   let roadmapError = '';
+  let roadmapLiveTasks: Task[] = [];
+  let roadmapLiveColumnsByProject: Record<string, Column[]> = {};
+  let roadmapLiveLoading = false;
+  let roadmapLiveError = '';
+  let roadmapActivityTasks: Record<string, Task> = {};
+  let roadmapActivityLoading = false;
+  let roadmapActivityError = '';
+  let roadmapActivityFilter: RoadmapActivityFilter = 'all';
+  let roadmapLiveRequest = 0;
+  let roadmapActivityRequest = 0;
+  let roadmapActorsLoaded = false;
+  let roadmapActorsLoading = false;
+  let roadmapActors: Record<string, Pick<Actor, 'id' | 'kind' | 'name'>> = {};
   let auditRefreshToken = 0;
 
   let agents: Agent[] = [];
@@ -342,9 +377,6 @@
   $: myWorkHandoffRows = sortWorkRows(myWorkRows.filter((row) => workBucket(row.task, pulseClock) === 'handoff'));
   $: myWorkVerifyingRows = sortWorkRows(myWorkRows.filter((row) => workBucket(row.task, pulseClock) === 'verifying'));
   $: myWorkWorkingRows = sortWorkRows(myWorkRows.filter((row) => workBucket(row.task, pulseClock) === 'working'));
-  $: drawerActivity = drawerTask
-    ? events.filter((event) => event.task_id === drawerTask?.id).sort((a, b) => b.cursor - a.cursor)
-    : [];
   $: roadmapTotal = roadmap?.task_total ?? roadmap?.total_tasks ?? 0;
   $: roadmapCompletion = Math.max(0, Math.min(100, roadmap?.completion_percentage ?? roadmap?.completion_percent ?? 0));
   $: roadmapCompleted = roadmap?.completed_count ?? roadmap?.completed ?? 0;
@@ -352,6 +384,7 @@
   $: roadmapDueSoon = roadmap?.due_soon_count ?? roadmap?.due_soon ?? 0;
   $: roadmapUpcoming = roadmap?.upcoming_tasks ?? roadmap?.upcoming ?? [];
   $: roadmapProject = projects.find((project) => project.id === roadmapProjectId);
+  $: roadmapActivityEvents = roadmap?.recent_activity ?? [];
   $: roadmapProjectRows = roadmap?.projects?.length
     ? roadmap.projects
     : projects.map((project) => ({
@@ -690,6 +723,9 @@
     projectListRequest += 1;
     boardRequest += 1;
     roadmapRequest += 1;
+    roadmapLiveRequest += 1;
+    roadmapActivityRequest += 1;
+    drawerTimelineRequest += 1;
     taskModalColumnsRequest += 1;
     issueRequest += 1;
     if (drawerTask) closeDrawer();
@@ -705,6 +741,14 @@
     myWorkTasks = [];
     myWorkColumnsByProject = {};
     roadmap = null;
+    roadmapLiveTasks = [];
+    roadmapLiveColumnsByProject = {};
+    roadmapLiveError = '';
+    roadmapActivityTasks = {};
+    roadmapActivityError = '';
+    roadmapActors = {};
+    roadmapActorsLoaded = false;
+    roadmapActorsLoading = false;
     events = [];
     eventsCursor = undefined;
     if (pollTimer) window.clearInterval(pollTimer);
@@ -717,6 +761,10 @@
     boardLivenessRequest += 1;
     myWorkLivenessRequest += 1;
     drawerLivenessRequest += 1;
+    drawerTimelineItems = [];
+    drawerTimelineNextCursor = '';
+    drawerTimelineError = '';
+    drawerTimelineTaskId = '';
     boardLivenessInFlight = null;
     myWorkLivenessInFlight = null;
     drawerLivenessInFlight = null;
@@ -743,6 +791,7 @@
       projects = nextProjects;
       if (selectionVersion !== projectSwitchVersion) return;
       const routeSlug = getProjectSlugFromLocation();
+      const taskRoute = getTaskRouteFromLocation();
       const remembered = localStorage.getItem('roadmap.last-project');
       const target = nextProjects.find((project) => project.slug === routeSlug) || nextProjects.find((project) => project.slug === remembered) || nextProjects[0];
       if (target) {
@@ -762,7 +811,11 @@
         || !user
       ) return;
       const path = window.location.pathname;
-      if (/^\/my-work\/?$/.test(path)) {
+      if (taskRoute && target) {
+        roadmapProjectId = undefined;
+        view = 'board';
+        await openTaskFromRoute(taskRoute, target);
+      } else if (/^\/my-work\/?$/.test(path)) {
         roadmapProjectId = undefined;
         view = 'my-work';
         await loadMyWork();
@@ -981,6 +1034,13 @@
             : project;
         });
       }
+      // These are intentionally separate reads from the aggregate summary:
+      // live work is task-scoped and activity task metadata is not embedded in
+      // the append-only event records. Both reads are guarded independently so
+      // a route change cannot paint another scope over the current Roadmap.
+      void loadRoadmapLiveWork(projectId, requestId);
+      void loadRoadmapActivityTasks(result.recent_activity || [], projectId, requestId);
+      void loadRoadmapActors(requestId);
       return true;
     } catch (error) {
       if (requestId === roadmapRequest && view === 'roadmap' && roadmapProjectId === requestedProjectId) {
@@ -989,6 +1049,131 @@
       return false;
     } finally {
       if (requestId === roadmapRequest) roadmapLoading = false;
+    }
+  }
+
+  async function loadRoadmapLiveWork(projectId: string | undefined, parentRequestId: number): Promise<void> {
+    const requestId = ++roadmapLiveRequest;
+    const requestedSession = sessionGeneration;
+    const scopeProjects = projectId
+      ? projects.filter((project) => project.id === projectId)
+      : [...projects];
+    roadmapLiveLoading = true;
+    roadmapLiveError = '';
+    try {
+      const [workResult, columnResults] = await Promise.all([
+        api.allMyWork({ view: 'live', ...(projectId ? { project: projectId } : {}) }),
+        Promise.all(scopeProjects.map(async (project) => ({
+          projectId: project.id,
+          columns: (await api.listAllColumns(project.id)).data
+        })))
+      ]);
+      if (
+        requestId !== roadmapLiveRequest
+        || parentRequestId !== roadmapRequest
+        || requestedSession !== sessionGeneration
+        || view !== 'roadmap'
+        || roadmapProjectId !== projectId
+        || !user
+      ) return;
+      roadmapLiveTasks = workResult.data;
+      roadmapLiveColumnsByProject = Object.fromEntries(columnResults.map((result) => [result.projectId, result.columns]));
+      observeWorkTransitions(roadmapLiveTasks);
+    } catch (error) {
+      if (
+        requestId === roadmapLiveRequest
+        && parentRequestId === roadmapRequest
+        && requestedSession === sessionGeneration
+        && view === 'roadmap'
+        && roadmapProjectId === projectId
+        && user
+      ) {
+        roadmapLiveError = friendlyError(error, 'Live agent work could not be loaded.');
+      }
+    } finally {
+      if (requestId === roadmapLiveRequest) roadmapLiveLoading = false;
+    }
+  }
+
+  function knownRoadmapActivityTasks(): Record<string, Task> {
+    const known: Record<string, Task> = { ...roadmapActivityTasks };
+    [...tasks, ...myWorkTasks, ...roadmapLiveTasks, ...roadmapUpcoming].forEach((task) => {
+      known[task.id] = task;
+    });
+    return known;
+  }
+
+  async function loadRoadmapActivityTasks(
+    activity: ActivityEvent[],
+    projectId: string | undefined,
+    parentRequestId: number
+  ): Promise<void> {
+    const requestId = ++roadmapActivityRequest;
+    const requestedSession = sessionGeneration;
+    const known = knownRoadmapActivityTasks();
+    const taskIds = Array.from(new Set(activity.map((event) => event.task_id).filter((id): id is string => Boolean(id))));
+    const missing = taskIds.filter((taskId) => !known[taskId]);
+    roadmapActivityLoading = missing.length > 0;
+    roadmapActivityError = '';
+    if (!missing.length) {
+      if (
+        requestId === roadmapActivityRequest
+        && parentRequestId === roadmapRequest
+        && requestedSession === sessionGeneration
+        && view === 'roadmap'
+        && roadmapProjectId === projectId
+      ) roadmapActivityTasks = known;
+      roadmapActivityLoading = false;
+      return;
+    }
+    const fetched = await Promise.all(missing.map(async (taskId) => {
+      try {
+        return await api.getTask(taskId);
+      } catch {
+        return null;
+      }
+    }));
+    if (
+      requestId !== roadmapActivityRequest
+      || parentRequestId !== roadmapRequest
+      || requestedSession !== sessionGeneration
+      || view !== 'roadmap'
+      || roadmapProjectId !== projectId
+    ) return;
+    fetched.filter((task): task is Task => Boolean(task)).forEach((task) => {
+      if (!projectId || task.project_id === projectId) known[task.id] = task;
+    });
+    roadmapActivityTasks = known;
+    roadmapActivityLoading = false;
+  }
+
+  function seedRoadmapActors() {
+    const next = { ...roadmapActors };
+    if (user) next[user.id] = { id: user.id, kind: user.kind, name: user.name };
+    agents.forEach((agent) => {
+      next[agent.id] = { id: agent.id, kind: agent.kind, name: agent.name };
+    });
+    roadmapActors = next;
+  }
+
+  async function loadRoadmapActors(parentRequestId: number): Promise<void> {
+    seedRoadmapActors();
+    if (roadmapActorsLoaded || roadmapActorsLoading) return;
+    roadmapActorsLoading = true;
+    const requestedSession = sessionGeneration;
+    try {
+      const result = await api.listAllAgents();
+      if (requestedSession !== sessionGeneration || !user) return;
+      result.data.forEach((agent) => {
+        roadmapActors[agent.id] = { id: agent.id, kind: agent.kind, name: agent.name };
+      });
+      seedRoadmapActors();
+      roadmapActorsLoaded = true;
+    } catch {
+      // A non-admin can still use Roadmap; opaque actor IDs remain explicit
+      // fallbacks when the agent directory is not readable.
+    } finally {
+      if (requestedSession === sessionGeneration && parentRequestId <= roadmapRequest) roadmapActorsLoading = false;
     }
   }
 
@@ -1160,6 +1345,9 @@
 
         if (drawerTask && affectedTaskIds.has(drawerTask.id)) {
           reloadSucceeded = (await refreshDrawerTask(drawerTask.id)) && reloadSucceeded;
+          if (drawerView === 'activity') {
+            reloadSucceeded = (await loadDrawerTimeline(drawerTask.id)) && reloadSucceeded;
+          }
         }
         // Leave the cursor where it was when any dependent read failed. The
         // next poll will replay the event and retry the authoritative refresh.
@@ -1181,6 +1369,14 @@
     return match ? decodeURIComponent(match[1]) : '';
   }
 
+  function getTaskRouteFromLocation() {
+    return parseTaskRoute(window.location.pathname, window.location.search, window.location.hash);
+  }
+
+  function isTaskLocation(): boolean {
+    return Boolean(getTaskRouteFromLocation());
+  }
+
   function isProjectRoadmapLocation(): boolean {
     return /^\/p\/[^/]+\/roadmap\/?$/.test(window.location.pathname);
   }
@@ -1192,6 +1388,32 @@
   function getAuditIdFromLocation(): string {
     const match = window.location.pathname.match(/^\/p\/[^/]+\/audits\/([^/]+)\/?$/);
     return match ? decodeURIComponent(match[1]) : '';
+  }
+
+  async function openTaskFromRoute(
+    route: NonNullable<ReturnType<typeof parseTaskRoute>>,
+    routeProject = projects.find((project) => project.slug === route.projectSlug)
+  ): Promise<void> {
+    if (!routeProject) return;
+    const candidate = [...tasks, ...myWorkTasks, ...roadmapLiveTasks, ...issueTasks]
+      .find((task) => task.project_id === routeProject.id && (task.key === route.taskReference || task.id === route.taskReference || String(task.number) === route.taskReference));
+    let task = candidate;
+    if (!task) {
+      try {
+        const loaded = await api.getTask(route.taskReference);
+        if (loaded.project_id === routeProject.id) task = loaded;
+      } catch {
+        // The route remains stable even if a deleted or inaccessible task is
+        // opened; the board error gives the person an actionable explanation.
+      }
+    }
+    if (!task) {
+      boardError = `Task ${route.taskReference} could not be found in ${routeProject.name}.`;
+      return;
+    }
+    taskRouteIntent = route.intent;
+    taskRouteOrigin = `/p/${encodeURIComponent(routeProject.slug)}`;
+    await openTask(task, route.intent);
   }
 
   function navigate(path: string, replace = false) {
@@ -1253,9 +1475,24 @@
 
   function handlePopState() {
     const slug = getProjectSlugFromLocation();
+    const taskRoute = getTaskRouteFromLocation();
     if (slug) {
       const project = projects.find((item) => item.slug === slug);
-      if (project && isProjectAuditLocation()) {
+      if (project && taskRoute) {
+        const projectChanged = activeProjectSlug !== project.slug;
+        projectSwitchVersion += 1;
+        activeProjectSlug = project.slug;
+        roadmapProjectId = undefined;
+        view = 'board';
+        if (projectChanged || !columns.length || !tasks.length) {
+          columns = [];
+          tasks = [];
+          labels = [];
+          void loadBoard().then(() => openTaskFromRoute(taskRoute, project));
+        } else {
+          void openTaskFromRoute(taskRoute, project);
+        }
+      } else if (project && isProjectAuditLocation()) {
         const projectChanged = activeProjectSlug !== project.slug;
         projectSwitchVersion += 1;
         activeProjectSlug = project.slug;
@@ -1820,23 +2057,144 @@
     }
   }
 
-  async function openTask(task: Task) {
+  function timelineKindForFilter(filter: TaskTimelineFilter): TaskTimelineKind | undefined {
+    return filter === 'all' ? undefined : filter;
+  }
+
+  function mergeDrawerTimeline(existing: TaskTimelineItem[], incoming: TaskTimelineItem[]): TaskTimelineItem[] {
+    const merged = new Map<string, TaskTimelineItem>();
+    [...existing, ...incoming].forEach((item) => merged.set(item.id, item));
+    return [...merged.values()].sort((a, b) => {
+      const aTime = Date.parse(a.created_at) || 0;
+      const bTime = Date.parse(b.created_at) || 0;
+      // Modern browsers guarantee stable Array#sort, so equal timestamps
+      // retain the API's deterministic cursor order.
+      return bTime - aTime;
+    });
+  }
+
+  async function loadDrawerTimeline(
+    taskId = drawerTask?.id,
+    options: { older?: boolean } = {}
+  ): Promise<boolean> {
+    if (!taskId) return false;
+    const older = Boolean(options.older);
+    if (drawerTimelineLoading || drawerTimelineLoadingOlder) return true;
+    const requestId = ++drawerTimelineRequest;
+    const requestedSession = sessionGeneration;
+    const requestedFilter = drawerTimelineFilter;
+    const requestedTaskId = taskId;
+    const previousItems = drawerTimelineItems;
+    const previousCursor = drawerTimelineNextCursor;
+    const hadItems = previousItems.length > 0 && drawerTimelineTaskId === taskId;
+    if (older) drawerTimelineLoadingOlder = true;
+    else drawerTimelineLoading = true;
+    drawerTimelineTaskId = taskId;
+    drawerTimelineError = '';
+    try {
+      const result = await api.listTaskTimeline(taskId, {
+        before: older ? previousCursor || undefined : undefined,
+        limit: 50,
+        kind: timelineKindForFilter(requestedFilter)
+      });
+      if (
+        requestId !== drawerTimelineRequest
+        || requestedSession !== sessionGeneration
+        || drawerTask?.id !== requestedTaskId
+        || drawerTimelineTaskId !== requestedTaskId
+        || drawerTimelineFilter !== requestedFilter
+        || !user
+      ) return false;
+      drawerTimelineItems = mergeDrawerTimeline(older ? previousItems : hadItems ? previousItems : [], result.data || []);
+      // A refresh of a list that already includes older pages must retain the
+      // existing keyset boundary; the first page's cursor would otherwise
+      // replay rows the user has already loaded.
+      drawerTimelineNextCursor = older || !hadItems ? (result.next_cursor || '') : previousCursor;
+      return true;
+    } catch (error) {
+      if (
+        requestId === drawerTimelineRequest
+        && requestedSession === sessionGeneration
+        && drawerTask?.id === requestedTaskId
+        && drawerTimelineFilter === requestedFilter
+      ) drawerTimelineError = friendlyError(error, 'Task activity could not be loaded.');
+      return false;
+    } finally {
+      if (requestId === drawerTimelineRequest) {
+        if (older) drawerTimelineLoadingOlder = false;
+        else drawerTimelineLoading = false;
+      }
+    }
+  }
+
+  function setDrawerView(next: DrawerView) {
+    if (!drawerTask) return;
+    drawerView = next;
+    taskRouteIntent = next;
+    const route = getTaskRouteFromLocation();
+    if (route) {
+      const path = taskDeepLink(route.projectSlug, route.taskReference, next);
+      if (`${window.location.pathname}${window.location.search}` !== path) window.history.replaceState({}, '', path);
+    }
+    if (
+      next === 'activity'
+      && drawerTimelineTaskId === drawerTask.id
+      && drawerTimelineError
+    ) void loadDrawerTimeline(drawerTask.id);
+    else if (next === 'activity' && drawerTimelineTaskId !== drawerTask.id) void loadDrawerTimeline(drawerTask.id);
+  }
+
+  function drawerTabKeydown(event: KeyboardEvent) {
+    if (!['ArrowLeft', 'ArrowRight', 'Home', 'End'].includes(event.key)) return;
+    event.preventDefault();
+    const next: DrawerView = event.key === 'ArrowLeft' || event.key === 'Home' ? 'details' : 'activity';
+    setDrawerView(next);
+    requestAnimationFrame(() => document.getElementById(`drawer-${next}-tab`)?.focus());
+  }
+
+  function setDrawerTimelineFilter(next: TaskTimelineFilter) {
+    if (!drawerTask || drawerTimelineFilter === next) return;
+    drawerTimelineFilter = next;
+    drawerTimelineRequest += 1;
+    drawerTimelineItems = [];
+    drawerTimelineNextCursor = '';
+    drawerTimelineTaskId = drawerTask.id;
+    drawerTimelineError = '';
+    drawerTimelineLoading = false;
+    drawerTimelineLoadingOlder = false;
+    void loadDrawerTimeline(drawerTask.id);
+  }
+
+  function loadOlderDrawerActivity() {
+    if (drawerTimelineNextCursor) void loadDrawerTimeline(drawerTask?.id, { older: true });
+  }
+
+  async function openTask(task: Task, intent: TaskRouteIntent = taskRouteIntent) {
     const requestId = ++taskDetailRequest;
     rememberDialogFocus('[data-task-trigger], .work-row');
+    taskRouteIntent = intent;
+    drawerView = intent === 'activity' ? 'activity' : 'details';
     drawerTask = task;
     drawerError = '';
-    comments = [];
     commentBody = '';
+    drawerTimelineItems = [];
+    drawerTimelineNextCursor = '';
+    drawerTimelineTaskId = task.id;
+    drawerTimelineError = '';
+    drawerTimelineFilter = 'all';
+    drawerTimelineRequest += 1;
+    drawerTimelineLoading = false;
+    drawerTimelineLoadingOlder = false;
     blockReasonDraft = '';
     blockReasonOpen = false;
     syncDraft(task);
     drawerLoading = true;
+    void loadDrawerTimeline(task.id);
     try {
-      const [detail, commentResult] = await Promise.all([api.getTask(task.id), api.listAllComments(task.id)]);
+      const detail = await api.getTask(task.id);
       if (requestId !== taskDetailRequest || drawerTask?.id !== task.id) return;
       replaceTask(detail);
       syncDraft(detail);
-      comments = commentResult.data;
     } catch (error) {
       if (requestId === taskDetailRequest && drawerTask?.id === task.id) {
         drawerError = friendlyError(error, 'Some task details could not be loaded.');
@@ -1964,13 +2322,24 @@
   }
 
   function closeDrawer() {
+    const routeOrigin = taskRouteOrigin;
     taskDetailRequest += 1;
     drawerLivenessRequest += 1;
     drawerTask = null;
+    taskRouteOrigin = '';
+    taskRouteIntent = 'details';
+    drawerView = 'details';
     drawerError = '';
-    comments = [];
+    drawerTimelineRequest += 1;
+    drawerTimelineItems = [];
+    drawerTimelineNextCursor = '';
+    drawerTimelineTaskId = '';
+    drawerTimelineError = '';
+    drawerTimelineLoading = false;
+    drawerTimelineLoadingOlder = false;
     blockReasonDraft = '';
     blockReasonOpen = false;
+    if (isTaskLocation()) navigate(routeOrigin || `/p/${encodeURIComponent(activeProjectSlug)}`);
     restoreDialogFocus();
   }
 
@@ -2193,10 +2562,17 @@
   async function postComment() {
     if (!drawerTask || !commentBody.trim()) return;
     commentSending = true;
+    const taskId = drawerTask.id;
     try {
-      const comment = await api.postComment(drawerTask.id, commentBody.trim());
-      comments = [...comments, comment];
+      await api.postComment(taskId, commentBody.trim());
       commentBody = '';
+      // The POST response is a comment resource without a timeline cursor.
+      // Refresh one newest page so the canonical timeline item is merged once
+      // and generated progress rows cannot be duplicated in the drawer.
+      drawerTimelineRequest += 1;
+      drawerTimelineLoading = false;
+      drawerTimelineLoadingOlder = false;
+      await loadDrawerTimeline(taskId);
       toast('success', 'Comment added.');
     } catch (error) {
       drawerError = friendlyError(error, 'Your comment could not be added.');
@@ -2219,22 +2595,44 @@
     await openTask(task);
   }
 
+  async function openRoadmapTask(task: Task): Promise<void> {
+    const project = projectForTask(task) || projects.find((item) => item.id === task.project_id);
+    if (!project) {
+      await openTask(task, 'activity');
+      return;
+    }
+    taskRouteOrigin = window.location.pathname + window.location.search;
+    activeProjectSlug = project.slug;
+    roadmapProjectId = undefined;
+    view = 'board';
+    recentProjectIds = rememberProject(project.id, localStorage);
+    localStorage.setItem('roadmap.last-project', project.slug);
+    navigate(taskDeepLink(project.slug, task.key, 'activity'));
+    await loadBoard();
+    await openTask(task, 'activity');
+  }
+
+  async function openRoadmapActivity(event: ActivityEvent): Promise<void> {
+    const task = event.task_id ? roadmapActivityTasks[event.task_id] : undefined;
+    if (task) {
+      await openRoadmapTask(task);
+      return;
+    }
+    if (!event.task_id) return;
+    try {
+      const loaded = await api.getTask(event.task_id);
+      if (roadmapProjectId && loaded.project_id !== roadmapProjectId) return;
+      roadmapActivityTasks = { ...roadmapActivityTasks, [loaded.id]: loaded };
+      await openRoadmapTask(loaded);
+    } catch {
+      roadmapActivityError = 'This activity points to a task that is no longer available.';
+    }
+  }
+
   function taskDueClass(task: Task): string {
     if (isOverdue(task.due_at)) return 'overdue';
     if (isDueSoon(task.due_at)) return 'due-soon';
     return '';
-  }
-
-  function authorName(value: Comment['author'] | Comment['actor'] | ActivityEvent['actor'] | string | null | undefined): string {
-    return typeof value === 'string' ? value : value?.name || 'Unknown actor';
-  }
-
-  function commentAuthor(comment: Comment): string {
-    return authorName(comment.author || comment.actor || comment.actor_id);
-  }
-
-  function eventAuthor(event: ActivityEvent): string {
-    return authorName(event.actor || event.actor_id);
   }
 
   function claimAction(task: Task | null, now = pulseClock): 'claim' | 'renew' {
@@ -2645,7 +3043,7 @@
         {:else if view === 'roadmap'}
           <section class="page-heading"><div><div class="breadcrumbs"><span>Workspace</span><span>/</span><span>{roadmapProject ? roadmapProject.key : 'Overview'}</span></div><h1>{roadmapProject ? `${roadmapProject.name} progress` : 'Roadmap overview'}</h1><p>{roadmapProject ? 'A focused view of delivery, deadlines, and recent activity for this project.' : 'A high-level pulse on every project and what needs attention next.'}</p></div><div class="heading-actions">{#if roadmapProject}<button class="button quiet-button" type="button" on:click={() => setView('roadmap')}>All projects</button>{/if}<button class="button quiet-button" type="button" on:click={() => loadRoadmap(roadmapProjectId)}>↻ Refresh</button></div></section>
           {#if roadmapError}<div class="inline-alert error content-alert" role="alert"><span>!</span>{roadmapError}<button class="text-button" type="button" on:click={() => loadRoadmap(roadmapProjectId)}>Retry</button></div>{/if}
-          {#if roadmapLoading}<div class="roadmap-skeleton"><div></div><div></div><div></div></div>{:else}<section class="roadmap-content"><div class="roadmap-hero"><div class="hero-copy"><span class="eyebrow">Workspace pulse</span><h2>Momentum, at a glance.</h2><p>Progress is calculated from each project's semantic board state.</p></div><div class="hero-progress"><div class="progress-ring" style={`--progress: ${roadmapCompletion}%`}><span>{Math.round(roadmapCompletion)}<small>%</small></span></div><div><strong>{roadmapTotal} total tasks</strong><span>{roadmap?.completed_count ?? Math.round(roadmapTotal * roadmapCompletion / 100)} completed</span></div></div></div><div class="metric-grid"><div class="metric-card"><span class="metric-icon purple">◒</span><span class="metric-label">Completion</span><strong>{Math.round(roadmapCompletion)}%</strong><span class="metric-note">Across all projects</span></div><div class="metric-card"><span class="metric-icon red">!</span><span class="metric-label">Overdue</span><strong>{roadmap?.overdue_count ?? 0}</strong><span class="metric-note">Need attention</span></div><div class="metric-card"><span class="metric-icon amber">◷</span><span class="metric-label">Due soon</span><strong>{roadmap?.due_soon_count ?? 0}</strong><span class="metric-note">Next 7 days</span></div><div class="metric-card"><span class="metric-icon green">✓</span><span class="metric-label">Completed</span><strong>{roadmap?.completed_count ?? 0}</strong><span class="metric-note">Shipped so far</span></div></div><div class="roadmap-columns"><section class="roadmap-panel project-progress-panel"><div class="panel-heading"><div><h2>Project progress</h2><p>Where each project stands today.</p></div><button class="icon-button" type="button" aria-label="Refresh progress" on:click={() => loadRoadmap(roadmapProjectId)}>↻</button></div>{#if roadmapProjectRows.length}{#each roadmapProjectRows as row}<button class="project-progress-row" type="button" on:click={() => selectProject(row.project)}><span class="project-dot" style={`--project-color: ${row.project.color || '#6d5efc'}`}>{projectInitials(row.project)}</span><span class="project-progress-name"><strong>{row.project.name}</strong><small>{row.project.key}</small></span><span class="progress-track"><span style={`width: ${row.total_tasks ? (row.completed_tasks / row.total_tasks) * 100 : 0}%; --project-color: ${row.project.color || '#6d5efc'}`}></span></span><span class="progress-number">{row.total_tasks ? Math.round((row.completed_tasks / row.total_tasks) * 100) : 0}%</span><span>→</span></button>{/each}{:else}<div class="panel-empty">Create a project to see progress here.</div>{/if}</section><section class="roadmap-panel upcoming-panel"><div class="panel-heading"><div><h2>Coming up</h2><p>Tasks with the nearest due dates.</p></div></div>{#if roadmap?.upcoming_tasks?.length}{#each roadmap.upcoming_tasks.slice(0, 5) as task}<button class="upcoming-row" type="button" on:click={() => openWorkTask(task)}><span class="upcoming-key">{task.key}</span><span class="upcoming-title">{task.title}</span><span class={`upcoming-date ${taskDueClass(task)}`}>{formatDate(task.due_at)}</span></button>{/each}{:else}<div class="panel-empty">No upcoming deadlines. Nice breathing room.</div>{/if}</section></div></section>{/if}
+          {#if roadmapLoading}<div class="roadmap-skeleton"><div></div><div></div><div></div></div>{:else}<section class="roadmap-content"><div class="roadmap-hero"><div class="hero-copy"><span class="eyebrow">Workspace pulse</span><h2>Momentum, at a glance.</h2><p>Progress is calculated from each project's semantic board state.</p></div><div class="hero-progress"><div class="progress-ring" style={`--progress: ${roadmapCompletion}%`}><span>{Math.round(roadmapCompletion)}<small>%</small></span></div><div><strong>{roadmapTotal} total tasks</strong><span>{roadmap?.completed_count ?? Math.round(roadmapTotal * roadmapCompletion / 100)} completed</span></div></div></div><div class="metric-grid"><div class="metric-card"><span class="metric-icon purple">◒</span><span class="metric-label">Completion</span><strong>{Math.round(roadmapCompletion)}%</strong><span class="metric-note">Across all projects</span></div><div class="metric-card"><span class="metric-icon red">!</span><span class="metric-label">Overdue</span><strong>{roadmap?.overdue_count ?? 0}</strong><span class="metric-note">Need attention</span></div><div class="metric-card"><span class="metric-icon amber">◷</span><span class="metric-label">Due soon</span><strong>{roadmap?.due_soon_count ?? 0}</strong><span class="metric-note">Next 7 days</span></div><div class="metric-card"><span class="metric-icon green">✓</span><span class="metric-label">Completed</span><strong>{roadmap?.completed_count ?? 0}</strong><span class="metric-note">Shipped so far</span></div></div><RoadmapLiveWork tasks={roadmapLiveTasks} {projects} columnsByProject={roadmapLiveColumnsByProject} actors={roadmapActors} now={pulseClock} loading={roadmapLiveLoading} error={roadmapLiveError} onOpen={openRoadmapTask} onViewAll={() => setView('my-work')} /><div class="roadmap-columns"><section class="roadmap-panel project-progress-panel"><div class="panel-heading"><div><h2>Project progress</h2><p>Where each project stands today.</p></div><button class="icon-button" type="button" aria-label="Refresh progress" on:click={() => loadRoadmap(roadmapProjectId)}>↻</button></div>{#if roadmapProjectRows.length}{#each roadmapProjectRows as row}<button class="project-progress-row" type="button" on:click={() => selectProject(row.project)}><span class="project-dot" style={`--project-color: ${row.project.color || '#6d5efc'}`}>{projectInitials(row.project)}</span><span class="project-progress-name"><strong>{row.project.name}</strong><small>{row.project.key}</small></span><span class="progress-track"><span style={`width: ${row.total_tasks ? (row.completed_tasks / row.total_tasks) * 100 : 0}%; --project-color: ${row.project.color || '#6d5efc'}`}></span></span><span class="progress-number">{row.total_tasks ? Math.round((row.completed_tasks / row.total_tasks) * 100) : 0}%</span><span>→</span></button>{/each}{:else}<div class="panel-empty">Create a project to see progress here.</div>{/if}</section><section class="roadmap-panel upcoming-panel"><div class="panel-heading"><div><h2>Coming up</h2><p>Tasks with the nearest due dates.</p></div></div>{#if roadmap?.upcoming_tasks?.length}{#each roadmap.upcoming_tasks.slice(0, 5) as task}<button class="upcoming-row" type="button" on:click={() => openWorkTask(task)}><span class="upcoming-key">{task.key}</span><span class="upcoming-title">{task.title}</span><span class={`upcoming-date ${taskDueClass(task)}`}>{formatDate(task.due_at)}</span></button>{/each}{:else}<div class="panel-empty">No upcoming deadlines. Nice breathing room.</div>{/if}</section></div><RoadmapActivity events={roadmapActivityEvents} tasksById={roadmapActivityTasks} {projects} actors={roadmapActors} filter={roadmapActivityFilter} loading={roadmapActivityLoading} error={roadmapActivityError} onFilterChange={(next) => roadmapActivityFilter = next} onOpen={openRoadmapActivity} /></section>{/if}
         {:else}
           <section class="page-heading"><div><div class="breadcrumbs"><span>Workspace</span><span>/</span><span>Preferences</span></div><h1>Settings</h1><p>Manage the agents and tokens that help your workspace move.</p></div></section>
           {#if agentsError}<div class="inline-alert error content-alert" role="alert"><span>!</span>{agentsError}<button class="text-button" type="button" on:click={loadAgents}>Retry</button></div>{/if}
@@ -2656,10 +3054,16 @@
 
     {#if drawerTask}
       <div class="drawer-backdrop" role="presentation" on:click={closeDrawer}></div>
-      <div class="task-drawer" role="dialog" aria-modal="true" aria-labelledby="drawer-title" use:focusTrap>
+      <div class="task-drawer" role="dialog" aria-modal="true" aria-label={`${drawerTask.key}: ${drawerTask.title}`} use:focusTrap>
         <div class="drawer-header"><div><span class="drawer-key">{drawerTask.key}</span><span class="issue-kind-badge" class:task-kind={drawerTask.kind !== 'bug'}>{drawerTask.kind === 'bug' ? 'Bug' : 'Task'}</span>{#if drawerTask.kind === 'bug'}<span class:untriaged={!drawerTask.bug?.severity} class="severity-badge">{drawerTask.bug?.severity ? severityLabels[drawerTask.bug.severity] : 'Untriaged'}</span>{/if}<span class={`priority-pill priority-${drawerTask.priority}`}>{priorityLabels[drawerTask.priority]}</span></div><button class="icon-button" type="button" aria-label="Close task details" on:click={closeDrawer}>×</button></div>
         {#if drawerLoading}<div class="drawer-loading"><span class="spinner"></span><span>Loading task details…</span></div>{/if}
         {#if drawerError}<div class="inline-alert error drawer-alert" role="alert"><span>!</span>{drawerError}</div>{/if}
+        <div class="drawer-tabs" role="tablist" aria-label="Task views">
+          <button class:active={drawerView === 'details'} id="drawer-details-tab" class="drawer-tab" type="button" role="tab" aria-selected={drawerView === 'details'} aria-controls="drawer-details-panel" tabindex={drawerView === 'details' ? 0 : -1} on:click={() => setDrawerView('details')} on:keydown={drawerTabKeydown}>Details</button>
+          <button class:active={drawerView === 'activity'} id="drawer-activity-tab" class="drawer-tab" type="button" role="tab" aria-selected={drawerView === 'activity'} aria-controls="drawer-activity-panel" tabindex={drawerView === 'activity' ? 0 : -1} on:click={() => setDrawerView('activity')} on:keydown={drawerTabKeydown}>Activity</button>
+        </div>
+        {#if drawerView === 'details'}
+        <div id="drawer-details-panel" class="drawer-details-panel" role="tabpanel" aria-labelledby="drawer-details-tab">
         {#if drawerTask.kind === 'bug'}
           <div class="drawer-bug-controls">
             <section class="drawer-section bug-details-section" aria-labelledby="bug-details-heading"><div class="section-heading-inline"><h2 id="bug-details-heading">Bug report</h2><span class="optional">Reporter: {drawerTask.bug?.reporter_id || 'Unknown'}</span></div><label>Actual behavior<textarea rows="3" bind:value={draftBugActual} placeholder="What happened?"></textarea></label><label>Expected behavior<textarea rows="3" bind:value={draftBugExpected} placeholder="What should have happened?"></textarea></label><label>Reproduction steps<textarea rows="3" bind:value={draftBugReproduction} placeholder="1. Open…&#10;2. Click…"></textarea></label><div class="drawer-field-grid"><label>Environment<input bind:value={draftBugEnvironment} placeholder="Browser, OS, device" /></label><label>Affected version<input bind:value={draftBugVersion} placeholder="e.g. 1.4.0" /></label></div></section>
@@ -2681,7 +3085,31 @@
         {#if blockReasonOpen}
           <section class="block-reason-form" aria-labelledby="block-reason-heading"><label id="block-reason-heading">Why is this task blocked?<textarea rows="3" bind:value={blockReasonDraft} placeholder="Describe the dependency or decision needed." required></textarea></label><div class="form-actions"><button class="text-button" type="button" on:click={() => { blockReasonOpen = false; blockReasonDraft = ''; }}>Cancel</button><button class="button danger-button" type="button" disabled={!blockReasonDraft.trim() || taskActionLoading === drawerTask.id} on:click={() => runTaskAction('block', blockReasonDraft)}>Block task</button></div></section>
         {/if}
-              <div class="drawer-scroll"><label class="drawer-title-label"><span class="sr-only">Task title</span><input id="drawer-title" class="drawer-title-input" data-dialog-initial-focus bind:value={draftTitle} /></label><div class="drawer-meta"><span class="task-project-marker" style={`--project-color: ${projectForTask(drawerTask)?.color || '#6d5efc'}`}></span><span>{projectForTask(drawerTask)?.name || 'Project'}</span><span>·</span><span>Updated {formatRelative(drawerTask?.updated_at)}</span></div><div class="drawer-actions"><button class="button quiet-button" type="button" disabled={taskActionLoading === drawerTask?.id} on:click={() => runTaskAction(claimAction(drawerTask))}>{drawerTask.claimed_by && actorId(drawerTask.claimed_by) === user?.id && claimIsActive(drawerTask, pulseClock) ? '↻ Renew claim' : drawerTask.claimed_by && claimConflict(drawerTask, pulseClock) ? `Claimed by ${actorName(drawerTask.claimed_by) || 'agent'}` : '⚑ Claim task'}</button>{#if drawerTask.claimed_by && actorId(drawerTask.claimed_by) === user?.id && claimIsActive(drawerTask, pulseClock)}<button class="button quiet-button" type="button" disabled={taskActionLoading === drawerTask?.id} on:click={() => runTaskAction('release')}>Release</button>{/if}<button class="button complete-button" type="button" disabled={Boolean(drawerTask.completed_at) || taskActionLoading === drawerTask.id} on:click={() => runTaskAction('complete')}>{drawerTask.completed_at ? '✓ Completed' : '✓ Complete'}</button></div>{#if showAgentPulse(drawerTask)}<AgentWorkPanel task={drawerTask} now={pulseClock} actorLabel={agentLabelForTask(drawerTask)} />{/if}<section class="drawer-section"><div class="drawer-field-grid"><label>Priority<select bind:value={draftPriority}><option value="urgent">Urgent</option><option value="high">High</option><option value="normal">Normal</option><option value="low">Low</option></select></label><label>Due date<input type="date" bind:value={draftDueDate} /></label></div><label>Assignee<input bind:value={draftAssignee} placeholder="Actor ID (optional)" /></label><label>Labels <span class="optional">Comma separated</span><input bind:value={draftLabels} placeholder="frontend, design" /></label>{#if labels.filter((label) => label.project_id === drawerTask?.project_id).length}<div class="drawer-label-picker"><span class="optional">Project labels</span><div class="drawer-label-options">{#each labels.filter((label) => label.project_id === drawerTask?.project_id) as label (label.id)}<span class="drawer-label-option" style={`--label-color: ${label.color || '#8b7cf6'}`}><span>{label.name}</span><button class="icon-button tiny danger-button" type="button" aria-label={`Delete label ${label.name}`} disabled={labelDeleting === label.id} on:click|stopPropagation={() => deleteProjectLabel(label)}>×</button></span>{/each}</div></div>{/if}</section><section class="drawer-section description-section"><div class="section-heading-inline"><h2>Description</h2><span class="markdown-hint">Markdown supported</span></div><textarea class="description-input" rows="7" bind:value={draftDescription} placeholder="What does success look like?"></textarea></section><button class="button primary save-task-button" type="button" disabled={drawerSaving || !draftTitle.trim()} on:click={saveTask}>{#if drawerSaving}<span class="button-spinner"></span>{/if}Save changes</button><section class="drawer-section activity-section"><div class="section-heading-inline"><h2>Comments &amp; activity</h2><span class="activity-count">{comments.length + drawerActivity.length}</span></div><form class="comment-form" on:submit|preventDefault={postComment}><span class="avatar mini-user-avatar">{projectInitials({ name: user.name, key: user.name })}</span><textarea rows="2" bind:value={commentBody} placeholder="Leave a note for your team…"></textarea><button class="icon-button comment-send" type="submit" disabled={!commentBody.trim() || commentSending} aria-label="Add comment">↑</button></form><div class="activity-list">{#if !comments.length && !drawerActivity.length}<div class="activity-empty">No updates yet. Be the first to leave context.</div>{:else}{#each comments as comment}<article class="activity-item"><span class="activity-avatar" class:agent={typeof comment.author !== 'object' && typeof comment.actor !== 'object'}>{(commentAuthor(comment).slice(0, 1) || '?').toUpperCase()}</span><div><p><strong>{commentAuthor(comment)}</strong><span> commented</span></p><div class="comment-body">{comment.body}</div><time datetime={comment.created_at}>{formatRelative(comment.created_at)}</time></div></article>{/each}{#each drawerActivity as event}<article class="activity-item system-activity"><span class="activity-avatar event-avatar">✦</span><div><p><strong>{eventAuthor(event)}</strong><span> {displayEvent(event).toLowerCase()}</span></p><time datetime={event.created_at}>{formatRelative(event.created_at)}</time></div></article>{/each}{/if}</div></section></div>
+              <div class="drawer-scroll"><label class="drawer-title-label"><span class="sr-only">Task title</span><input id="drawer-title" class="drawer-title-input" data-dialog-initial-focus bind:value={draftTitle} /></label><div class="drawer-meta"><span class="task-project-marker" style={`--project-color: ${projectForTask(drawerTask)?.color || '#6d5efc'}`}></span><span>{projectForTask(drawerTask)?.name || 'Project'}</span><span>·</span><span>Updated {formatRelative(drawerTask?.updated_at)}</span></div><div class="drawer-actions"><button class="button quiet-button" type="button" disabled={taskActionLoading === drawerTask?.id} on:click={() => runTaskAction(claimAction(drawerTask))}>{drawerTask.claimed_by && actorId(drawerTask.claimed_by) === user?.id && claimIsActive(drawerTask, pulseClock) ? '↻ Renew claim' : drawerTask.claimed_by && claimConflict(drawerTask, pulseClock) ? `Claimed by ${actorName(drawerTask.claimed_by) || 'agent'}` : '⚑ Claim task'}</button>{#if drawerTask.claimed_by && actorId(drawerTask.claimed_by) === user?.id && claimIsActive(drawerTask, pulseClock)}<button class="button quiet-button" type="button" disabled={taskActionLoading === drawerTask?.id} on:click={() => runTaskAction('release')}>Release</button>{/if}<button class="button complete-button" type="button" disabled={Boolean(drawerTask.completed_at) || taskActionLoading === drawerTask.id} on:click={() => runTaskAction('complete')}>{drawerTask.completed_at ? '✓ Completed' : '✓ Complete'}</button></div>{#if showAgentPulse(drawerTask)}<AgentWorkPanel task={drawerTask} now={pulseClock} actorLabel={agentLabelForTask(drawerTask)} />{/if}<section class="drawer-section"><div class="drawer-field-grid"><label>Priority<select bind:value={draftPriority}><option value="urgent">Urgent</option><option value="high">High</option><option value="normal">Normal</option><option value="low">Low</option></select></label><label>Due date<input type="date" bind:value={draftDueDate} /></label></div><label>Assignee<input bind:value={draftAssignee} placeholder="Actor ID (optional)" /></label><label>Labels <span class="optional">Comma separated</span><input bind:value={draftLabels} placeholder="frontend, design" /></label>{#if labels.filter((label) => label.project_id === drawerTask?.project_id).length}<div class="drawer-label-picker"><span class="optional">Project labels</span><div class="drawer-label-options">{#each labels.filter((label) => label.project_id === drawerTask?.project_id) as label (label.id)}<span class="drawer-label-option" style={`--label-color: ${label.color || '#8b7cf6'}`}><span>{label.name}</span><button class="icon-button tiny danger-button" type="button" aria-label={`Delete label ${label.name}`} disabled={labelDeleting === label.id} on:click|stopPropagation={() => deleteProjectLabel(label)}>×</button></span>{/each}</div></div>{/if}</section><section class="drawer-section description-section"><div class="section-heading-inline"><h2>Description</h2><span class="markdown-hint">Markdown supported</span></div><textarea class="description-input" rows="7" bind:value={draftDescription} placeholder="What does success look like?"></textarea></section><button class="button primary save-task-button" type="button" disabled={drawerSaving || !draftTitle.trim()} on:click={saveTask}>{#if drawerSaving}<span class="button-spinner"></span>{/if}Save changes</button></div>
+        </div>
+        {:else}
+          <div id="drawer-activity-panel" class="drawer-scroll drawer-activity-scroll" role="tabpanel" aria-labelledby="drawer-activity-tab">
+            {#if showAgentPulse(drawerTask)}<AgentWorkPanel task={drawerTask} now={pulseClock} actorLabel={agentLabelForTask(drawerTask)} />{/if}
+            <section class="drawer-section activity-section drawer-timeline-section">
+              <form class="comment-form" on:submit|preventDefault={postComment}>
+                <span class="avatar mini-user-avatar">{projectInitials({ name: user.name, key: user.name })}</span>
+                <textarea rows="2" bind:value={commentBody} placeholder="Leave a note for your team…" aria-label="Comment"></textarea>
+                <button class="icon-button comment-send" type="submit" disabled={!commentBody.trim() || commentSending} aria-label="Add comment">↑</button>
+              </form>
+              <TaskActivityTimeline
+                items={drawerTimelineItems}
+                filter={drawerTimelineFilter}
+                loading={drawerTimelineLoading}
+                loadingOlder={drawerTimelineLoadingOlder}
+                error={drawerTimelineError}
+                hasOlder={Boolean(drawerTimelineNextCursor)}
+                onFilterChange={setDrawerTimelineFilter}
+                onLoadOlder={loadOlderDrawerActivity}
+                onRetry={() => { void loadDrawerTimeline(drawerTask?.id); }}
+              />
+            </section>
+          </div>
+        {/if}
         <div class="drawer-delete-wrap"><button class="button danger-button" type="button" disabled={drawerSaving || taskActionLoading === drawerTask?.id} on:click={deleteDrawerTask}>Delete task</button></div>
       </div>
     {/if}

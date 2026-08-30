@@ -23,6 +23,8 @@ import {
   type BugResolution,
   type RoadmapSummary,
   type Task,
+  type TaskTimelineCollection,
+  type TaskTimelineKind,
   type TaskMoveInput,
   type TaskPatch,
   type TriageInput,
@@ -314,6 +316,14 @@ export const api = {
       body: { body },
       idempotencyKey: key()
     }),
+  listTaskTimeline: (task: string, params: { before?: string; limit?: number; kind?: TaskTimelineKind } = {}) =>
+    request<TaskTimelineCollection>(
+      pathWithQuery(`/tasks/${encodeURIComponent(task)}/timeline`, {
+        before: params.before,
+        limit: params.limit ?? 50,
+        kind: params.kind
+      })
+    ),
 
   claimTask: (task: string, version: number, leaseSeconds = 3600) =>
     request<Task>(`/tasks/${encodeURIComponent(task)}/claim`, {

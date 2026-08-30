@@ -148,6 +148,17 @@ describe('public API client', () => {
     expect((blockInit.headers as Headers).get('Idempotency-Key')).toMatch(/^roadmap-|^[0-9a-f-]{20,}$/);
   });
 
+  it('lists a typed task timeline with stable cursor and kind filters', async () => {
+    const fetchMock = vi.spyOn(globalThis, 'fetch').mockResolvedValue(response({ data: [], next_cursor: 'older-cursor' }));
+    await api.listTaskTimeline('task/1', { before: 'cursor/2', limit: 25, kind: 'comment' });
+    expect(fetchMock).toHaveBeenCalledOnce();
+    const url = new URL(String(fetchMock.mock.calls[0][0]), 'http://localhost');
+    expect(url.pathname).toBe('/api/v1/tasks/task%2F1/timeline');
+    expect(url.searchParams.get('before')).toBe('cursor/2');
+    expect(url.searchParams.get('limit')).toBe('25');
+    expect(url.searchParams.get('kind')).toBe('comment');
+  });
+
   it('supports assigned/live work views and preserves filters while collecting pages', async () => {
     const fetchMock = vi.spyOn(globalThis, 'fetch')
       .mockResolvedValueOnce(response({ data: [], next_cursor: null }))

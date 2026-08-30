@@ -20,8 +20,15 @@ import {
   moveTaskLocal,
   nextPosition,
   projectInitials,
+  roadmapActivityKind,
+  roadmapActivityLabel,
+  roadmapLiveWorkCounts,
+  matchesRoadmapActivity,
+  parseTaskRoute,
+  sortRoadmapLiveWork,
   sortLiveWork,
   shouldShowAgentPulse,
+  taskDeepLink,
   toInputDate
 } from './state';
 import type { AgentWork, Column, Task } from './types';
@@ -219,5 +226,35 @@ describe('board state helpers', () => {
     expect(lookup.get('p')?.get('active')?.name).toBe('In progress');
     expect(lookup.get('p-2')?.get('ready-2')?.semantic_state).toBe('ready');
     expect(lookup.get('p')?.get('ready-2')).toBeUndefined();
+  });
+
+  it('prioritizes Roadmap live work and exposes scoped counts', () => {
+    const stale = liveTask('stale', { state: 'working', updated_at: '2026-08-28T11:00:00Z' });
+    const waiting = liveTask('waiting', { state: 'waiting', updated_at: '2026-08-28T11:56:00Z' });
+    const working = liveTask('working', { state: 'working', updated_at: '2026-08-28T11:59:00Z' });
+    expect(sortRoadmapLiveWork([working, stale, waiting], workNow).map((task) => task.id)).toEqual(['waiting', 'stale', 'working']);
+    expect(roadmapLiveWorkCounts([working, stale, waiting], workNow)).toEqual({ working: 1, needsYou: 2, stale: 1 });
+  });
+
+  it('classifies recent activity without inventing timeline records', () => {
+    expect(roadmapActivityKind({ type: 'task.progressed' })).toBe('agent-updates');
+    expect(roadmapActivityKind({ type: 'comment.created' })).toBe('comments');
+    expect(roadmapActivityKind({ type: 'task.moved' })).toBe('task-changes');
+    expect(matchesRoadmapActivity({ type: 'task.progressed' }, 'agent-updates')).toBe(true);
+    expect(matchesRoadmapActivity({ type: 'task.progressed' }, 'comments')).toBe(false);
+    expect(roadmapActivityLabel({ type: 'task.progressed' })).toBe('updated agent progress');
+    expect(roadmapActivityLabel({ type: 'task.moved' })).toBe('moved the task');
+  });
+
+  it('round-trips stable task links and activity intent aliases', () => {
+    expect(taskDeepLink('Product Ops', 'OPS-7', 'activity')).toBe('/p/Product%20Ops/tasks/OPS-7?view=activity');
+    expect(parseTaskRoute('/p/Product%20Ops/tasks/OPS-7', '?view=activity')).toEqual({
+      projectSlug: 'Product Ops',
+      taskReference: 'OPS-7',
+      intent: 'activity'
+    });
+    expect(parseTaskRoute('/p/Product%20Ops/tasks/OPS-7', '?intent=activity')).toMatchObject({ intent: 'activity' });
+    expect(parseTaskRoute('/p/Product%20Ops/tasks/OPS-7', '', '#activity')).toMatchObject({ intent: 'activity' });
+    expect(parseTaskRoute('/p/Product%20Ops/roadmap')).toBeNull();
   });
 });

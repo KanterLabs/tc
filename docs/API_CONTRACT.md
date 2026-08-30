@@ -98,6 +98,7 @@ defaults to `#94a3b8` when omitted or null.
 - `GET /api/v1/issues`
 - `GET|PATCH|DELETE /api/v1/tasks/{task}`
 - `GET|POST /api/v1/tasks/{task}/comments`
+- `GET /api/v1/tasks/{task}/timeline`
 - `POST /api/v1/tasks/{task}/claim`
 - `POST /api/v1/tasks/{task}/progress`
 - `POST /api/v1/tasks/{task}/renew`
@@ -335,6 +336,33 @@ Comments return `id`, `task_id`, `actor_id`, `body`, `created_at`, and
 `updated_at`. On create, `body` and compatibility field `text` are accepted;
 when both are non-empty, `body` wins, otherwise a non-empty `text` is used.
 Both empty returns `400`.
+
+### Durable task activity timeline
+
+`GET /api/v1/tasks/{task}/timeline` requires `tasks:read` and returns the
+task's durable activity as `{ "data": [...], "next_cursor": "" }`. The page
+is newest-first and accepts `limit` (default 50, capped at 200), an optional
+`kind` filter (`agent_progress`, `comment`, or `task_change`), and an opaque
+`before` cursor from a prior item or `next_cursor`. Cursors are keyset
+boundaries rather than offsets, so newer writes do not shift an older page;
+malformed, empty, repeated, or overlong `before` values return `400`.
+
+Each item has `id`, its stable opaque `cursor`, `kind`, `task_id`, an enriched
+`actor` (`id`, `kind`, and `name`, or `null` when the actor no longer exists),
+`created_at`, and exactly one typed payload. `agent_progress` uses `progress`
+with the persisted operation, state, phase, summary, next action, checkpoint
+references/counts, and start time. `comment` carries the canonical Comment
+object. `task_change` carries the original event ID/type/payload. The other
+two payload fields are JSON `null`.
+
+Progress publication appends one immutable structured history row while
+retaining `task_agent_work` as the latest snapshot. Its generated narrative
+comment and `comment.created` event are de-duplicated from the timeline and
+represented by one `agent_progress` item. Ordinary comments are represented
+once by their `comment` item; their `comment.created` event is not emitted as
+a second change. Events and comments written before the history migration
+remain readable, with legacy progress events represented as generic
+`task_change` items rather than inferred rich progress records.
 
 ### Built-in bug tracker (internal MVP)
 

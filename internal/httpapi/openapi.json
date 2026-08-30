@@ -2694,6 +2694,107 @@
         }
       }
     },
+    "/api/v1/tasks/{task}/timeline": {
+      "parameters": [
+        {
+          "$ref": "#/components/parameters/TaskPath"
+        }
+      ],
+      "get": {
+        "operationId": "listTaskTimeline",
+        "summary": "List unified task activity",
+        "description": "Return the durable newest-first task activity stream, merging\nstructured agent progress, comments, and task-change events. The\nresponse uses stable opaque keyset cursors: pass `next_cursor` as\n`before` to load older activity. Generated progress comments and their\n`comment.created` events are represented once by the corresponding\n`agent_progress` item. Legacy comments and events remain available as\ncomments or generic `task_change` items without inferred progress\nfields. Timeline reads require `tasks:read`.\n",
+        "tags": [
+          "Tasks"
+        ],
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/BeforeTimelineCursor"
+          },
+          {
+            "$ref": "#/components/parameters/TimelineKind"
+          },
+          {
+            "$ref": "#/components/parameters/Limit"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Newest-first unified task activity page",
+            "headers": {
+              "X-Request-ID": {
+                "$ref": "#/components/headers/XRequestID"
+              },
+              "X-Roadmap-Revision": {
+                "$ref": "#/components/headers/XRoadmapRevision"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TaskTimelineCollection"
+                },
+                "example": {
+                  "data": [
+                    {
+                      "id": "progress_01",
+                      "cursor": "eyJ2IjoxLCJhdCI6IjIwMjYtMDgtMjdUMTA6MzA6MDBaIiwiZWMiOjQ0LCJrIjoiYWdlbnRfcHJvZ3Jlc3MiLCJpZCI6InByb2dyZXNzXzAxIn0",
+                      "kind": "agent_progress",
+                      "task_id": "task_42",
+                      "actor": {
+                        "id": "agent_ada",
+                        "kind": "agent",
+                        "name": "Build agent"
+                      },
+                      "created_at": "2026-08-27T10:30:00Z",
+                      "progress": {
+                        "operation_id": "codex/ops-release",
+                        "actor_id": "agent_ada",
+                        "state": "working",
+                        "phase": "Implementing event polling",
+                        "summary": "Added the progress persistence and HTTP contract.",
+                        "next_action": "Run the focused API tests.",
+                        "checkpoint_refs": [
+                          "api-contract",
+                          "http-tests"
+                        ],
+                        "checkpoint_completed": 1,
+                        "checkpoint_total": 2,
+                        "started_at": "2026-08-27T10:00:00Z"
+                      },
+                      "comment": null,
+                      "change": null
+                    }
+                  ],
+                  "next_cursor": ""
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalServerError"
+          },
+          "503": {
+            "$ref": "#/components/responses/ServiceUnavailable"
+          }
+        }
+      }
+    },
     "/api/v1/tasks/{task}/progress": {
       "parameters": [
         {
@@ -4693,6 +4794,33 @@
           "minLength": 1
         },
         "example": "MjU"
+      },
+      "BeforeTimelineCursor": {
+        "name": "before",
+        "in": "query",
+        "required": false,
+        "description": "Opaque item cursor returned by a prior timeline page. Omit for the newest page; malformed, empty, or repeated values are invalid.",
+        "schema": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 2048
+        },
+        "example": "eyJ2IjoxLCJhdCI6IjIwMjYtMDgtMjdUMTA6MzA6MDBaIiwiZWMiOjQ0LCJrIjoiYWdlbnRfcHJvZ3Jlc3MiLCJpZCI6InByb2dyZXNzXzAxIn0"
+      },
+      "TimelineKind": {
+        "name": "kind",
+        "in": "query",
+        "required": false,
+        "description": "Restrict activity to one discriminated item kind.",
+        "schema": {
+          "type": "string",
+          "enum": [
+            "agent_progress",
+            "comment",
+            "task_change"
+          ]
+        },
+        "example": "agent_progress"
       },
       "Limit": {
         "name": "limit",
@@ -7386,6 +7514,210 @@
         ],
         "additionalProperties": false
       },
+      "TimelineActor": {
+        "type": "object",
+        "required": [
+          "id",
+          "kind",
+          "name"
+        ],
+        "properties": {
+          "id": {
+            "$ref": "#/components/schemas/Identifier"
+          },
+          "kind": {
+            "type": "string",
+            "enum": [
+              "human",
+              "agent"
+            ]
+          },
+          "name": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "additionalProperties": false
+      },
+      "TaskTimelineProgress": {
+        "type": "object",
+        "required": [
+          "operation_id",
+          "actor_id",
+          "state",
+          "phase",
+          "summary",
+          "next_action",
+          "checkpoint_refs",
+          "checkpoint_completed",
+          "checkpoint_total",
+          "started_at"
+        ],
+        "properties": {
+          "operation_id": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 128,
+            "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:/-]*$"
+          },
+          "actor_id": {
+            "$ref": "#/components/schemas/Identifier"
+          },
+          "state": {
+            "type": "string",
+            "enum": [
+              "working",
+              "waiting",
+              "verifying",
+              "handoff"
+            ]
+          },
+          "phase": {
+            "type": "string",
+            "maxLength": 120
+          },
+          "summary": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 1000
+          },
+          "next_action": {
+            "type": "string",
+            "maxLength": 1000
+          },
+          "checkpoint_refs": {
+            "type": "array",
+            "maxItems": 100,
+            "uniqueItems": true,
+            "items": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 128
+            }
+          },
+          "checkpoint_completed": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "minimum": 0,
+            "maximum": 100
+          },
+          "checkpoint_total": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "minimum": 1,
+            "maximum": 100
+          },
+          "started_at": {
+            "$ref": "#/components/schemas/Timestamp"
+          }
+        },
+        "additionalProperties": false
+      },
+      "TaskTimelineChange": {
+        "type": "object",
+        "required": [
+          "event_id",
+          "event_type",
+          "payload"
+        ],
+        "properties": {
+          "event_id": {
+            "$ref": "#/components/schemas/Identifier"
+          },
+          "event_type": {
+            "type": "string",
+            "minLength": 1
+          },
+          "payload": {
+            "type": "object",
+            "additionalProperties": true
+          }
+        },
+        "additionalProperties": false
+      },
+      "TaskTimelineItem": {
+        "type": "object",
+        "required": [
+          "id",
+          "cursor",
+          "kind",
+          "task_id",
+          "actor",
+          "created_at",
+          "progress",
+          "comment",
+          "change"
+        ],
+        "properties": {
+          "id": {
+            "$ref": "#/components/schemas/Identifier"
+          },
+          "cursor": {
+            "type": "string",
+            "minLength": 1,
+            "description": "Opaque stable keyset cursor for this activity item."
+          },
+          "kind": {
+            "type": "string",
+            "enum": [
+              "agent_progress",
+              "comment",
+              "task_change"
+            ]
+          },
+          "task_id": {
+            "$ref": "#/components/schemas/Identifier"
+          },
+          "actor": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/TimelineActor"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "created_at": {
+            "$ref": "#/components/schemas/Timestamp"
+          },
+          "progress": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/TaskTimelineProgress"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "comment": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/Comment"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "change": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/TaskTimelineChange"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "additionalProperties": false
+      },
       "Label": {
         "type": "object",
         "required": [
@@ -8188,6 +8520,26 @@
           "next_cursor": {
             "type": "string",
             "description": "Empty string when there is no next page."
+          }
+        },
+        "additionalProperties": false
+      },
+      "TaskTimelineCollection": {
+        "type": "object",
+        "required": [
+          "data",
+          "next_cursor"
+        ],
+        "properties": {
+          "data": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/TaskTimelineItem"
+            }
+          },
+          "next_cursor": {
+            "type": "string",
+            "description": "Empty string when there is no next page; otherwise pass as before."
           }
         },
         "additionalProperties": false

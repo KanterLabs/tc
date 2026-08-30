@@ -515,4 +515,35 @@ test('shows live agent work across the board, drawer, and My Work', async ({ pag
   await page.goto(`/p/${encodeURIComponent(projectA.slug)}/roadmap/`);
   await expect(page).toHaveURL(new RegExp(`/p/${encodeURIComponent(projectA.slug)}/roadmap/?$`));
   await expect(page.getByRole('heading', { name: `${projectAName} progress`, exact: true })).toBeVisible();
+
+  const roadmapLiveWork = page.locator('.roadmap-live-work');
+  await expect(roadmapLiveWork.getByRole('heading', { name: 'Agent work', exact: true })).toBeVisible();
+  await expect(roadmapLiveWork.getByLabel(`Open ${workingTask.key}: ${workingTask.title} activity`)).toBeVisible();
+  await expect(page.getByRole('heading', { name: 'Recent activity', exact: true })).toBeVisible();
+  await expect(page.getByRole('group', { name: 'Filter recent activity' })).toBeVisible();
+
+  await roadmapLiveWork.getByLabel(`Open ${workingTask.key}: ${workingTask.title} activity`).click();
+  await expect(drawer).toBeVisible();
+  await expect(page).toHaveURL(new RegExp(`/p/${encodeURIComponent(projectA.slug)}/tasks/${workingTask.key}\\?view=activity$`));
+  const activityTab = drawer.getByRole('tab', { name: 'Activity', exact: true });
+  const detailsTab = drawer.getByRole('tab', { name: 'Details', exact: true });
+  await expect(activityTab).toHaveAttribute('aria-selected', 'true');
+  await expect(drawer.getByRole('heading', { name: 'Activity', exact: true })).toBeVisible();
+  await expect(drawer.locator('.task-timeline-item[data-kind="agent_progress"]').first()).toContainText(remoteSummary);
+
+  await activityTab.focus();
+  await activityTab.press('ArrowLeft');
+  await expect(detailsTab).toBeFocused();
+  await expect(detailsTab).toHaveAttribute('aria-selected', 'true');
+  await detailsTab.press('ArrowRight');
+  await expect(activityTab).toBeFocused();
+  await expect(activityTab).toHaveAttribute('aria-selected', 'true');
+
+  const timelineFilters = drawer.getByRole('group', { name: 'Filter task activity' });
+  await timelineFilters.getByRole('button', { name: 'Agent', exact: true }).click();
+  await expect(drawer.locator('.task-timeline-item[data-kind="agent_progress"]')).not.toHaveCount(0);
+  await expect(drawer.locator('.task-timeline-item[data-kind="comment"]')).toHaveCount(0);
+  await timelineFilters.getByRole('button', { name: 'All', exact: true }).click();
+  await drawer.getByRole('button', { name: 'Close task details', exact: true }).click();
+  await expect(page).toHaveURL(new RegExp(`/p/${encodeURIComponent(projectA.slug)}/roadmap/?$`));
 });

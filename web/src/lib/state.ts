@@ -1,4 +1,15 @@
-import type { AgentWork, AgentWorkState, BugSeverity, Column, Project, Task } from './types';
+import type {
+  ActivityEvent,
+  AgentWork,
+  AgentWorkState,
+  BugSeverity,
+  Column,
+  Project,
+  RoadmapActivityFilter,
+  RoadmapActivityKind,
+  Task,
+  TaskRouteIntent
+} from './types';
 
 export interface BoardFilters {
   query: string;
@@ -325,6 +336,112 @@ export function sortLiveWork(tasks: Task[], now: TimeValue = Date.now()): Task[]
 export const sortAgentWork = sortLiveWork;
 export const sortLiveWorkTasks = sortLiveWork;
 
+export interface RoadmapLiveWorkCounts {
+  working: number;
+  needsYou: number;
+  stale: number;
+}
+
+/**
+ * Count the compact status buckets used by the Roadmap follow-along panel.
+ * The API's live view already excludes completed tasks, but retaining the
+ * completion guard keeps this helper safe with cached or fixture data.
+ */
+export function roadmapLiveWorkCounts(
+  tasks: Task[],
+  now: TimeValue = Date.now(),
+  semanticStateForTask: (task: Task) => string = () => ''
+): RoadmapLiveWorkCounts {
+  const unfinished = tasks.filter((task) => !isTaskCompleted(task, semanticStateForTask(task)));
+  return {
+    working: unfinished.filter((task) => agentWorkBucket(task, now) === 'working').length,
+    needsYou: unfinished.filter((task) => agentWorkActionNeeded(task, now, semanticStateForTask(task))).length,
+    stale: unfinished.filter((task) => agentWorkBucket(task, now) === 'stale').length
+  };
+}
+
+/**
+ * Prioritize attention items ahead of ordinary working updates and use the
+ * agent check-in timestamp as the stable secondary ordering. Unknown dates
+ * retain their original order so a refresh cannot make rows jump randomly.
+ */
+export function sortRoadmapLiveWork(
+  tasks: Task[],
+  now: TimeValue = Date.now(),
+  semanticStateForTask: (task: Task) => string = () => ''
+): Task[] {
+  return tasks
+    .filter((task) => !isTaskCompleted(task, semanticStateForTask(task)))
+    .map((task, index) => ({
+      task,
+      index,
+      needsYou: agentWorkActionNeeded(task, now, semanticStateForTask(task)),
+      updated: liveWorkTimestamp(task)
+    }))
+    .sort((a, b) => {
+      if (a.needsYou !== b.needsYou) return a.needsYou ? -1 : 1;
+      if (a.updated !== null && b.updated !== null && a.updated !== b.updated) return b.updated - a.updated;
+      if (a.updated !== null && b.updated === null) return -1;
+      if (a.updated === null && b.updated !== null) return 1;
+      return a.index - b.index;
+    })
+    .map(({ task }) => task);
+}
+
+/** Classify the append-only event types into the bounded Roadmap filters. */
+export function roadmapActivityKind(event: Pick<ActivityEvent, 'type'>): RoadmapActivityKind {
+  const type = (event.type || '').toLowerCase();
+  if (type === 'comment.created' || type.endsWith('.comment.created')) return 'comments';
+  if (type === 'task.progressed' || type.endsWith('.progressed') || type.includes('agent.progress')) return 'agent-updates';
+  return 'task-changes';
+}
+
+export function matchesRoadmapActivity(
+  event: Pick<ActivityEvent, 'type'>,
+  filter: RoadmapActivityFilter
+): boolean {
+  return filter === 'all' || roadmapActivityKind(event) === filter;
+}
+
+const roadmapActivityLabels: Record<RoadmapActivityKind, Record<string, string>> = {
+  'agent-updates': {
+    'task.progressed': 'updated agent progress'
+  },
+  comments: {
+    'comment.created': 'left a comment'
+  },
+  'task-changes': {
+    'agent.created': 'created an agent',
+    'actor.created': 'created an actor',
+    'bug.created': 'reported a bug',
+    'bug.reopened': 'reopened the bug',
+    'bug.resolved': 'resolved the bug',
+    'bug.triaged': 'triaged the bug',
+    'bug.updated': 'updated the bug',
+    'column.created': 'created a column',
+    'column.updated': 'updated a column',
+    'label.created': 'created a label',
+    'label.deleted': 'deleted a label',
+    'project.created': 'created the project',
+    'project.updated': 'updated the project',
+    'task.blocked': 'blocked the task',
+    'task.claimed': 'claimed the task',
+    'task.claim_renewed': 'renewed the claim',
+    'task.completed': 'completed the task',
+    'task.created': 'created the task',
+    'task.deleted': 'deleted the task',
+    'task.moved': 'moved the task',
+    'task.released': 'released the claim',
+    'task.updated': 'updated the task'
+  }
+};
+
+/** Human-readable event copy that intentionally stays at the event layer. */
+export function roadmapActivityLabel(event: Pick<ActivityEvent, 'type'>): string {
+  const kind = roadmapActivityKind(event);
+  return roadmapActivityLabels[kind][event.type] || displayEvent(event).toLowerCase();
+}
+
 /**
  * Group live work while retaining the same display order as `sortLiveWork`.
  * Empty groups are included so a caller can render predictable sections.
@@ -431,6 +548,53 @@ export function projectInitials(project: Pick<Project, 'name' | 'key'>): string 
   const words = project.name.trim().split(/\s+/).filter(Boolean);
   if (words.length > 1) return words.slice(0, 2).map((word) => word[0]).join('').toUpperCase();
   return (project.key || project.name).slice(0, 2).toUpperCase();
+}
+
+/** Build a bookmarkable task route. Activity is an explicit intent so a
+ * later drawer tab can consume the same URL without changing the path. */
+export function taskDeepLink(
+  projectSlug: string,
+  taskReference: string,
+  intent: TaskRouteIntent = 'details'
+): string {
+  const path = `/p/${encodeURIComponent(projectSlug)}/tasks/${encodeURIComponent(taskReference)}`;
+  return intent === 'activity' ? `${path}?view=activity` : path;
+}
+
+export interface ParsedTaskRoute {
+  projectSlug: string;
+  taskReference: string;
+  intent: TaskRouteIntent;
+}
+
+function decodeRoutePart(value: string): string {
+  try {
+    return decodeURIComponent(value);
+  } catch {
+    return value;
+  }
+}
+
+/** Parse task routes defensively for direct navigation and browser history. */
+export function parseTaskRoute(
+  pathname: string,
+  search = '',
+  hash = ''
+): ParsedTaskRoute | null {
+  const match = pathname.match(/^\/p\/([^/]+)\/tasks\/([^/]+)\/?$/);
+  if (!match) return null;
+  let params: URLSearchParams;
+  try {
+    params = new URLSearchParams(search.startsWith('?') ? search.slice(1) : search);
+  } catch {
+    params = new URLSearchParams();
+  }
+  const requestedIntent = params.get('view') || params.get('intent') || params.get('tab') || hash.replace(/^#/, '');
+  return {
+    projectSlug: decodeRoutePart(match[1]),
+    taskReference: decodeRoutePart(match[2]),
+    intent: requestedIntent === 'activity' ? 'activity' : 'details'
+  };
 }
 
 export function toInputDate(value?: string | null): string {

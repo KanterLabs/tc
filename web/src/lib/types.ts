@@ -64,6 +64,9 @@ export interface Actor {
   updated_at?: string;
 }
 
+/** Small actor shape used by read-only coordination surfaces. */
+export type ActorSummary = Pick<Actor, 'id' | 'kind' | 'name'>;
+
 export interface Project {
   id: string;
   key: string;
@@ -197,6 +200,58 @@ export interface ActivityEvent {
   actor?: Pick<Actor, 'name'> | string;
   metadata?: never;
 }
+
+/** The discriminated payload kinds returned by the durable task timeline. */
+export type TaskTimelineKind = 'agent_progress' | 'comment' | 'task_change';
+export type TaskTimelineFilter = 'all' | TaskTimelineKind;
+
+export interface TimelineActor {
+  id: string;
+  kind: ActorKind;
+  name: string;
+}
+
+export interface TaskTimelineProgress {
+  operation_id: string;
+  actor_id: string;
+  state: AgentWorkState;
+  phase: string;
+  summary: string;
+  next_action: string;
+  checkpoint_refs: string[];
+  checkpoint_completed?: number | null;
+  checkpoint_total?: number | null;
+  started_at: string;
+}
+
+export interface TaskTimelineChange {
+  event_id: string;
+  event_type: string;
+  payload: Record<string, unknown>;
+}
+
+/** One newest-first immutable activity row for a task. */
+export interface TaskTimelineItem {
+  id: string;
+  cursor: string;
+  kind: TaskTimelineKind;
+  task_id: string;
+  actor: TimelineActor | null;
+  created_at: string;
+  progress: TaskTimelineProgress | null;
+  comment: Comment | null;
+  change: TaskTimelineChange | null;
+}
+
+export interface TaskTimelineCollection {
+  data: TaskTimelineItem[];
+  next_cursor?: string | null;
+}
+
+/** The bounded activity filters exposed by the Roadmap follow-along view. */
+export type RoadmapActivityFilter = 'all' | 'agent-updates' | 'comments' | 'task-changes';
+export type RoadmapActivityKind = Exclude<RoadmapActivityFilter, 'all'>;
+export type TaskRouteIntent = 'details' | 'activity';
 
 export interface RoadmapSummary {
   task_total: number;

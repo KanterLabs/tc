@@ -332,7 +332,14 @@ func (s *Store) PublishAgentWork(ctx context.Context, taskID string, input Agent
 			payload["completed"] = *validated.CheckpointCompleted
 			payload["total"] = *validated.CheckpointTotal
 		}
-		_, err = insertEvent(ctx, tx, "task.progressed", actorID, projectID, taskID, payload)
+		progressEventCursor, err := insertEvent(ctx, tx, "task.progressed", actorID, projectID, taskID, payload)
+		if err != nil {
+			return err
+		}
+		// History is inserted after the progress event so the row can retain its
+		// exact event cursor. Both links make timeline de-duplication explicit;
+		// no timestamp/body matching is needed and legacy rows are never guessed.
+		_, err = tx.ExecContext(ctx, `INSERT INTO task_agent_work_history(id, task_id, operation_id, actor_id, state, phase, summary, next_action, checkpoint_refs, checkpoint_completed, checkpoint_total, started_at, created_at, generated_comment_id, progress_event_cursor) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, newID(), taskID, validated.OperationID, actorID, validated.State, validated.Phase, validated.Summary, validated.NextAction, string(refsJSON), nullableIntArg(validated.CheckpointCompleted), nullableIntArg(validated.CheckpointTotal), startedAt, timestamp, commentID, progressEventCursor)
 		return err
 	})
 	if err != nil {

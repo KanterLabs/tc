@@ -296,6 +296,10 @@ func TestRetainedBinaryProcessAgainstSchema10(t *testing.T) {
 	if len(migrations) < 10 {
 		t.Skip("migration 010 is not present")
 	}
+	latest, _, err := EmbeddedSchema()
+	if err != nil {
+		t.Fatal(err)
+	}
 	dir := t.TempDir()
 	path := filepath.Join(dir, "roadmap.db")
 	database, err := sql.Open("sqlite", "file:"+path+"?_pragma=foreign_keys(1)")
@@ -305,7 +309,7 @@ func TestRetainedBinaryProcessAgainstSchema10(t *testing.T) {
 	applyMigrationPrefix(t, ctx, database, migrations, 8)
 	populateProductionFixture(t, ctx, database, 8)
 	if err := Migrate(ctx, database); err != nil {
-		t.Fatalf("upgrade to schema 10: %v", err)
+		t.Fatalf("upgrade to schema %d: %v", latest, err)
 	}
 	if _, err := database.ExecContext(ctx, `INSERT INTO task_agent_work(task_id, operation_id, actor_id, state, phase, summary, next_action, checkpoint_refs, started_at, updated_at) VALUES ('task-1', 'retained-run', 'agent', 'working', 'old binary', 'Existing pulse', 'Keep going', '[]', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')`); err != nil {
 		t.Fatal(err)
@@ -316,7 +320,7 @@ func TestRetainedBinaryProcessAgainstSchema10(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if inspection.SchemaVersion != 10 || len(inspection.PendingVersions) != 0 || len(inspection.UnknownVersions) != 0 {
+	if inspection.SchemaVersion != latest || len(inspection.PendingVersions) != 0 || len(inspection.UnknownVersions) != 0 {
 		t.Fatalf("upgraded schema inspection = %#v", inspection)
 	}
 	if err := database.Close(); err != nil {
@@ -357,7 +361,7 @@ func TestRetainedBinaryProcessAgainstSchema10(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if inspection.SchemaVersion != 10 || len(inspection.PendingVersions) != 0 || len(inspection.UnknownVersions) != 0 {
+	if inspection.SchemaVersion != latest || len(inspection.PendingVersions) != 0 || len(inspection.UnknownVersions) != 0 {
 		t.Fatalf("retained process changed schema inspection = %#v", inspection)
 	}
 	if err := CheckIntegrity(ctx, retained); err != nil {

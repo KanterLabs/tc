@@ -591,6 +591,8 @@ func (s *Server) dispatchAuthed(w http.ResponseWriter, r *http.Request, identity
 			switch parts[2] {
 			case "comments":
 				s.comments(w, r, identity, parts[1])
+			case "timeline":
+				s.taskTimeline(w, r, identity, parts[1])
 			case "progress":
 				s.taskProgress(w, r, identity, parts[1])
 			case "heartbeat":
