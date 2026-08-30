@@ -324,6 +324,14 @@ export const api = {
         kind: params.kind
       })
     ),
+  listProjectTimeline: (project: string, params: { before?: string; limit?: number; kind?: TaskTimelineKind } = {}) =>
+    request<TaskTimelineCollection>(
+      pathWithQuery(`/projects/${encodeURIComponent(project)}/timeline`, {
+        before: params.before,
+        limit: params.limit ?? 50,
+        kind: params.kind
+      })
+    ),
 
   claimTask: (task: string, version: number, leaseSeconds = 3600) =>
     request<Task>(`/tasks/${encodeURIComponent(task)}/claim`, {

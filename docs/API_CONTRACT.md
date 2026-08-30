@@ -56,6 +56,7 @@ metadata never includes plaintext token values.
 - `GET|POST /api/v1/projects`
 - `GET|PATCH /api/v1/projects/{project}`
 - `GET|POST /api/v1/projects/{project}/columns`
+- `GET /api/v1/projects/{project}/timeline`
 - `GET /api/v1/columns/{column}`
 - `PATCH /api/v1/columns/{column}`
 - `GET|POST /api/v1/projects/{project}/labels`
@@ -134,6 +135,16 @@ This reduced form applies to task creation, PATCH, claim, renew, release,
 complete, block, progress, triage, resolve, and reopen, and idempotent retries
 replay the already-reduced body.
 Direct task GET and task collections still require `tasks:read`.
+
+`GET /api/v1/projects/{project}/timeline` returns the same typed, newest-first
+timeline items as the task route, merged across every non-deleted task in the
+selected project. It requires `tasks:read` and honors project-scoped bearer
+tokens. Use the opaque `next_cursor` as `before` for stable keyset pagination;
+`kind` optionally restricts results to `agent_progress`, `comment`, or
+`task_change`. Generated progress comments and their `comment.created` and
+`task.progressed` events are represented once by the corresponding structured
+progress item. Legacy comments and events remain visible with their original
+typed payloads, and actor enrichment includes only actor ID, kind, and name.
 
 PATCH, DELETE, and task action requests require an exact quoted `If-Match: "vN"`
 value. Missing If-Match returns `428`; an unquoted, weak, malformed, or

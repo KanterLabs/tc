@@ -546,4 +546,65 @@ test('shows live agent work across the board, drawer, and My Work', async ({ pag
   await timelineFilters.getByRole('button', { name: 'All', exact: true }).click();
   await drawer.getByRole('button', { name: 'Close task details', exact: true }).click();
   await expect(page).toHaveURL(new RegExp(`/p/${encodeURIComponent(projectA.slug)}/roadmap/?$`));
+
+  const boardTimelineComment = `Board timeline comment ${suffix}`;
+  await postJSON(request, `/api/v1/tasks/${workingTask.id}/comments`, { body: boardTimelineComment }, {
+    'Idempotency-Key': mutationKey()
+  });
+  await page.setViewportSize({ width: 1280, height: 800 });
+  await page.goto(`/p/${encodeURIComponent(projectA.slug)}/timeline`);
+  await expect(page).toHaveURL(new RegExp(`/p/${encodeURIComponent(projectA.slug)}/timeline/?$`));
+  const boardViewTimelineTab = page.getByRole('tab', { name: 'Timeline', exact: true });
+  const boardViewBoardTab = page.getByRole('tab', { name: 'Board', exact: true });
+  await expect(boardViewTimelineTab).toHaveAttribute('aria-selected', 'true');
+  await boardViewTimelineTab.focus();
+  await boardViewTimelineTab.press('ArrowLeft');
+  await expect(boardViewBoardTab).toBeFocused();
+  await expect(page).toHaveURL(new RegExp(`/p/${encodeURIComponent(projectA.slug)}/?$`));
+  await boardViewBoardTab.press('ArrowRight');
+  await expect(boardViewTimelineTab).toBeFocused();
+  await expect(page).toHaveURL(new RegExp(`/p/${encodeURIComponent(projectA.slug)}/timeline/?$`));
+  const boardTimeline = page.locator('.board-timeline');
+  await expect(boardTimeline.getByRole('heading', { name: 'Recent work', exact: true })).toBeVisible();
+  await expect(boardTimeline.locator('.board-timeline-row').filter({ hasText: workingTask.title }).first()).toBeVisible();
+  await expect(boardTimeline).not.toContainText(verifyingTask.title);
+
+  const boardTimelineFilters = boardTimeline.getByRole('group', { name: 'Filter board timeline' });
+  await boardTimelineFilters.getByRole('button', { name: 'Comments', exact: true }).click();
+  await expect(boardTimeline.locator('.board-timeline-row').filter({ hasText: boardTimelineComment })).toBeVisible();
+  await expect(boardTimeline.locator('.board-timeline-item[data-kind="agent_progress"]')).toHaveCount(0);
+  await boardTimelineFilters.getByRole('button', { name: 'Agent', exact: true }).click();
+  await expect(boardTimeline.locator('.board-timeline-row').filter({ hasText: remoteSummary })).toBeVisible();
+
+  const liveTimelineSummary = `Board timeline refreshed live ${suffix}.`;
+  workingTask = await publish(
+    workingTask,
+    'working',
+    'Board timeline live refresh',
+    liveTimelineSummary,
+    'Review the board-wide history.',
+    ['timeline', 'polling'],
+    2,
+    2
+  );
+  await expect(boardTimeline.locator('.board-timeline-row').filter({ hasText: liveTimelineSummary })).toBeVisible({ timeout: 30_000 });
+
+  await boardTimelineFilters.getByRole('button', { name: 'All', exact: true }).click();
+  const timelineTaskRow = boardTimeline.locator('.board-timeline-row').filter({ hasText: liveTimelineSummary });
+  await timelineTaskRow.click();
+  await expect(drawer).toBeVisible();
+  await expect(page).toHaveURL(new RegExp(`/p/${encodeURIComponent(projectA.slug)}/tasks/${workingTask.key}\\?view=activity$`));
+  await expect(drawer.getByRole('tab', { name: 'Activity', exact: true })).toHaveAttribute('aria-selected', 'true');
+  await drawer.getByRole('button', { name: 'Close task details', exact: true }).click();
+  await expect(page).toHaveURL(new RegExp(`/p/${encodeURIComponent(projectA.slug)}/timeline/?$`));
+
+  await page.setViewportSize({ width: 390, height: 844 });
+  await expect(boardTimeline).toBeVisible();
+  const timelineDimensions = await page.evaluate(() => ({
+    viewport: window.innerWidth,
+    documentWidth: document.documentElement.scrollWidth,
+    bodyWidth: document.body.scrollWidth
+  }));
+  expect(timelineDimensions.documentWidth, 'mobile board timeline should not overflow horizontally').toBeLessThanOrEqual(timelineDimensions.viewport);
+  expect(timelineDimensions.bodyWidth, 'mobile board timeline should not overflow horizontally').toBeLessThanOrEqual(timelineDimensions.viewport);
 });

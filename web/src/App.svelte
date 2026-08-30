@@ -59,6 +59,7 @@
   import AgentPulse from './lib/components/AgentPulse.svelte';
   import AgentWorkPanel from './lib/components/AgentWorkPanel.svelte';
   import AuditReview from './lib/components/AuditReview.svelte';
+  import BoardTimeline from './lib/components/BoardTimeline.svelte';
   import LiveWorkRow from './lib/components/LiveWorkRow.svelte';
   import RoadmapActivity from './lib/components/RoadmapActivity.svelte';
   import RoadmapLiveWork from './lib/components/RoadmapLiveWork.svelte';
@@ -72,7 +73,7 @@
     type TaskMutationScope
   } from './lib/liveness';
 
-  type View = 'board' | 'issues' | 'my-work' | 'roadmap' | 'audits' | 'settings';
+  type View = 'board' | 'timeline' | 'issues' | 'my-work' | 'roadmap' | 'audits' | 'settings';
   type AuthView = 'login' | 'setup';
   type ToastKind = 'success' | 'error' | 'info';
   type CommandChoice = {
@@ -209,6 +210,14 @@
   let drawerTimelineFilter: TaskTimelineFilter = 'all';
   let drawerTimelineTaskId = '';
   let drawerTimelineRequest = 0;
+  let boardTimelineItems: TaskTimelineItem[] = [];
+  let boardTimelineNextCursor = '';
+  let boardTimelineLoading = false;
+  let boardTimelineLoadingOlder = false;
+  let boardTimelineError = '';
+  let boardTimelineFilter: TaskTimelineFilter = 'all';
+  let boardTimelineProjectId = '';
+  let boardTimelineRequest = 0;
   let draftTitle = '';
   let draftDescription = '';
   let draftPriority: Priority = 'normal';
@@ -726,6 +735,7 @@
     roadmapLiveRequest += 1;
     roadmapActivityRequest += 1;
     drawerTimelineRequest += 1;
+    boardTimelineRequest += 1;
     taskModalColumnsRequest += 1;
     issueRequest += 1;
     if (drawerTask) closeDrawer();
@@ -746,6 +756,10 @@
     roadmapLiveError = '';
     roadmapActivityTasks = {};
     roadmapActivityError = '';
+    boardTimelineItems = [];
+    boardTimelineNextCursor = '';
+    boardTimelineError = '';
+    boardTimelineProjectId = '';
     roadmapActors = {};
     roadmapActorsLoaded = false;
     roadmapActorsLoading = false;
@@ -836,6 +850,10 @@
         roadmapProjectId = undefined;
         auditIdFromRoute = getAuditIdFromLocation();
         view = 'audits';
+      } else if (routeSlug && isProjectTimelineLocation()) {
+        roadmapProjectId = undefined;
+        view = 'timeline';
+        await loadBoardTimeline(target?.id, { reset: true });
       } else if (routeSlug && isProjectRoadmapLocation()) {
         roadmapProjectId = target?.id;
         view = 'roadmap';
@@ -901,6 +919,77 @@
     } finally {
       if (requestId === boardRequest && sessionGeneration === requestedSession) boardLoading = false;
     }
+  }
+
+  async function loadBoardTimeline(
+    projectId = activeProject?.id,
+    options: { older?: boolean; reset?: boolean } = {}
+  ): Promise<boolean> {
+    const { older = false, reset = false } = options;
+    if (!projectId) return true;
+    if (older && !boardTimelineNextCursor) return true;
+    if (reset) {
+      boardTimelineItems = [];
+      boardTimelineNextCursor = '';
+      boardTimelineError = '';
+    }
+    const requestId = ++boardTimelineRequest;
+    const requestedSession = sessionGeneration;
+    const requestedProjectId = projectId;
+    const requestedFilter = boardTimelineFilter;
+    const previousCursor = boardTimelineNextCursor;
+    const hadItems = boardTimelineItems.length > 0;
+    if (older) boardTimelineLoadingOlder = true;
+    else boardTimelineLoading = true;
+    boardTimelineError = '';
+    try {
+      const result = await api.listProjectTimeline(requestedProjectId, {
+        before: older ? previousCursor : undefined,
+        limit: 50,
+        kind: requestedFilter === 'all' ? undefined : requestedFilter
+      });
+      if (
+        requestId !== boardTimelineRequest
+        || requestedSession !== sessionGeneration
+        || !user
+        || view !== 'timeline'
+        || activeProject?.id !== requestedProjectId
+        || boardTimelineFilter !== requestedFilter
+      ) return false;
+      const merged = new Map<string, TaskTimelineItem>();
+      const rows = older ? [...boardTimelineItems, ...result.data] : [...result.data, ...(reset ? [] : boardTimelineItems)];
+      rows.forEach((item) => merged.set(item.id, item));
+      boardTimelineItems = [...merged.values()].sort((a, b) => {
+        const time = Date.parse(b.created_at) - Date.parse(a.created_at);
+        return time || b.cursor.localeCompare(a.cursor) || b.id.localeCompare(a.id);
+      });
+      boardTimelineProjectId = requestedProjectId;
+      boardTimelineNextCursor = older || !hadItems || reset || !previousCursor ? (result.next_cursor || '') : previousCursor;
+      return true;
+    } catch (error) {
+      if (
+        requestId === boardTimelineRequest
+        && requestedSession === sessionGeneration
+        && view === 'timeline'
+        && activeProject?.id === requestedProjectId
+      ) boardTimelineError = friendlyError(error, 'This board timeline could not be loaded.');
+      return false;
+    } finally {
+      if (requestId === boardTimelineRequest) {
+        if (older) boardTimelineLoadingOlder = false;
+        else boardTimelineLoading = false;
+      }
+    }
+  }
+
+  function setBoardTimelineFilter(next: TaskTimelineFilter) {
+    if (!activeProject || boardTimelineFilter === next) return;
+    boardTimelineFilter = next;
+    void loadBoardTimeline(activeProject.id, { reset: true });
+  }
+
+  function loadOlderBoardTimeline() {
+    if (activeProject && boardTimelineNextCursor) void loadBoardTimeline(activeProject.id, { older: true });
   }
 
   /** Load bug-capable tasks from every accessible project for the Issues view. */
@@ -1208,7 +1297,7 @@
   async function refreshLiveness(): Promise<void> {
     if (!user) return;
     const refreshes: Promise<boolean>[] = [];
-    if (view === 'board') refreshes.push(refreshBoardTasks());
+    if (view === 'board' || view === 'timeline') refreshes.push(refreshBoardTasks());
     if (view === 'my-work') refreshes.push(refreshMyWorkTasks());
     if (view === 'audits') auditRefreshToken += 1;
     if (drawerTask) refreshes.push(refreshDrawerTask(drawerTask.id));
@@ -1216,7 +1305,7 @@
   }
 
   async function refreshBoardTasks(): Promise<boolean> {
-    if (!user || view !== 'board' || !activeProject || boardLoading) return true;
+    if (!user || (view !== 'board' && view !== 'timeline') || !activeProject || boardLoading) return true;
     if (boardLivenessInFlight) return boardLivenessInFlight;
 
     const requestId = ++boardLivenessRequest;
@@ -1231,7 +1320,7 @@
         if (
           !user
           || sessionGeneration !== requestedSession
-          || view !== 'board'
+          || (view !== 'board' && view !== 'timeline')
           || activeProjectSlug !== requestedSlug
           || boardRequest !== normalRequestId
           || boardLivenessRequest !== requestId
@@ -1323,7 +1412,14 @@
           && sessionGeneration === requestedSession
           && pollInFlight === poll
         );
-        if (!isCurrentPoll() || !result.data.length) return;
+        if (!isCurrentPoll()) return;
+        // The project timeline has its own newest-first cursor. Refresh its
+        // first page on every poll so a quiet or globally backlogged event
+        // feed cannot delay visible work from the current board.
+        if (view === 'timeline' && activeProject?.id) {
+          if (!(await loadBoardTimeline(activeProject.id)) || !isCurrentPoll()) return;
+        }
+        if (!result.data.length) return;
         const mergedEvents = new Map<string, ActivityEvent>();
         [...events, ...result.data].forEach((event) => mergedEvents.set(event.id || String(event.cursor), event));
         events = [...mergedEvents.values()].sort((a, b) => b.cursor - a.cursor).slice(0, 100);
@@ -1334,7 +1430,7 @@
         const affectedTaskIds = new Set(result.data.map((event) => event.task_id).filter((id): id is string => Boolean(id)));
         let reloadSucceeded = true;
 
-        if (boardChanged && currentView === 'board') reloadSucceeded = (await loadBoard()) && reloadSucceeded;
+        if (boardChanged && (currentView === 'board' || currentView === 'timeline')) reloadSucceeded = (await loadBoard()) && reloadSucceeded;
         if (!isCurrentPoll()) return;
         if (boardChanged && currentView === 'issues') reloadSucceeded = (await loadIssues()) && reloadSucceeded;
         if (!isCurrentPoll()) return;
@@ -1381,6 +1477,10 @@
     return /^\/p\/[^/]+\/roadmap\/?$/.test(window.location.pathname);
   }
 
+  function isProjectTimelineLocation(): boolean {
+    return /^\/p\/[^/]+\/timeline\/?$/.test(window.location.pathname);
+  }
+
   function isProjectAuditLocation(): boolean {
     return /^\/p\/[^/]+\/audits(?:\/[^/]+)?\/?$/.test(window.location.pathname);
   }
@@ -1424,6 +1524,7 @@
 
   async function selectProject(project: Project, push = true) {
     projectSwitchVersion += 1;
+    boardTimelineRequest += 1;
     if (drawerTask) closeDrawer();
     activeProjectSlug = project.slug;
     auditIdFromRoute = '';
@@ -1432,6 +1533,10 @@
     tasks = [];
     labels = [];
     boardError = '';
+    boardTimelineItems = [];
+    boardTimelineNextCursor = '';
+    boardTimelineError = '';
+    boardTimelineProjectId = '';
     recentProjectIds = rememberProject(project.id, localStorage);
     localStorage.setItem('roadmap.last-project', project.slug);
     projectSwitcherOpen = false;
@@ -1456,6 +1561,11 @@
       roadmapProjectId = undefined;
       if (push) navigate('/roadmap');
       await loadRoadmap();
+    } else if (next === 'timeline' && activeProject) {
+      roadmapProjectId = undefined;
+      if (push) navigate(`/p/${encodeURIComponent(activeProject.slug)}/timeline`);
+      if (!columns.length || boardTimelineProjectId !== activeProject.id) await loadBoard();
+      await loadBoardTimeline(activeProject.id, { reset: boardTimelineProjectId !== activeProject.id });
     } else if (next === 'audits' && activeProject) {
       roadmapProjectId = undefined;
       auditIdFromRoute = '';
@@ -1491,6 +1601,20 @@
           void loadBoard().then(() => openTaskFromRoute(taskRoute, project));
         } else {
           void openTaskFromRoute(taskRoute, project);
+        }
+      } else if (project && isProjectTimelineLocation()) {
+        const projectChanged = activeProjectSlug !== project.slug;
+        projectSwitchVersion += 1;
+        activeProjectSlug = project.slug;
+        roadmapProjectId = undefined;
+        view = 'timeline';
+        if (projectChanged || !columns.length || !tasks.length) {
+          columns = [];
+          tasks = [];
+          labels = [];
+          void loadBoard().then(() => loadBoardTimeline(project.id, { reset: true }));
+        } else {
+          void loadBoardTimeline(project.id, { reset: boardTimelineProjectId !== project.id });
         }
       } else if (project && isProjectAuditLocation()) {
         const projectChanged = activeProjectSlug !== project.slug;
@@ -1652,6 +1776,17 @@
     view = 'roadmap';
     navigate(`/p/${encodeURIComponent(activeProject.slug)}/roadmap`);
     await loadRoadmap(activeProject.id);
+  }
+
+  async function openProjectTimeline() {
+    await setView('timeline');
+  }
+
+  function boardViewKeydown(event: KeyboardEvent) {
+    if (!['ArrowLeft', 'ArrowRight', 'Home', 'End'].includes(event.key)) return;
+    event.preventDefault();
+    const next: View = event.key === 'ArrowLeft' || event.key === 'Home' ? 'board' : 'timeline';
+    void setView(next).then(() => requestAnimationFrame(() => document.getElementById(`board-view-${next}`)?.focus()));
   }
 
   async function openProjectAudits() {
@@ -2612,6 +2747,14 @@
     await openTask(task, 'activity');
   }
 
+  async function openBoardTimelineTask(task: Task): Promise<void> {
+    const project = activeProject && activeProject.id === task.project_id ? activeProject : projectForTask(task);
+    if (!project) return;
+    taskRouteOrigin = `/p/${encodeURIComponent(project.slug)}/timeline`;
+    navigate(taskDeepLink(project.slug, task.key, 'activity'));
+    await openTask(task, 'activity');
+  }
+
   async function openRoadmapActivity(event: ActivityEvent): Promise<void> {
     const task = event.task_id ? roadmapActivityTasks[event.task_id] : undefined;
     if (task) {
@@ -2880,7 +3023,7 @@
       </header>
 
       <nav class="mobile-nav" aria-label="Primary navigation">
-        <button class:active={view === 'board'} type="button" aria-label="Board" aria-current={view === 'board' ? 'page' : undefined} on:click={() => setView('board')}><span class="mobile-nav-icon" aria-hidden="true">▦</span><span>Board</span></button>
+        <button class:active={view === 'board' || view === 'timeline'} type="button" aria-label="Board" aria-current={view === 'board' || view === 'timeline' ? 'page' : undefined} on:click={() => setView('board')}><span class="mobile-nav-icon" aria-hidden="true">▦</span><span>Board</span></button>
         <button class:active={view === 'issues'} type="button" aria-label="Issues" aria-current={view === 'issues' ? 'page' : undefined} on:click={() => setView('issues')}><span class="mobile-nav-icon" aria-hidden="true">⚠</span><span>Issues</span></button>
         <button class:active={view === 'my-work'} type="button" aria-label="My work" aria-current={view === 'my-work' ? 'page' : undefined} on:click={() => setView('my-work')}><span class="mobile-nav-icon" aria-hidden="true">◌</span><span>My Work</span></button>
         <button class:active={view === 'roadmap'} type="button" aria-label="Roadmap" aria-current={view === 'roadmap' ? 'page' : undefined} on:click={() => setView('roadmap')}><span class="mobile-nav-icon" aria-hidden="true">◒</span><span>Roadmap</span></button>
@@ -2888,13 +3031,19 @@
       </nav>
 
       <main class="content" class:my-work-live={view === 'my-work' && myWorkView === 'live'}>
-        {#if view === 'board'}
+        {#if view === 'board' || view === 'timeline'}
           {#if activeProject}
             <section class="page-heading board-heading">
-              <div><div class="breadcrumbs"><span>Workspace</span><span>/</span><span>{activeProject.key}</span></div><div class="heading-title-row"><span class="heading-project-dot" style={`--project-color: ${activeProject.color || '#6d5efc'}`}></span><h1>{activeProject.name}</h1><button class="icon-button favorite-heading" class:starred={activeProject.favorite} type="button" aria-label={activeProject.favorite ? 'Remove from favorites' : 'Add to favorites'} on:click={(event) => toggleFavorite(event, activeProject)}>{activeProject.favorite ? '★' : '☆'}</button></div><p>{activeProject.description || 'A focused space for turning ideas into shipped work.'}</p></div>
+              <div><div class="breadcrumbs"><span>Workspace</span><span>/</span><span>{activeProject.key}</span></div><div class="heading-title-row"><span class="heading-project-dot" style={`--project-color: ${activeProject.color || '#6d5efc'}`}></span><h1>{activeProject.name}</h1><button class="icon-button favorite-heading" class:starred={activeProject.favorite} type="button" aria-label={activeProject.favorite ? 'Remove from favorites' : 'Add to favorites'} on:click={(event) => toggleFavorite(event, activeProject)}>{activeProject.favorite ? '★' : '☆'}</button></div><p>{view === 'timeline' ? 'Everything recently worked on in this board, in one chronological view.' : activeProject.description || 'A focused space for turning ideas into shipped work.'}</p></div>
               <div class="heading-actions"><button class="button quiet-button" type="button" on:click={openProjectRoadmap}><span aria-hidden="true">◒</span> Progress</button><button class="button quiet-button" type="button" on:click={openProjectAudits}><span aria-hidden="true">◎</span> Audits</button><button class="button quiet-button" type="button" data-report-bug-trigger on:click={openBugModal}><span aria-hidden="true">⚠</span> Report bug</button><button class="button primary" type="button" data-task-modal-trigger on:click={openTaskModal}><span aria-hidden="true">＋</span> New task</button></div>
             </section>
 
+            <div class="board-view-switch" role="tablist" aria-label="Board view">
+              <button id="board-view-board" class:active={view === 'board'} type="button" role="tab" aria-selected={view === 'board'} tabindex={view === 'board' ? 0 : -1} on:click={() => setView('board')} on:keydown={boardViewKeydown}><span aria-hidden="true">▦</span> Board</button>
+              <button id="board-view-timeline" class:active={view === 'timeline'} type="button" role="tab" aria-selected={view === 'timeline'} tabindex={view === 'timeline' ? 0 : -1} on:click={openProjectTimeline} on:keydown={boardViewKeydown}><span aria-hidden="true">◷</span> Timeline</button>
+            </div>
+
+            {#if view === 'board'}
             <section class="board-toolbar" aria-label="Board filters">
               <div class="filter-search"><span aria-hidden="true">⌕</span><input aria-label="Search tasks" bind:value={filters.query} placeholder="Search tasks…" /><kbd>/</kbd></div>
               <div class="filter-group"><select aria-label="Filter by state" bind:value={filters.state}><option value="all">All states</option>{#each sortedColumns as column}<option value={column.semantic_state}>{stateLabels[column.semantic_state] || column.name}</option>{/each}</select><select aria-label="Filter by priority" bind:value={filters.priority}><option value="all">All priorities</option><option value="urgent">Urgent</option><option value="high">High</option><option value="normal">Normal</option><option value="low">Low</option></select><select aria-label="Filter by agent work" bind:value={boardWorkFilter}><option value="all">All agent work</option><option value="action-needed">Action needed{boardWorkCounts.actionNeeded ? ` · ${boardWorkCounts.actionNeeded}` : ''}</option><option value="missing">Missing{boardWorkCounts.missing ? ` · ${boardWorkCounts.missing}` : ''}</option><option value="stale">Stale{boardWorkCounts.stale ? ` · ${boardWorkCounts.stale}` : ''}</option><option value="waiting">Waiting{boardWorkCounts.waiting ? ` · ${boardWorkCounts.waiting}` : ''}</option><option value="handoff">Handoff{boardWorkCounts.handoff ? ` · ${boardWorkCounts.handoff}` : ''}</option><option value="working">Working{boardWorkCounts.working ? ` · ${boardWorkCounts.working}` : ''}</option><option value="verifying">Verifying{boardWorkCounts.verifying ? ` · ${boardWorkCounts.verifying}` : ''}</option></select><select aria-label="Filter by label" bind:value={filters.label}><option value="all">All labels</option>{#each labels as label}<option value={label.id}>{label.name}</option>{/each}</select><select aria-label="Filter by assignee" bind:value={filters.assignee}><option value="all">All assignees</option>{#each Array.from(new Map(tasks.map((task) => [actorId(task.assignee), task.assignee])).entries()).filter(([id]) => id) as pair}<option value={pair[0]}>{actorName(pair[1]) || pair[0]}</option>{/each}</select></div>
@@ -2939,6 +3088,21 @@
                   </article>
                 {/each}
               </section>
+            {/if}
+            {:else}
+              <BoardTimeline
+                items={boardTimelineItems}
+                {tasks}
+                filter={boardTimelineFilter}
+                loading={boardTimelineLoading}
+                loadingOlder={boardTimelineLoadingOlder}
+                error={boardTimelineError}
+                hasOlder={Boolean(boardTimelineNextCursor)}
+                onFilterChange={setBoardTimelineFilter}
+                onLoadOlder={loadOlderBoardTimeline}
+                onRetry={() => { if (activeProject) void loadBoardTimeline(activeProject.id, { reset: !boardTimelineItems.length }); }}
+                onOpen={openBoardTimelineTask}
+              />
             {/if}
           {:else}
             <div class="empty-state welcome-state"><div class="welcome-orbit"><span>R</span></div><span class="eyebrow">Your workspace is ready</span><h1>Start with a project.</h1><p>Projects give your ideas a home. Create one, invite your agents, and keep the next step clear.</p><button class="button primary button-large" type="button" on:click={openProjectModal}>＋ Create your first project</button></div>

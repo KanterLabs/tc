@@ -16,6 +16,16 @@ describe('public API client', () => {
     expect(etagForVersion(14)).toBe('"v14"');
   });
 
+  it('requests a board timeline with stable server-side filters', async () => {
+    const fetchMock = vi.spyOn(globalThis, 'fetch').mockResolvedValue(response({ data: [], next_cursor: null }));
+    await api.listProjectTimeline('project/one', { before: 'cursor/2', limit: 25, kind: 'agent_progress' });
+    const url = String(fetchMock.mock.calls[0][0]);
+    expect(url).toContain('/api/v1/projects/project%2Fone/timeline?');
+    expect(url).toContain('before=cursor%2F2');
+    expect(url).toContain('limit=25');
+    expect(url).toContain('kind=agent_progress');
+  });
+
   it('normalizes collection envelopes and arrays', () => {
     expect(collectionFrom([{ id: 'one' }])).toEqual({ data: [{ id: 'one' }] });
     expect(collectionFrom({ data: [{ id: 'two' }], next_cursor: '3' })).toEqual({ data: [{ id: 'two' }], next_cursor: '3' });

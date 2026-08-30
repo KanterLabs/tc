@@ -175,3 +175,123 @@ func TestTaskTimelineLeavesLegacyProgressEventsAsGenericChanges(t *testing.T) {
 		t.Fatal("legacy progress event was omitted")
 	}
 }
+
+func TestProjectTimelineMergesNonDeletedTaskActivity(t *testing.T) {
+	ctx := context.Background()
+	database, err := db.Open(ctx, ":memory:")
+	if err != nil {
+		t.Fatalf("open database: %v", err)
+	}
+	defer database.Close()
+	data := New(database)
+	actor, project, first := createAgentWorkFixture(t, data, ctx, "BOARDTIMELINE")
+	second, err := data.CreateTask(ctx, project.ID, TaskInput{Title: stringPtrForTest("Second")}, actor.ID)
+	if err != nil {
+		t.Fatalf("create second task: %v", err)
+	}
+	deleted, err := data.CreateTask(ctx, project.ID, TaskInput{Title: stringPtrForTest("Deleted")}, actor.ID)
+	if err != nil {
+		t.Fatalf("create deleted task: %v", err)
+	}
+
+	firstClaim, err := data.ClaimTask(ctx, first.ID, actor.ID, time.Hour, first.Version)
+	if err != nil {
+		t.Fatalf("claim first task: %v", err)
+	}
+	if _, err := data.PublishAgentWork(ctx, first.ID, AgentWorkInput{
+		OperationID: "board/first",
+		State:       "working",
+		Summary:     "First task progress",
+		NextAction:  "Continue first task",
+	}, firstClaim.Version, actor.ID); err != nil {
+		t.Fatalf("publish first progress: %v", err)
+	}
+	secondClaim, err := data.ClaimTask(ctx, second.ID, actor.ID, time.Hour, second.Version)
+	if err != nil {
+		t.Fatalf("claim second task: %v", err)
+	}
+	if _, err := data.PublishAgentWork(ctx, second.ID, AgentWorkInput{
+		OperationID: "board/second",
+		State:       "verifying",
+		Summary:     "Second task progress",
+	}, secondClaim.Version, actor.ID); err != nil {
+		t.Fatalf("publish second progress: %v", err)
+	}
+	if _, err := data.CreateComment(ctx, second.ID, actor.ID, "Shared board context"); err != nil {
+		t.Fatalf("create ordinary comment: %v", err)
+	}
+	if err := data.DeleteTask(ctx, deleted.ID, deleted.Version, actor.ID); err != nil {
+		t.Fatalf("delete task: %v", err)
+	}
+
+	items, more, err := data.ListProjectTimeline(ctx, project.ID, TaskTimelineFilter{Limit: 50})
+	if err != nil {
+		t.Fatalf("list project timeline: %v", err)
+	}
+	if more {
+		t.Fatal("project timeline unexpectedly has another page")
+	}
+	seenTasks := make(map[string]bool)
+	progressCount, commentCount := 0, 0
+	for _, item := range items {
+		if item.TaskID == deleted.ID {
+			t.Fatalf("deleted task leaked into project timeline: %+v", item)
+		}
+		seenTasks[item.TaskID] = true
+		if item.Kind == "agent_progress" {
+			progressCount++
+			if item.Progress == nil || item.Actor == nil || item.Actor.ID != actor.ID {
+				t.Fatalf("project progress item = %+v", item)
+			}
+		}
+		if item.Kind == "comment" {
+			commentCount++
+			if item.Comment == nil || item.Comment.Body != "Shared board context" {
+				t.Fatalf("project comment item = %+v", item)
+			}
+		}
+		if item.Kind == "task_change" && item.Change != nil && (item.Change.EventType == "comment.created" || item.Change.EventType == "task.progressed") {
+			t.Fatalf("duplicate project change item = %+v", item)
+		}
+	}
+	if !seenTasks[first.ID] || !seenTasks[second.ID] || seenTasks[deleted.ID] {
+		t.Fatalf("project task IDs = %v, want only active tasks", seenTasks)
+	}
+	if progressCount != 2 || commentCount != 1 {
+		t.Fatalf("project timeline kinds = progress %d comments %d, want 2/1", progressCount, commentCount)
+	}
+
+	// A project cursor walks the merged stream exactly once, even when rows
+	// from different tasks share the same page boundary.
+	var paged []string
+	before := ""
+	for page := 0; page < len(items)+1; page++ {
+		pageItems, hasMore, err := data.ListProjectTimeline(ctx, project.ID, TaskTimelineFilter{Before: before, Limit: 1})
+		if err != nil {
+			t.Fatalf("list project timeline page %d: %v", page, err)
+		}
+		if len(pageItems) == 0 {
+			if hasMore {
+				t.Fatal("empty project timeline page reported more rows")
+			}
+			break
+		}
+		paged = append(paged, pageItems[0].ID)
+		if !hasMore {
+			break
+		}
+		before = pageItems[0].Cursor
+	}
+	if len(paged) != len(items) {
+		t.Fatalf("paged project timeline rows = %d, want %d", len(paged), len(items))
+	}
+	for index := range items {
+		if paged[index] != items[index].ID {
+			t.Fatalf("paged project timeline[%d] = %q, want %q", index, paged[index], items[index].ID)
+		}
+	}
+
+	if _, _, err := data.ListProjectTimeline(ctx, "missing-project", TaskTimelineFilter{}); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("missing project timeline error = %v, want ErrNotFound", err)
+	}
+}

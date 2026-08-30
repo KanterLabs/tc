@@ -564,6 +564,8 @@ func (s *Server) dispatchAuthed(w http.ResponseWriter, r *http.Request, identity
 			switch parts[2] {
 			case "tasks":
 				s.tasks(w, r, identity, parts[1])
+			case "timeline":
+				s.projectTimeline(w, r, identity, parts[1])
 			case "columns":
 				s.columns(w, r, identity, parts[1])
 			case "labels":
