@@ -2688,7 +2688,7 @@
       "post": {
         "operationId": "addTaskDependency",
         "summary": "Add a direct prerequisite",
-        "description": "Add the referenced task as one direct prerequisite of `{task}`. The\nprerequisite accepts an opaque task ID or a case-insensitive\nproject-local key. The caller must have `tasks:write`, send the exact\ncurrent task ETag in `If-Match`, and send a non-empty,\nnon-whitespace `Idempotency-Key`. The task must be in the caller's\nproject access ceiling; references outside that ceiling are masked as\nnot found. A live claim may be changed only by its owner;\na human administrator may explicitly override another actor's claim.\nDependencies are limited to 200 direct prerequisites and 200 direct\ndependents, must remain within the same project, and may not create a\ncycle. A successful mutation advances only the dependent task version,\nemits `task.dependency_added`, returns the updated task (or the\nid/version redacted form for a write-only bearer), and sets its strong\nETag. Repeating the same idempotency key with the same request replays\nthe original response.\n",
+        "description": "Add the referenced task as one direct prerequisite of `{task}`. The\nprerequisite accepts an opaque task ID or a case-insensitive\nproject-local key. The caller must have `tasks:write`, send the exact\ncurrent task ETag in `If-Match`, and send a non-empty,\nnon-whitespace `Idempotency-Key`. The task must be in the caller's\nproject access ceiling; references outside that ceiling are masked as\nnot found. A live claim may be changed only by its owner;\na human administrator may explicitly override another actor's claim.\nDependencies are limited to 200 direct prerequisites and 200 direct\ndependents, must remain within the same project, and may not create a\ncycle. A successful mutation advances only the dependent task version,\nemits `task.dependency_added`, returns the updated task (or the\nid/version redacted form for a write-only bearer), and sets its strong\nETag. Repeating the same idempotency key with the same request replays\nthe original response.\nLifecycle ordering is enforced transactionally for claim, start or\nfinish transitions, ordinary task reopen or completed-to-blocked\ntransitions, bug triage/resolution/reopen, semantic column changes\n(including bulk updates), and dependency insertion into already active,\ncompleted, or actively claimed work. Reopening a completed prerequisite\nwith an unfinished active or claimed dependent, or deleting a\nprerequisite with live dependents, is rejected; rejected requests do\nnot change task, claim, graph, comment, or event state.\n",
         "tags": [
           "Tasks"
         ],
@@ -2796,7 +2796,7 @@
       "delete": {
         "operationId": "removeTaskDependency",
         "summary": "Remove a direct prerequisite",
-        "description": "Remove one direct prerequisite edge from `{task}`. The prerequisite\npath value accepts an opaque task ID or a case-insensitive\nproject-local key. The caller must have `tasks:write`, send the exact\ncurrent task ETag in `If-Match`, and send a non-empty,\nnon-whitespace `Idempotency-Key`. The task must be in the caller's\nproject access ceiling; references outside that ceiling are masked as\nnot found. A live claim may be changed only by its owner;\na human administrator may explicitly override another actor's claim.\nA successful mutation advances only the dependent task version, emits\n`task.dependency_removed`, returns the updated task (or the id/version\nredacted form for a write-only bearer), and sets its strong ETag.\nRepeating the same idempotency key with the same request replays the\noriginal response.\n",
+        "description": "Remove one direct prerequisite edge from `{task}`. The prerequisite\npath value accepts an opaque task ID or a case-insensitive\nproject-local key. The caller must have `tasks:write`, send the exact\ncurrent task ETag in `If-Match`, and send a non-empty,\nnon-whitespace `Idempotency-Key`. The task must be in the caller's\nproject access ceiling; references outside that ceiling are masked as\nnot found. A live claim may be changed only by its owner;\na human administrator may explicitly override another actor's claim.\nA successful mutation advances only the dependent task version, emits\n`task.dependency_removed`, returns the updated task (or the id/version\nredacted form for a write-only bearer), and sets its strong ETag.\nRepeating the same idempotency key with the same request replays the\noriginal response.\nLifecycle ordering guards are applied transactionally across claim,\nstart or finish transitions, ordinary task reopen or\ncompleted-to-blocked transitions, bug triage/resolution/reopen,\nsemantic column changes, reopening completed prerequisites, and\nprerequisite deletion. A prerequisite with live dependents cannot be\ndeleted until its edges are removed.\n",
         "tags": [
           "Tasks"
         ],
@@ -4559,7 +4559,7 @@
       "get": {
         "operationId": "listEvents",
         "summary": "Poll the append-only event feed",
-        "description": "Supply `after` with the last integer cursor seen to receive subsequent\nproject, task, claim, comment, completion, and bug lifecycle events.\nAgent progress publishes `task.progressed` events containing the\nmachine-readable state and checkpoint counts. Bearer tokens with\n`events:read` but without `tasks:read` receive those coordination\nfields with progress narrative (`phase`, `summary`, `next_action`,\nand `checkpoint_refs`) redacted.\nBug lifecycle events (`bug.created`, `bug.updated`, `bug.triaged`,\n`bug.resolved`, `bug.duplicated`, and `bug.reopened`) carry lifecycle\nand version metadata and are emitted in the same transaction as the\naction. Resolution events include the selected resolution; a reopen\nreason is recorded in the atomic comment.created event associated with\nthe action.\n",
+        "description": "Supply `after` with the last integer cursor seen to receive subsequent\nproject, task, claim, comment, completion, dependency, and bug\nlifecycle events.\nAgent progress publishes `task.progressed` events containing the\nmachine-readable state and checkpoint counts. Bearer tokens with\n`events:read` but without `tasks:read` receive those coordination\nfields with progress narrative (`phase`, `summary`, `next_action`,\nand `checkpoint_refs`) redacted.\nBug lifecycle events (`bug.created`, `bug.updated`, `bug.triaged`,\n`bug.resolved`, `bug.duplicated`, and `bug.reopened`) carry lifecycle\nand version metadata and are emitted in the same transaction as the\naction. Resolution events include the selected resolution; a reopen\nreason is recorded in the atomic comment.created event associated with\nthe action.\nA prerequisite's satisfied-state transition emits one bounded\n`task.dependency_state_changed` event for each direct live dependent.\nThe enclosing event's `task_id` is the dependent; its payload contains\ndependent/prerequisite IDs and keys plus the resulting `satisfied`\nboolean. This derived notification does not increment the dependent's\neditable task version. Clients should refetch the affected task or\ndependency graph.\n",
         "tags": [
           "Events"
         ],
@@ -5200,7 +5200,7 @@
         "name": "Idempotency-Key",
         "in": "header",
         "required": false,
-        "description": "Client-generated key for safely retrying a mutation. Reusing the same\nkey with the same authenticated principal, method, path, and payload\nreplays the original response before mutable resource lookup, including\nafter the resource has been deleted or changed. Bearer-token retries\nare isolated by token credential, even when tokens belong to the same\nagent actor. Location and ETag from the original response are replayed;\nusing it for another request returns 409 Conflict. Authentication\nsetup, login, and logout do not accept this header, and secret token\nissuance rejects it so plaintext cannot be replay-cached.\n",
+        "description": "Client-generated key for safely retrying a mutation. Reusing the same\nkey with the same authenticated principal, method, path, and payload\nreplays the original response before mutable resource lookup, including\nafter the resource has been deleted or changed. Bearer-token retries\nare isolated by token credential, even when tokens belong to the same\nagent actor. Location and ETag from the original response are replayed;\nusing the same key for another method, path, or payload under that\nprincipal returns 409 Conflict; different principals may reuse the\nvisible key independently. Authentication\nsetup, login, and logout do not accept this header, and secret token\nissuance rejects it so plaintext cannot be replay-cached.\n",
         "schema": {
           "type": "string",
           "minLength": 1,
@@ -5632,7 +5632,7 @@
         }
       },
       "DependencyConflict": {
-        "description": "Dependency mutations use stable conflict codes. `dependency_cycle`,\n`dependency_already_exists`, `dependency_in_use`, `stale_task`,\n`task_already_claimed`, and `idempotency_key_reused` are returned with\nHTTP 409 when the graph or mutation precondition conflicts with current\nstate. `details` is scope-aware and never discloses read-protected task\nfields to a bearer token without `tasks:read`.\n",
+        "description": "Dependency mutations use stable conflict codes. `dependency_cycle`,\n`dependency_already_exists`, `dependency_in_use`, `stale_task`,\n`task_already_claimed`, and `idempotency_key_reused` are returned with\nHTTP 409 when the graph or mutation precondition conflicts with current\nstate. Lifecycle guards also return `unmet_dependencies` when claim,\nstart, finish, resolution, or semantic-column transitions would cross a\nboundary with an unsatisfied prerequisite. Conflict details are bounded\nby the 200-edge graph limit and scope-aware: a bearer token without\n`tasks:read` receives no relation IDs, keys, titles, timestamps,\nsatisfaction flags, or cycle paths; only safe metadata such as a count,\ndirection, or limit may remain.\n",
         "headers": {
           "X-Request-ID": {
             "$ref": "#/components/headers/XRequestID"
@@ -8159,7 +8159,7 @@
           },
           "payload": {
             "type": "object",
-            "description": "For task.dependency_added and task.dependency_removed, payload conforms to DependencyEventPayload; other event types define their own payload fields.",
+            "description": "For task.dependency_added and task.dependency_removed, payload conforms to DependencyEventPayload; for task.dependency_state_changed, it conforms to DependencyStateChangedEventPayload; other event types define their own payload fields.",
             "additionalProperties": true
           }
         },
@@ -8524,6 +8524,38 @@
         },
         "additionalProperties": false
       },
+      "DependencyStateChangedEventPayload": {
+        "type": "object",
+        "required": [
+          "dependent_id",
+          "dependent_key",
+          "prerequisite_id",
+          "prerequisite_key",
+          "satisfied"
+        ],
+        "description": "Payload for `task.dependency_state_changed`, emitted once for each\ndirect live dependent when a prerequisite's satisfied state changes.\nThe dependent's editable task version does not change for this derived\nreadiness notification.\n",
+        "properties": {
+          "dependent_id": {
+            "$ref": "#/components/schemas/Identifier"
+          },
+          "dependent_key": {
+            "type": "string",
+            "pattern": "^[A-Z][A-Z0-9_-]{0,15}-[1-9][0-9]*$"
+          },
+          "prerequisite_id": {
+            "$ref": "#/components/schemas/Identifier"
+          },
+          "prerequisite_key": {
+            "type": "string",
+            "pattern": "^[A-Z][A-Z0-9_-]{0,15}-[1-9][0-9]*$"
+          },
+          "satisfied": {
+            "type": "boolean",
+            "description": "Whether the prerequisite is now complete in its completed semantic column."
+          }
+        },
+        "additionalProperties": false
+      },
       "Event": {
         "type": "object",
         "required": [
@@ -8547,7 +8579,7 @@
           "type": {
             "type": "string",
             "minLength": 1,
-            "description": "Event type, for example task.claimed, task.progressed, task.moved, task.completed, task.dependency_added, task.dependency_removed, bug.triaged, bug.resolved, bug.duplicated, or bug.reopened.",
+            "description": "Event type, for example task.claimed, task.progressed, task.moved, task.completed, task.dependency_added, task.dependency_removed, task.dependency_state_changed, bug.triaged, bug.resolved, bug.duplicated, or bug.reopened.",
             "example": "task.claimed"
           },
           "actor_id": {
@@ -8564,6 +8596,7 @@
           },
           "payload": {
             "type": "object",
+            "description": "For task.dependency_added and task.dependency_removed, payload conforms to DependencyEventPayload; for task.dependency_state_changed, it conforms to DependencyStateChangedEventPayload; other event types define their own payload fields.",
             "additionalProperties": true
           }
         },
@@ -9860,6 +9893,25 @@
             "prerequisite_id": "task_41",
             "prerequisite_key": "OPS-41",
             "version": 9
+          }
+        }
+      },
+      "TaskDependencyStateChangedEventExample": {
+        "summary": "Dependent readiness invalidation event",
+        "value": {
+          "cursor": 48,
+          "id": "event_48",
+          "type": "task.dependency_state_changed",
+          "actor_id": "agent_ada",
+          "project_id": "proj_ops",
+          "task_id": "task_43",
+          "created_at": "2026-08-27T10:50:00Z",
+          "payload": {
+            "dependent_id": "task_43",
+            "dependent_key": "OPS-43",
+            "prerequisite_id": "task_41",
+            "prerequisite_key": "OPS-41",
+            "satisfied": true
           }
         }
       },

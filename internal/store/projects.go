@@ -508,7 +508,7 @@ func (s *Store) UpdateColumnWithClaimOverride(ctx context.Context, id string, in
 		}
 		result, err := tx.ExecContext(ctx, query, args...)
 		if err != nil {
-			return err
+			return mapDependencyLifecycleError(ctx, tx, err, dependencyLifecycleTarget{ColumnID: id, NextSemanticState: state})
 		}
 		count, _ := result.RowsAffected()
 		if count == 0 {
@@ -523,7 +523,12 @@ func (s *Store) UpdateColumnWithClaimOverride(ctx context.Context, id string, in
 			}
 			return conflict("column has changed", map[string]any{"column_id": id})
 		}
+		var dependencyChanges []dependencyStateChange
 		if stateChanged {
+			dependencyChanges, err = dependencyColumnStateChanges(ctx, tx, current, state, updated)
+			if err != nil {
+				return err
+			}
 			var taskQuery string
 			var taskArgs []any
 			switch {
@@ -538,11 +543,13 @@ func (s *Store) UpdateColumnWithClaimOverride(ctx context.Context, id string, in
 				taskArgs = []any{updated, id}
 			}
 			if _, err := tx.ExecContext(ctx, taskQuery, taskArgs...); err != nil {
-				return err
+				return mapDependencyLifecycleError(ctx, tx, err, dependencyLifecycleTarget{ColumnID: id, NextSemanticState: state})
 			}
 		}
-		_, err = insertEvent(ctx, tx, "column.updated", actorID, current.ProjectID, "", map[string]any{"column_id": id})
-		return err
+		if _, err = insertEvent(ctx, tx, "column.updated", actorID, current.ProjectID, "", map[string]any{"column_id": id}); err != nil {
+			return err
+		}
+		return emitDependencyStateChanges(ctx, tx, actorID, dependencyChanges)
 	})
 	if err != nil {
 		return Column{}, err

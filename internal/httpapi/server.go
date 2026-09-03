@@ -1306,7 +1306,7 @@ func redactDependencyValue(value any) any {
 		redacted := make(map[string]any, len(typed))
 		for key, child := range typed {
 			switch key {
-			case "id", "key", "title", "completed_at", "satisfied", "task_id", "prerequisite_id", "dependent_id", "prerequisite_task_id", "task_key", "prerequisite_key", "path", "path_ids", "task_project_id", "prerequisite_project_id":
+			case "id", "key", "title", "completed_at", "satisfied", "task_id", "prerequisite_id", "dependent_id", "prerequisite_task_id", "task_key", "task_title", "prerequisite_key", "dependent_key", "column_id", "path", "path_ids", "task_project_id", "prerequisite_project_id":
 				continue
 			default:
 				redacted[key] = redactDependencyValue(child)

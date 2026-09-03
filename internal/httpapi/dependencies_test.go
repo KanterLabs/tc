@@ -181,6 +181,100 @@ func TestTaskDependenciesHTTPContractAndTimeline(t *testing.T) {
 	}
 }
 
+func TestTaskDependencyLifecycleHTTPContractAndRedaction(t *testing.T) {
+	fixture := newDependencyHTTPFixture(t, "DEPLIFE")
+	ctx := context.Background()
+	dependent, err := fixture.data.AddTaskDependency(ctx, fixture.dependent.ID, fixture.prerequisite.ID, fixture.dependent.Version, fixture.actor.ID)
+	if err != nil {
+		t.Fatalf("add dependency: %v", err)
+	}
+	agent, token := dependencyHTTPToken(t, fixture, "claim-only lifecycle agent", []string{"tasks:claim"}, []string{fixture.project.ID}, "agent")
+	claimHeaders := map[string]string{
+		"Authorization": "Bearer " + token,
+		"Content-Type":  "application/json",
+		"If-Match":      `"v2"`,
+	}
+
+	blocked := request(t, fixture.server, http.MethodPost, "/api/v1/tasks/"+dependent.ID+"/claim", map[string]any{"lease_seconds": 60}, claimHeaders)
+	if blocked.Code != http.StatusConflict || responseErrorCode(t, blocked.Body.Bytes()) != "unmet_dependencies" {
+		t.Fatalf("blocked lifecycle claim: status=%d body=%s", blocked.Code, blocked.Body.String())
+	}
+	for _, secret := range []string{dependent.ID, dependent.Key, dependent.Title, fixture.prerequisite.ID, fixture.prerequisite.Key, fixture.prerequisite.Title} {
+		if strings.Contains(blocked.Body.String(), secret) {
+			t.Fatalf("claim-only dependency conflict leaked %q: %s", secret, blocked.Body.String())
+		}
+	}
+	var errorEnvelope struct {
+		Error struct {
+			Details map[string]any `json:"details"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(blocked.Body.Bytes(), &errorEnvelope); err != nil {
+		t.Fatalf("decode redacted lifecycle conflict: %v", err)
+	}
+	if len(errorEnvelope.Error.Details) != 0 {
+		t.Fatalf("redacted unmet details = %#v, want no task graph fields", errorEnvelope.Error.Details)
+	}
+
+	completed := request(t, fixture.server, http.MethodPost, "/api/v1/tasks/"+fixture.prerequisite.ID+"/complete", nil, map[string]string{"If-Match": `"v1"`})
+	if completed.Code != http.StatusOK || completed.Header().Get("ETag") != `"v2"` {
+		t.Fatalf("complete prerequisite: status=%d etag=%q body=%s", completed.Code, completed.Header().Get("ETag"), completed.Body.String())
+	}
+	relationsResponse := request(t, fixture.server, http.MethodGet, "/api/v1/tasks/"+dependent.ID+"/dependencies", nil, nil)
+	if relationsResponse.Code != http.StatusOK || relationsResponse.Header().Get("ETag") != `"v2"` {
+		t.Fatalf("refresh dependencies: status=%d etag=%q body=%s", relationsResponse.Code, relationsResponse.Header().Get("ETag"), relationsResponse.Body.String())
+	}
+	var relations store.TaskDependencies
+	if err := json.Unmarshal(relationsResponse.Body.Bytes(), &relations); err != nil {
+		t.Fatalf("decode refreshed dependencies: %v", err)
+	}
+	if len(relations.Prerequisites) != 1 || !relations.Prerequisites[0].Satisfied {
+		t.Fatalf("refreshed prerequisite state = %#v, want satisfied", relations.Prerequisites)
+	}
+	var invalidations int
+	if err := fixture.data.DB.QueryRowContext(ctx, `SELECT COUNT(1) FROM events WHERE type='task.dependency_state_changed' AND task_id=?`, dependent.ID).Scan(&invalidations); err != nil {
+		t.Fatalf("count dependent invalidations: %v", err)
+	}
+	if invalidations != 1 {
+		t.Fatalf("dependent invalidations = %d, want 1", invalidations)
+	}
+
+	claimed := request(t, fixture.server, http.MethodPost, "/api/v1/tasks/"+dependent.ID+"/claim", map[string]any{"lease_seconds": 60}, claimHeaders)
+	if claimed.Code != http.StatusOK || claimed.Header().Get("ETag") != `"v3"` {
+		t.Fatalf("claim after prerequisite completion: status=%d etag=%q body=%s", claimed.Code, claimed.Header().Get("ETag"), claimed.Body.String())
+	}
+	var reduced map[string]any
+	if err := json.Unmarshal(claimed.Body.Bytes(), &reduced); err != nil {
+		t.Fatalf("decode claim-only response: %v", err)
+	}
+	if reduced["id"] != dependent.ID || reduced["version"] != float64(3) || strings.Contains(claimed.Body.String(), dependent.Title) {
+		t.Fatalf("claim-only success response = %#v body=%s", reduced, claimed.Body.String())
+	}
+
+	for _, mutation := range []struct {
+		name   string
+		method string
+		path   string
+		body   any
+	}{
+		{name: "reopen", method: http.MethodPost, path: "/api/v1/tasks/" + fixture.prerequisite.ID + "/block", body: map[string]any{"reason": "unsafe reopen"}},
+		{name: "delete", method: http.MethodDelete, path: "/api/v1/tasks/" + fixture.prerequisite.ID},
+	} {
+		result := request(t, fixture.server, mutation.method, mutation.path, mutation.body, map[string]string{"Content-Type": "application/json", "If-Match": `"v2"`})
+		if result.Code != http.StatusConflict || responseErrorCode(t, result.Body.Bytes()) != "dependency_in_use" {
+			t.Fatalf("%s protected prerequisite: status=%d body=%s", mutation.name, result.Code, result.Body.String())
+		}
+	}
+
+	completedDependent := request(t, fixture.server, http.MethodPost, "/api/v1/tasks/"+dependent.ID+"/complete", nil, map[string]string{
+		"Authorization": "Bearer " + token,
+		"If-Match":      `"v3"`,
+	})
+	if completedDependent.Code != http.StatusOK || completedDependent.Header().Get("ETag") != `"v4"` {
+		t.Fatalf("complete eligible claimed dependent as %s: status=%d etag=%q body=%s", agent.ID, completedDependent.Code, completedDependent.Header().Get("ETag"), completedDependent.Body.String())
+	}
+}
+
 func TestTaskDependenciesHTTPHeadersScopesAndProjectCeiling(t *testing.T) {
 	fixture := newDependencyHTTPFixture(t, "DEPSCOPE")
 	ctx := context.Background()

@@ -1744,6 +1744,14 @@ paths:
         id/version redacted form for a write-only bearer), and sets its strong
         ETag. Repeating the same idempotency key with the same request replays
         the original response.
+        Lifecycle ordering is enforced transactionally for claim, start or
+        finish transitions, ordinary task reopen or completed-to-blocked
+        transitions, bug triage/resolution/reopen, semantic column changes
+        (including bulk updates), and dependency insertion into already active,
+        completed, or actively claimed work. Reopening a completed prerequisite
+        with an unfinished active or claimed dependent, or deleting a
+        prerequisite with live dependents, is rejected; rejected requests do
+        not change task, claim, graph, comment, or event state.
       tags:
         - Tasks
       security:
@@ -1820,6 +1828,12 @@ paths:
         redacted form for a write-only bearer), and sets its strong ETag.
         Repeating the same idempotency key with the same request replays the
         original response.
+        Lifecycle ordering guards are applied transactionally across claim,
+        start or finish transitions, ordinary task reopen or
+        completed-to-blocked transitions, bug triage/resolution/reopen,
+        semantic column changes, reopening completed prerequisites, and
+        prerequisite deletion. A prerequisite with live dependents cannot be
+        deleted until its edges are removed.
       tags:
         - Tasks
       security:
@@ -2982,7 +2996,8 @@ paths:
       summary: Poll the append-only event feed
       description: |
         Supply `after` with the last integer cursor seen to receive subsequent
-        project, task, claim, comment, completion, and bug lifecycle events.
+        project, task, claim, comment, completion, dependency, and bug
+        lifecycle events.
         Agent progress publishes `task.progressed` events containing the
         machine-readable state and checkpoint counts. Bearer tokens with
         `events:read` but without `tasks:read` receive those coordination
@@ -2994,6 +3009,13 @@ paths:
         action. Resolution events include the selected resolution; a reopen
         reason is recorded in the atomic comment.created event associated with
         the action.
+        A prerequisite's satisfied-state transition emits one bounded
+        `task.dependency_state_changed` event for each direct live dependent.
+        The enclosing event's `task_id` is the dependent; its payload contains
+        dependent/prerequisite IDs and keys plus the resulting `satisfied`
+        boolean. This derived notification does not increment the dependent's
+        editable task version. Clients should refetch the affected task or
+        dependency graph.
       tags:
         - Events
       parameters:
@@ -3438,7 +3460,9 @@ components:
         after the resource has been deleted or changed. Bearer-token retries
         are isolated by token credential, even when tokens belong to the same
         agent actor. Location and ETag from the original response are replayed;
-        using it for another request returns 409 Conflict. Authentication
+        using the same key for another method, path, or payload under that
+        principal returns 409 Conflict; different principals may reuse the
+        visible key independently. Authentication
         setup, login, and logout do not accept this header, and secret token
         issuance rejects it so plaintext cannot be replay-cached.
       schema:
@@ -3757,8 +3781,13 @@ components:
         `dependency_already_exists`, `dependency_in_use`, `stale_task`,
         `task_already_claimed`, and `idempotency_key_reused` are returned with
         HTTP 409 when the graph or mutation precondition conflicts with current
-        state. `details` is scope-aware and never discloses read-protected task
-        fields to a bearer token without `tasks:read`.
+        state. Lifecycle guards also return `unmet_dependencies` when claim,
+        start, finish, resolution, or semantic-column transitions would cross a
+        boundary with an unsatisfied prerequisite. Conflict details are bounded
+        by the 200-edge graph limit and scope-aware: a bearer token without
+        `tasks:read` receives no relation IDs, keys, titles, timestamps,
+        satisfaction flags, or cycle paths; only safe metadata such as a count,
+        direction, or limit may remain.
       headers: *commonResponseHeaders
       content:
         application/json:
@@ -5642,7 +5671,7 @@ components:
           minLength: 1
         payload:
           type: object
-          description: For task.dependency_added and task.dependency_removed, payload conforms to DependencyEventPayload; other event types define their own payload fields.
+          description: For task.dependency_added and task.dependency_removed, payload conforms to DependencyEventPayload; for task.dependency_state_changed, it conforms to DependencyStateChangedEventPayload; other event types define their own payload fields.
           additionalProperties: true
       additionalProperties: false
 
@@ -5903,6 +5932,35 @@ components:
           minimum: 1
       additionalProperties: false
 
+    DependencyStateChangedEventPayload:
+      type: object
+      required:
+        - dependent_id
+        - dependent_key
+        - prerequisite_id
+        - prerequisite_key
+        - satisfied
+      description: |
+        Payload for `task.dependency_state_changed`, emitted once for each
+        direct live dependent when a prerequisite's satisfied state changes.
+        The dependent's editable task version does not change for this derived
+        readiness notification.
+      properties:
+        dependent_id:
+          $ref: '#/components/schemas/Identifier'
+        dependent_key:
+          type: string
+          pattern: '^[A-Z][A-Z0-9_-]{0,15}-[1-9][0-9]*$'
+        prerequisite_id:
+          $ref: '#/components/schemas/Identifier'
+        prerequisite_key:
+          type: string
+          pattern: '^[A-Z][A-Z0-9_-]{0,15}-[1-9][0-9]*$'
+        satisfied:
+          type: boolean
+          description: Whether the prerequisite is now complete in its completed semantic column.
+      additionalProperties: false
+
     Event:
       type: object
       required:
@@ -5923,7 +5981,7 @@ components:
         type:
           type: string
           minLength: 1
-          description: Event type, for example task.claimed, task.progressed, task.moved, task.completed, task.dependency_added, task.dependency_removed, bug.triaged, bug.resolved, bug.duplicated, or bug.reopened.
+          description: Event type, for example task.claimed, task.progressed, task.moved, task.completed, task.dependency_added, task.dependency_removed, task.dependency_state_changed, bug.triaged, bug.resolved, bug.duplicated, or bug.reopened.
           example: task.claimed
         actor_id:
           $ref: '#/components/schemas/Identifier'
@@ -5935,6 +5993,7 @@ components:
           $ref: '#/components/schemas/Timestamp'
         payload:
           type: object
+          description: For task.dependency_added and task.dependency_removed, payload conforms to DependencyEventPayload; for task.dependency_state_changed, it conforms to DependencyStateChangedEventPayload; other event types define their own payload fields.
           additionalProperties: true
       additionalProperties: false
 
@@ -6950,6 +7009,22 @@ components:
           prerequisite_id: task_41
           prerequisite_key: OPS-41
           version: 9
+    TaskDependencyStateChangedEventExample:
+      summary: Dependent readiness invalidation event
+      value:
+        cursor: 48
+        id: event_48
+        type: task.dependency_state_changed
+        actor_id: agent_ada
+        project_id: proj_ops
+        task_id: task_43
+        created_at: '2026-08-27T10:50:00Z'
+        payload:
+          dependent_id: task_43
+          dependent_key: OPS-43
+          prerequisite_id: task_41
+          prerequisite_key: OPS-41
+          satisfied: true
     AgentCollectionExample:
       summary: Agent collection
       value:

@@ -334,6 +334,14 @@ func (s *Store) TriageBugWithClaimOverride(ctx context.Context, id string, input
 	if column.SemanticState == "completed" && current.Bug.Resolution == nil {
 		return Task{}, invalid("bugs must be resolved before entering a completed column", nil)
 	}
+	sourceColumn := column
+	if current.ColumnID != column.ID {
+		sourceColumn, err = s.GetColumn(ctx, current.ColumnID)
+		if err != nil {
+			return Task{}, err
+		}
+	}
+	beforeDependency := dependencyTaskFromTask(current, sourceColumn.SemanticState)
 	timestamp := now()
 	completedAt := any(nil)
 	if column.SemanticState == "completed" {
@@ -352,7 +360,7 @@ func (s *Store) TriageBugWithClaimOverride(ctx context.Context, id string, input
 		}
 		result, err := tx.ExecContext(ctx, query, args...)
 		if err != nil {
-			return err
+			return mapDependencyLifecycleError(ctx, tx, err, dependencyLifecycleTarget{TaskID: id})
 		}
 		count, _ := result.RowsAffected()
 		if count == 0 {
@@ -365,8 +373,17 @@ func (s *Store) TriageBugWithClaimOverride(ctx context.Context, id string, input
 		if changed, _ := result.RowsAffected(); changed == 0 {
 			return invalid("bug details not found", nil)
 		}
-		_, err = insertEvent(ctx, tx, "bug.triaged", actorID, current.ProjectID, id, map[string]any{"version": expected + 1})
-		return err
+		if _, err = insertEvent(ctx, tx, "bug.triaged", actorID, current.ProjectID, id, map[string]any{"version": expected + 1}); err != nil {
+			return err
+		}
+		change, changed, err := dependencyTaskStateChange(ctx, tx, beforeDependency)
+		if err != nil {
+			return err
+		}
+		if changed {
+			return emitDependencyStateChanges(ctx, tx, actorID, []dependencyStateChange{change})
+		}
+		return nil
 	})
 	if err != nil {
 		return Task{}, err
@@ -418,6 +435,11 @@ func (s *Store) ResolveBugWithClaimOverride(ctx context.Context, id string, inpu
 	if err != nil {
 		return Task{}, err
 	}
+	sourceColumn, err := s.GetColumn(ctx, current.ColumnID)
+	if err != nil {
+		return Task{}, err
+	}
+	beforeDependency := dependencyTaskFromTask(current, sourceColumn.SemanticState)
 	timestamp := now()
 	err = s.withTx(ctx, func(tx *sql.Tx) error {
 		duplicateTargetID := ""
@@ -436,7 +458,7 @@ func (s *Store) ResolveBugWithClaimOverride(ctx context.Context, id string, inpu
 		}
 		result, err := tx.ExecContext(ctx, query, args...)
 		if err != nil {
-			return err
+			return mapDependencyLifecycleError(ctx, tx, err, dependencyLifecycleTarget{TaskID: id})
 		}
 		count, _ := result.RowsAffected()
 		if count == 0 {
@@ -470,8 +492,17 @@ func (s *Store) ResolveBugWithClaimOverride(ctx context.Context, id string, inpu
 		if resolution == "duplicate" {
 			eventType = "bug.duplicated"
 		}
-		_, err = insertEvent(ctx, tx, eventType, actorID, current.ProjectID, id, map[string]any{"version": expected + 1, "resolution": resolution})
-		return err
+		if _, err = insertEvent(ctx, tx, eventType, actorID, current.ProjectID, id, map[string]any{"version": expected + 1, "resolution": resolution}); err != nil {
+			return err
+		}
+		change, changed, err := dependencyTaskStateChange(ctx, tx, beforeDependency)
+		if err != nil {
+			return err
+		}
+		if changed {
+			return emitDependencyStateChanges(ctx, tx, actorID, []dependencyStateChange{change})
+		}
+		return nil
 	})
 	if err != nil {
 		return Task{}, err
@@ -514,6 +545,11 @@ func (s *Store) ReopenBugWithClaimOverride(ctx context.Context, id, reason strin
 	if err != nil {
 		return Task{}, err
 	}
+	sourceColumn, err := s.GetColumn(ctx, current.ColumnID)
+	if err != nil {
+		return Task{}, err
+	}
+	beforeDependency := dependencyTaskFromTask(current, sourceColumn.SemanticState)
 	timestamp := now()
 	err = s.withTx(ctx, func(tx *sql.Tx) error {
 		query := `UPDATE tasks SET column_id=?, completed_at=NULL, claimed_by=NULL, claim_expires_at=NULL, version=version+1, updated_at=? WHERE id=? AND kind='bug' AND version=? AND deleted_at IS NULL`
@@ -524,7 +560,7 @@ func (s *Store) ReopenBugWithClaimOverride(ctx context.Context, id, reason strin
 		}
 		result, err := tx.ExecContext(ctx, query, args...)
 		if err != nil {
-			return err
+			return mapDependencyLifecycleError(ctx, tx, err, dependencyLifecycleTarget{TaskID: id})
 		}
 		count, _ := result.RowsAffected()
 		if count == 0 {
@@ -543,8 +579,17 @@ func (s *Store) ReopenBugWithClaimOverride(ctx context.Context, id, reason strin
 		if _, err := insertEvent(ctx, tx, "comment.created", actorID, current.ProjectID, id, map[string]any{"comment_id": commentID}); err != nil {
 			return err
 		}
-		_, err = insertEvent(ctx, tx, "bug.reopened", actorID, current.ProjectID, id, map[string]any{"version": expected + 1})
-		return err
+		if _, err = insertEvent(ctx, tx, "bug.reopened", actorID, current.ProjectID, id, map[string]any{"version": expected + 1}); err != nil {
+			return err
+		}
+		change, changed, err := dependencyTaskStateChange(ctx, tx, beforeDependency)
+		if err != nil {
+			return err
+		}
+		if changed {
+			return emitDependencyStateChanges(ctx, tx, actorID, []dependencyStateChange{change})
+		}
+		return nil
 	})
 	if err != nil {
 		return Task{}, err

@@ -5,7 +5,6 @@ import (
 	"database/sql"
 	"errors"
 	"path/filepath"
-	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -348,8 +347,8 @@ func TestTaskDependenciesSoftDeleteLifecycle(t *testing.T) {
 	beforeDependent := liveDependent
 	if err := f.store.DeleteTask(f.ctx, livePrerequisite.ID, livePrerequisite.Version, f.actor.ID); err == nil {
 		t.Fatal("delete prerequisite succeeded with a live dependent")
-	} else if !strings.Contains(strings.ToLower(err.Error()), "dependency_in_use") {
-		t.Fatalf("delete prerequisite error = %v, want dependency_in_use trigger", err)
+	} else if !errors.Is(err, ErrDependencyInUse) {
+		t.Fatalf("delete prerequisite error = %v, want ErrDependencyInUse", err)
 	}
 	afterPrerequisite, err := f.store.GetTask(f.ctx, livePrerequisite.ID)
 	if err != nil {

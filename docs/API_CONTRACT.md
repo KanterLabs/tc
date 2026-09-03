@@ -223,6 +223,19 @@ ETag (or `{ "id": "...", "version": N }` for a write-only bearer without
 `tasks:read`), and emits the corresponding dependency event. Idempotent
 retries replay the original body and ETag before mutable task lookup.
 
+Lifecycle ordering is enforced inside the store transaction for every entry
+point: claim, generic task PATCH or move into `active`/`completed`, complete,
+ordinary task reopen or `completed`-to-`blocked` transition, bug triage,
+resolve, or reopen, semantic column changes (including bulk column updates),
+and dependency insertion into already active, completed, or actively claimed
+work.
+Every direct prerequisite must be live and satisfied before a task crosses a
+start/finish boundary. Reopening a completed prerequisite is rejected while
+an unfinished dependent is active or actively claimed, and deleting a
+prerequisite is rejected while it has a live dependent. Deleting a dependent
+cleans up its own graph edges atomically. Rejected lifecycle requests do not
+change the task, claim, graph, comments, or events.
+
 The stable dependency error codes are:
 
 - `dependency_self_reference`: the task was supplied as its own prerequisite.
@@ -251,8 +264,12 @@ isolated key namespaces. A missing or blank required key returns `400` with
 `idempotency_required`. Error details
 are scope-aware: callers without `tasks:read` never receive task titles,
 descriptions, or other read-protected fields. Conflict details are reduced to
-the IDs and versions needed to retry, and cycle details contain identifiers or
-keys only.
+bounded safe metadata. Write-only dependency callers receive no relation IDs,
+keys, titles, completion timestamps, satisfaction flags, or cycle paths; only
+non-sensitive fields such as direction, count, or limit may remain. Callers
+with `tasks:read` may receive bounded IDs/keys and cycle paths, but never more
+than the 200-edge graph limits. Stale task conflicts retain only the dependent
+task `id` and `version` for write-only retry callers.
 
 ### Board audits and guarded moves
 
@@ -626,7 +643,9 @@ their original response even after a target is deleted or its state/version
 changes. Successful replays preserve the original `Location` (and `ETag`)
 headers. Bearer-token idempotency namespaces are isolated by immutable token
 credential, so two tokens owned by one actor cannot replay each other's key.
-Reusing a key for a different request returns `409`.
+For the same authenticated principal and key, a different method, path, or
+payload returns `409`; different principals (and bearer credentials) may reuse
+the visible key independently.
 
 Validation, malformed request, and unknown JSON field errors are `400` (the
 runtime does not use `422`). Common statuses are `401` authentication required, `403` forbidden
@@ -663,9 +682,23 @@ Dependency mutations append `task.dependency_added` or
 }
 ```
 
-The `version` is the resulting dependent-task version. The current TC-103
-implementation does not emit a targeted dependent-invalidation event when a
-prerequisite is completed or reopened. `task.dependency_state_changed` is
-pending TC-104; consumers must not assume it is available until that work is
-deployed. Until then, clients that need fresh readiness state must refetch the
-affected task's dependency graph or use `dependency=blocked|ready`.
+The `version` is the resulting dependent-task version. Whenever a
+prerequisite's satisfied state changes, the server emits one
+`task.dependency_state_changed` event for each direct live dependent. The
+enclosing event's `task_id` is the dependent task. Its payload is:
+
+```json
+{
+  "dependent_id": "task_43",
+  "dependent_key": "OPS-43",
+  "prerequisite_id": "task_41",
+  "prerequisite_key": "OPS-41",
+  "satisfied": true
+}
+```
+
+This is a derived-readiness invalidation only: it does not increment the
+dependent's editable task version. Polling clients should refetch each
+affected task or its dependency graph, then recompute `dependency=blocked|ready`
+views as needed. The notification is bounded to the 200 direct-dependent
+limit and applies only to live, same-project relations.

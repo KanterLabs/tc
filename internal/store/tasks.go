@@ -656,6 +656,13 @@ func (s *Store) UpdateTaskWithClaimOverride(ctx context.Context, id string, inpu
 	if column.ProjectID != current.ProjectID {
 		return Task{}, invalid("column belongs to another project", nil)
 	}
+	sourceColumn := column
+	if current.ColumnID != column.ID {
+		sourceColumn, err = s.GetColumn(ctx, current.ColumnID)
+		if err != nil {
+			return Task{}, err
+		}
+	}
 	if kind == bugKind && column.SemanticState == "completed" && (current.Bug == nil || current.Bug.Resolution == nil) {
 		return Task{}, invalid("bugs must be resolved before entering a completed column", nil)
 	}
@@ -677,6 +684,7 @@ func (s *Store) UpdateTaskWithClaimOverride(ctx context.Context, id string, inpu
 		}
 	}
 	err = s.withTx(ctx, func(tx *sql.Tx) error {
+		beforeDependency := dependencyTaskFromTask(current, sourceColumn.SemanticState)
 		query := `UPDATE tasks SET kind=?, title=?, description=?, priority=?, column_id=?, position=?, assignee_id=NULLIF(?, ''), due_at=NULLIF(?, ''), version=version+1, completed_at=?, updated_at=? WHERE id=? AND version=? AND deleted_at IS NULL`
 		args := []any{kind, title, description, priority, columnID, position, assignee, dueAt, completedAt, updated, id, expected}
 		if !allowClaimOverride {
@@ -685,7 +693,7 @@ func (s *Store) UpdateTaskWithClaimOverride(ctx context.Context, id string, inpu
 		}
 		result, err := tx.ExecContext(ctx, query, args...)
 		if err != nil {
-			return err
+			return mapDependencyLifecycleError(ctx, tx, err, dependencyLifecycleTarget{TaskID: id})
 		}
 		count, _ := result.RowsAffected()
 		if count == 0 {
@@ -721,8 +729,16 @@ func (s *Store) UpdateTaskWithClaimOverride(ctx context.Context, id string, inpu
 			}
 		}
 		if kind == bugKind && (bugMutation || current.Kind != kind) {
-			_, err = insertEvent(ctx, tx, "bug.updated", actorID, current.ProjectID, id, map[string]any{"version": expected + 1})
+			if _, err = insertEvent(ctx, tx, "bug.updated", actorID, current.ProjectID, id, map[string]any{"version": expected + 1}); err != nil {
+				return err
+			}
+		}
+		change, stateChanged, err := dependencyTaskStateChange(ctx, tx, beforeDependency)
+		if err != nil {
 			return err
+		}
+		if stateChanged {
+			return emitDependencyStateChanges(ctx, tx, actorID, []dependencyStateChange{change})
 		}
 		return nil
 	})
@@ -756,7 +772,7 @@ func (s *Store) DeleteTaskWithClaimOverride(ctx context.Context, id string, expe
 		}
 		result, err := tx.ExecContext(ctx, query, args...)
 		if err != nil {
-			return err
+			return mapDependencyLifecycleError(ctx, tx, err, dependencyLifecycleTarget{TaskID: id, AllDependents: true})
 		}
 		count, _ := result.RowsAffected()
 		if count == 0 {
@@ -878,7 +894,7 @@ func (s *Store) ClaimTask(ctx context.Context, id, actorID string, duration time
 	err = s.withTx(ctx, func(tx *sql.Tx) error {
 		result, err := tx.ExecContext(ctx, `UPDATE tasks SET claimed_by=?, claim_expires_at=strftime('%Y-%m-%dT%H:%M:%fZ','now',?), version=version+1, updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id=? AND version=? AND deleted_at IS NULL AND completed_at IS NULL AND (claimed_by=? OR claimed_by IS NULL OR claim_expires_at IS NULL OR julianday(claim_expires_at) <= julianday('now'))`, actorID, expiresModifier, id, expected, actorID)
 		if err != nil {
-			return err
+			return mapDependencyLifecycleError(ctx, tx, err, dependencyLifecycleTarget{TaskID: id})
 		}
 		count, _ := result.RowsAffected()
 		if count == 0 {
@@ -930,7 +946,7 @@ func (s *Store) renewTask(ctx context.Context, id, actorID string, duration time
 	err = s.withTx(ctx, func(tx *sql.Tx) error {
 		result, err := tx.ExecContext(ctx, `UPDATE tasks SET claim_expires_at=strftime('%Y-%m-%dT%H:%M:%fZ','now',?), version=version+1, updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id=? AND version=? AND claimed_by=? AND julianday(claim_expires_at) > julianday('now') AND deleted_at IS NULL AND completed_at IS NULL`, expiresModifier, id, expected, actorID)
 		if err != nil {
-			return err
+			return mapDependencyLifecycleError(ctx, tx, err, dependencyLifecycleTarget{TaskID: id})
 		}
 		count, _ := result.RowsAffected()
 		if count == 0 {
@@ -1055,7 +1071,15 @@ func (s *Store) transitionTask(ctx context.Context, id, actorID string, expected
 	if err != nil {
 		return Task{}, err
 	}
+	sourceColumn := column
+	if current.ColumnID != column.ID {
+		sourceColumn, err = s.GetColumn(ctx, current.ColumnID)
+		if err != nil {
+			return Task{}, err
+		}
+	}
 	err = s.withTx(ctx, func(tx *sql.Tx) error {
+		beforeDependency := dependencyTaskFromTask(current, sourceColumn.SemanticState)
 		// Compare the task's pre-update column state inside the guarded UPDATE.
 		// Repeating complete while already completed must preserve its original
 		// timestamp; only a transition into completed gets a new one.
@@ -1067,7 +1091,7 @@ func (s *Store) transitionTask(ctx context.Context, id, actorID string, expected
 		}
 		result, err := tx.ExecContext(ctx, query, args...)
 		if err != nil {
-			return err
+			return mapDependencyLifecycleError(ctx, tx, err, dependencyLifecycleTarget{TaskID: id})
 		}
 		count, _ := result.RowsAffected()
 		if count == 0 {
@@ -1094,8 +1118,17 @@ func (s *Store) transitionTask(ctx context.Context, id, actorID string, expected
 				return err
 			}
 		}
-		_, err = insertEvent(ctx, tx, eventType, actorID, current.ProjectID, id, map[string]any{"column_id": column.ID})
-		return err
+		if _, err = insertEvent(ctx, tx, eventType, actorID, current.ProjectID, id, map[string]any{"column_id": column.ID}); err != nil {
+			return err
+		}
+		change, stateChanged, err := dependencyTaskStateChange(ctx, tx, beforeDependency)
+		if err != nil {
+			return err
+		}
+		if stateChanged {
+			return emitDependencyStateChanges(ctx, tx, actorID, []dependencyStateChange{change})
+		}
+		return nil
 	})
 	if err != nil {
 		return Task{}, err
