@@ -154,7 +154,7 @@ validate_release_env "$RELEASE_DIR/roadmap.env" "$SHA"
 
 export DEBIAN_FRONTEND=noninteractive
 apt-get update
-apt-get install --yes --no-install-recommends ca-certificates curl nftables sqlite3 unattended-upgrades
+apt-get install --yes --no-install-recommends bubblewrap ca-certificates curl nftables sqlite3 unattended-upgrades
 apt-get clean
 rm -rf -- /var/lib/apt/lists/*
 
