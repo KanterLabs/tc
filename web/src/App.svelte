@@ -1,5 +1,8 @@
 <script lang="ts">
   import { onMount, tick } from 'svelte';
+  import { flip } from 'svelte/animate';
+  import { backOut } from 'svelte/easing';
+  import { fade, fly, scale } from 'svelte/transition';
   import { API_PREFIX, api, listAllIssues, listAllTasks, unwrapActor } from './lib/api';
   import {
     actorId,
@@ -15,6 +18,7 @@
     bugSeverity,
     dateToIso,
     displayEvent,
+    dropIndexForPointer,
     filterTasks,
     formatDate,
     formatRelative,
@@ -54,11 +58,14 @@
     type BugResolution,
     type BugSeverity,
     type Column,
+    type CodexAccountStatus,
+    type CodexDeviceLogin,
     type Label,
     type Project,
     type RoadmapActivityFilter,
     type RoadmapSummary,
     type Task,
+    type TaskDraftSuggestion,
     type TaskReference,
     type TaskTimelineFilter,
     type TaskTimelineKind,
@@ -298,6 +305,10 @@
   let revealedToken: ApiToken | null = null;
   let showAgentForm = false;
   let showTokenForm = false;
+  let codexAccount: CodexAccountStatus | null = null;
+  let codexLogin: CodexDeviceLogin | null = null;
+  let codexLoading = false;
+  let codexError = '';
 
   let showProjectModal = false;
   let projectCreating = false;
@@ -318,6 +329,12 @@
   let taskModalPriority: Priority = 'normal';
   let taskModalDueDate = '';
   let taskModalAssignee = '';
+  let taskModalIdea = '';
+  let taskModalSuggestion: TaskDraftSuggestion | null = null;
+  let taskModalAssisting = false;
+  let taskModalAssistStage = '';
+  let taskModalNeedsCodex = false;
+  let taskModalAssistController: AbortController | null = null;
 
   let showBugModal = false;
   let bugModalLoading = false;
@@ -782,6 +799,9 @@
     roadmapActorsLoading = false;
     events = [];
     eventsCursor = undefined;
+    codexAccount = null;
+    codexLogin = null;
+    codexError = '';
     if (pollTimer) window.clearInterval(pollTimer);
     if (pulseTimer) window.clearInterval(pulseTimer);
     if (livenessRefreshTimer) window.clearInterval(livenessRefreshTimer);
@@ -862,7 +882,7 @@
       } else if (/^\/settings\/?$/.test(path)) {
         roadmapProjectId = undefined;
         view = 'settings';
-        await loadAgents();
+        await Promise.all([loadAgents(), loadCodexAccount()]);
       } else if (routeSlug && isProjectAuditLocation()) {
         roadmapProjectId = undefined;
         auditIdFromRoute = getAuditIdFromLocation();
@@ -1297,6 +1317,96 @@
     }
   }
 
+  async function loadCodexAccount(refresh = false) {
+    codexLoading = true;
+    codexError = '';
+    try {
+      codexAccount = await api.codexAccount(refresh);
+      if (codexAccount.connected) codexLogin = null;
+    } catch (error) {
+      codexError = friendlyError(error, 'Codex connection status could not be loaded.');
+    } finally {
+      codexLoading = false;
+    }
+  }
+
+  async function connectCodex() {
+    codexLoading = true;
+    codexError = '';
+    try {
+      codexLogin = await api.startCodexLogin();
+      const loginId = codexLogin.login_id;
+      void pollCodexLogin(loginId);
+    } catch (error) {
+      codexError = friendlyError(error, 'Codex device login could not be started. Your ChatGPT workspace may have disabled device-code login.');
+      if (showTaskModal && taskModalNeedsCodex) taskModalError = codexError;
+    } finally {
+      codexLoading = false;
+    }
+  }
+
+  async function pollCodexLogin(loginId: string) {
+    for (let attempt = 0; attempt < 150 && codexLogin?.login_id === loginId && user; attempt += 1) {
+      await new Promise((resolve) => window.setTimeout(resolve, 2000));
+      if (codexLogin?.login_id !== loginId || !user) return;
+      try {
+        const account = await api.codexAccount(true);
+        codexAccount = account;
+        if (account.connected) {
+          codexLogin = null;
+          toast('success', 'Codex connected to your ChatGPT subscription.');
+          if (showTaskModal && taskModalNeedsCodex) void assistTaskWithLuna();
+          return;
+        }
+      } catch {
+        // Keep the device-code panel usable through transient network errors.
+      }
+    }
+    if (codexLogin?.login_id === loginId) codexError = 'The Codex login is still pending. Cancel it and start a new code if this one expired.';
+  }
+
+  async function cancelCodexLogin() {
+    const loginId = codexLogin?.login_id;
+    if (!loginId) return;
+    codexLoading = true;
+    codexError = '';
+    try {
+      await api.cancelCodexLogin(loginId);
+      codexLogin = null;
+    } catch (error) {
+      codexError = friendlyError(error, 'The pending Codex login could not be canceled.');
+      if (showTaskModal) taskModalError = codexError;
+    } finally {
+      codexLoading = false;
+    }
+  }
+
+  async function disconnectCodex() {
+    codexLoading = true;
+    codexError = '';
+    try {
+      if (codexLogin) await api.cancelCodexLogin(codexLogin.login_id).catch(() => undefined);
+      await api.logoutCodex();
+      codexLogin = null;
+      codexAccount = { connected: false, requires_openai_auth: true };
+      toast('success', 'Codex disconnected from Helm.');
+    } catch (error) {
+      codexError = friendlyError(error, 'Codex could not be disconnected.');
+    } finally {
+      codexLoading = false;
+    }
+  }
+
+  async function copyCodexCode() {
+    if (!codexLogin) return;
+    try {
+      await navigator.clipboard.writeText(codexLogin.user_code);
+      toast('success', 'Device code copied.');
+    } catch {
+      toast('error', 'Device code could not be copied. Select it manually.');
+    }
+  }
+
   function startPolling() {
     if (pollTimer) window.clearInterval(pollTimer);
     if (pulseTimer) window.clearInterval(pulseTimer);
@@ -1604,7 +1714,7 @@
       if (!columns.length || !tasks.length) await loadBoard();
     } else if (next === 'settings') {
       if (push) navigate('/settings');
-      await loadAgents();
+      await Promise.all([loadAgents(), loadCodexAccount()]);
     } else if (activeProject) {
       if (push) navigate(`/p/${encodeURIComponent(activeProject.slug)}`);
       await loadBoard();
@@ -1727,6 +1837,8 @@
   }
 
   function closeTaskModal() {
+    taskModalAssistController?.abort();
+    taskModalAssistController = null;
     showTaskModal = false;
     taskModalLoading = false;
     taskModalColumnsRequest += 1;
@@ -1882,10 +1994,16 @@
     taskModalPriority = 'normal';
     taskModalDueDate = '';
     taskModalAssignee = '';
+    taskModalIdea = '';
+    taskModalSuggestion = null;
+    taskModalAssisting = false;
+    taskModalAssistStage = '';
+    taskModalNeedsCodex = false;
     taskModalError = '';
     rememberDialogFocus('[data-task-modal-trigger]');
     showTaskModal = true;
     projectSwitcherOpen = false;
+    void loadCodexAccount();
     if (!taskModalColumns.length) await loadTaskModalColumns(taskModalProjectId);
     else taskModalColumnId = taskModalColumns.find((column) => column.semantic_state === 'ready')?.id || taskModalColumns[0]?.id || '';
   }
@@ -1907,6 +2025,74 @@
     } finally {
       if (requestId === taskModalColumnsRequest) taskModalLoading = false;
     }
+  }
+
+  function changeTaskModalProject() {
+    taskModalSuggestion = null;
+    taskModalNeedsCodex = false;
+    void loadTaskModalColumns(taskModalProjectId);
+  }
+
+  function suggestionDescription(suggestion: TaskDraftSuggestion): string {
+    const criteria = suggestion.acceptance_criteria.map((criterion) => `- [ ] ${criterion}`).join('\n');
+    return [suggestion.description.trim(), `## Acceptance criteria\n${criteria}`].filter(Boolean).join('\n\n');
+  }
+
+  function applyLunaField(field: 'title' | 'description' | 'priority') {
+    if (!taskModalSuggestion) return;
+    if (field === 'title') taskModalTitle = taskModalSuggestion.title;
+    if (field === 'description') taskModalDescription = suggestionDescription(taskModalSuggestion);
+    if (field === 'priority') taskModalPriority = taskModalSuggestion.priority;
+  }
+
+  function applyAllLunaFields() {
+    applyLunaField('title');
+    applyLunaField('description');
+    applyLunaField('priority');
+    toast('success', 'Luna’s suggestion was applied. You can edit every field before creating the task.');
+  }
+
+  async function assistTaskWithLuna() {
+    const query = taskModalIdea.trim() || taskModalTitle.trim();
+    if (!taskModalProjectId || !query) {
+      taskModalError = 'Choose a project and describe the task idea before asking Luna.';
+      return;
+    }
+    taskModalAssistController?.abort();
+    const controller = new AbortController();
+    taskModalAssistController = controller;
+    taskModalAssisting = true;
+    taskModalAssistStage = 'Reviewing relevant project history…';
+    taskModalError = '';
+    taskModalNeedsCodex = false;
+    try {
+      const suggestion = await api.draftTask(taskModalProjectId, query, controller.signal);
+      if (controller.signal.aborted || taskModalAssistController !== controller) return;
+      taskModalAssistStage = 'Checking the draft and priority…';
+      await tick();
+      taskModalSuggestion = suggestion;
+    } catch (error) {
+      if (controller.signal.aborted) return;
+      if (error instanceof ApiError && error.code === 'codex_not_connected') {
+        codexAccount = { connected: false, requires_openai_auth: true };
+        taskModalNeedsCodex = true;
+      } else {
+        taskModalError = friendlyError(error, 'Luna is unavailable right now. You can retry or keep creating the task manually.');
+      }
+    } finally {
+      if (taskModalAssistController === controller) {
+        taskModalAssistController = null;
+        taskModalAssisting = false;
+        taskModalAssistStage = '';
+      }
+    }
+  }
+
+  function cancelTaskAssist() {
+    taskModalAssistController?.abort();
+    taskModalAssistController = null;
+    taskModalAssisting = false;
+    taskModalAssistStage = '';
   }
 
   async function createGlobalTask() {
@@ -3337,6 +3523,14 @@
           {#if roadmapLoading}<div class="roadmap-skeleton"><div></div><div></div><div></div></div>{:else}<section class="roadmap-content"><div class="roadmap-hero"><div class="hero-copy"><span class="eyebrow">Workspace pulse</span><h2>Momentum, at a glance.</h2><p>Progress is calculated from each project's semantic board state.</p></div><div class="hero-progress"><div class="progress-ring" style={`--progress: ${roadmapCompletion}%`}><span>{Math.round(roadmapCompletion)}<small>%</small></span></div><div><strong>{roadmapTotal} total tasks</strong><span>{roadmap?.completed_count ?? Math.round(roadmapTotal * roadmapCompletion / 100)} completed</span></div></div></div><div class="metric-grid"><div class="metric-card"><span class="metric-icon purple">◒</span><span class="metric-label">Completion</span><strong>{Math.round(roadmapCompletion)}%</strong><span class="metric-note">Across all projects</span></div><div class="metric-card"><span class="metric-icon red">!</span><span class="metric-label">Overdue</span><strong>{roadmap?.overdue_count ?? 0}</strong><span class="metric-note">Need attention</span></div><div class="metric-card"><span class="metric-icon amber">◷</span><span class="metric-label">Due soon</span><strong>{roadmap?.due_soon_count ?? 0}</strong><span class="metric-note">Next 7 days</span></div><div class="metric-card"><span class="metric-icon green">✓</span><span class="metric-label">Completed</span><strong>{roadmap?.completed_count ?? 0}</strong><span class="metric-note">Shipped so far</span></div></div><RoadmapLiveWork tasks={roadmapLiveTasks} {projects} columnsByProject={roadmapLiveColumnsByProject} actors={roadmapActors} now={pulseClock} loading={roadmapLiveLoading} error={roadmapLiveError} onOpen={openRoadmapTask} onViewAll={() => setView('my-work')} /><div class="roadmap-columns"><section class="roadmap-panel project-progress-panel"><div class="panel-heading"><div><h2>Project progress</h2><p>Where each project stands today.</p></div><button class="icon-button" type="button" aria-label="Refresh progress" on:click={() => loadRoadmap(roadmapProjectId)}>↻</button></div>{#if roadmapProjectRows.length}{#each roadmapProjectRows as row}<button class="project-progress-row" type="button" on:click={() => selectProject(row.project)}><span class="project-dot" style={`--project-color: ${row.project.color || '#6d5efc'}`}>{projectInitials(row.project)}</span><span class="project-progress-name"><strong>{row.project.name}</strong><small>{row.project.key}</small></span><span class="progress-track"><span style={`width: ${row.total_tasks ? (row.completed_tasks / row.total_tasks) * 100 : 0}%; --project-color: ${row.project.color || '#6d5efc'}`}></span></span><span class="progress-number">{row.total_tasks ? Math.round((row.completed_tasks / row.total_tasks) * 100) : 0}%</span><span>→</span></button>{/each}{:else}<div class="panel-empty">Create a project to see progress here.</div>{/if}</section><section class="roadmap-panel upcoming-panel"><div class="panel-heading"><div><h2>Coming up</h2><p>Tasks with the nearest due dates.</p></div></div>{#if roadmap?.upcoming_tasks?.length}{#each roadmap.upcoming_tasks.slice(0, 5) as task}<button class="upcoming-row" type="button" on:click={() => openWorkTask(task)}><span class="upcoming-key">{task.key}</span><span class="upcoming-title">{task.title}</span><span class={`upcoming-date ${taskDueClass(task)}`}>{formatDate(task.due_at)}</span></button>{/each}{:else}<div class="panel-empty">No upcoming deadlines. Nice breathing room.</div>{/if}</section></div><RoadmapActivity events={roadmapActivityEvents} tasksById={roadmapActivityTasks} {projects} actors={roadmapActors} filter={roadmapActivityFilter} loading={roadmapActivityLoading} error={roadmapActivityError} onFilterChange={(next) => roadmapActivityFilter = next} onOpen={openRoadmapActivity} /></section>{/if}
         {:else}
           <section class="page-heading"><div><div class="breadcrumbs"><span>Workspace</span><span>/</span><span>Preferences</span></div><h1>Settings</h1><p>Manage the agents and tokens that help your workspace move.</p></div></section>
+          <section class="settings-section codex-section">
+            <div class="settings-section-heading"><div><span class="eyebrow">Luna assistant</span><h2>Your Codex subscription</h2><p>Connect your own Codex-enabled ChatGPT account. Helm stores it only in your private user runtime and never shares it with another user.</p></div>{#if codexAccount?.connected}<span class="codex-connected">✓ Connected</span>{/if}</div>
+            {#if codexError}<div class="inline-alert error" role="alert"><span>!</span>{codexError}</div>{/if}
+            {#if codexLoading && !codexAccount && !codexLogin}<div class="list-skeleton"><div></div></div>
+            {:else if codexLogin}<div class="codex-device-panel"><div><strong>Finish connecting in ChatGPT</strong><p>Open the secure sign-in page and enter this one-time code.</p></div><div class="codex-code-row"><code>{codexLogin.user_code}</code><button class="button quiet-button compact-button" type="button" on:click={copyCodexCode}>Copy</button></div><div class="form-actions"><button class="text-button" type="button" disabled={codexLoading} on:click={cancelCodexLogin}>Cancel login</button><a class="button primary" href={codexLogin.verification_url} target="_blank" rel="noreferrer">Open ChatGPT ↗</a></div></div>
+            {:else if codexAccount?.connected}<div class="codex-account-row"><span class="agent-avatar">✦</span><span><strong>{codexAccount.email || 'ChatGPT account'}</strong><small>{codexAccount.plan_type ? `${codexAccount.plan_type} plan` : 'Codex enabled'}</small></span><div class="form-actions"><button class="button quiet-button compact-button" type="button" disabled={codexLoading} on:click={() => loadCodexAccount(true)}>Check access</button><button class="text-button danger-button" type="button" disabled={codexLoading} on:click={disconnectCodex}>Disconnect</button></div></div>
+            {:else}<div class="codex-empty"><p>Luna needs your personal ChatGPT subscription before it can draft tasks. Device-code login works on remote and headless self-hosted Helm installations.</p><button class="button primary" type="button" disabled={codexLoading} on:click={connectCodex}>{#if codexLoading}<span class="button-spinner"></span>{/if}Connect Codex</button></div>{/if}
+          </section>
           {#if agentsError}<div class="inline-alert error content-alert" role="alert"><span>!</span>{agentsError}<button class="text-button" type="button" on:click={loadAgents}>Retry</button></div>{/if}
           <section class="settings-layout"><div class="settings-main"><div class="settings-section"><div class="settings-section-heading"><div><span class="eyebrow">Coordination</span><h2>Agents &amp; tokens</h2><p>Give software agents scoped access without sharing a human login.</p></div><button class="button primary" type="button" on:click={() => showAgentForm = !showAgentForm}>＋ Add agent</button></div>{#if showAgentForm}<div class="settings-form"><label>Agent name<input bind:value={agentNameDraft} placeholder="Release assistant" /></label><label>Description <span class="optional">Optional</span><textarea rows="2" bind:value={agentDescriptionDraft} placeholder="What is this agent responsible for?"></textarea></label><div class="form-actions"><button class="text-button" type="button" on:click={() => showAgentForm = false}>Cancel</button><button class="button primary" type="button" disabled={!agentNameDraft.trim()} on:click={createAgent}>Create agent</button></div></div>{/if}{#if agentsLoading}<div class="list-skeleton">{#each [1, 2] as item}<div></div>{/each}</div>{:else if !agents.length}<div class="empty-state compact-empty"><div class="empty-icon">✦</div><h3>No agents yet</h3><p>Create a scoped identity for the tools that collaborate with you.</p><button class="button quiet-button" type="button" on:click={() => showAgentForm = true}>Create your first agent</button></div>{:else}<div class="agent-list">{#each agents as agent}<article class="agent-card"><div class="agent-card-header"><span class="agent-avatar">✦</span><div><h3>{agent.name}</h3><p>{agent.description || 'No description'}</p></div><button class="button quiet-button compact-button" type="button" data-token-trigger on:click={() => { selectedAgentId = agent.id; showTokenForm = selectedAgentId === agent.id && !showTokenForm; }}>＋ Token</button></div>{#if agent.tokens?.length}<div class="token-list">{#each agent.tokens as token}<div class="token-row"><span class="token-icon">⌘</span><span class="token-info"><strong>{token.name}</strong><small>{token.scopes.join(' · ')}</small></span><span class="token-date">{token.expires_at ? `Expires ${formatDate(token.expires_at)}` : 'No expiry'}</span><button class="icon-button tiny danger-button" type="button" aria-label={`Revoke ${token.name}`} on:click={() => deleteToken(token)}>×</button></div>{/each}</div>{:else}<div class="agent-no-tokens">No active tokens</div>{/if}{#if showTokenForm && selectedAgentId === agent.id}<div class="token-form"><div class="settings-form"><label>Token name<input bind:value={tokenNameDraft} placeholder="CI deployment token" /></label><fieldset><legend>Scopes</legend><div class="scope-grid">{#each scopeOptions as scope}<label class="check-label"><input type="checkbox" checked={tokenScopes.includes(scope)} on:change={() => toggleScope(scope)} /><span>{scope}</span></label>{/each}</div></fieldset><fieldset><legend>Limit to projects <span class="optional">Optional</span></legend><div class="scope-grid project-checks">{#each projects as project}<label class="check-label"><input type="checkbox" checked={tokenProjectIds.includes(project.id)} on:change={() => toggleTokenProject(project.id)} /><span>{project.name}</span></label>{/each}</div></fieldset><div class="form-actions"><button class="text-button" type="button" on:click={() => showTokenForm = false}>Cancel</button><button class="button primary" type="button" disabled={!tokenNameDraft.trim() || !tokenScopes.length || tokenCreating} on:click={createToken}>{#if tokenCreating}<span class="button-spinner"></span>{/if}Create token</button></div></div></div>{/if}</article>{/each}</div>{/if}</div><div class="settings-section appearance-section"><div class="settings-section-heading"><div><span class="eyebrow">Workspace</span><h2>Appearance</h2><p>Choose how Helm feels on this device.</p></div></div><div class="theme-options"><button class:chosen={theme === 'light'} type="button" on:click={() => { theme = 'light'; localStorage.setItem(helmStorageKeys.theme, theme); applyTheme(); }}><span class="theme-preview light-preview">☼</span><span><strong>Light</strong><small>Clear and airy</small></span>{#if theme === 'light'}<span class="theme-check">✓</span>{/if}</button><button class:chosen={theme === 'dark'} type="button" on:click={() => { theme = 'dark'; localStorage.setItem(helmStorageKeys.theme, theme); applyTheme(); }}><span class="theme-preview dark-preview">☾</span><span><strong>Dark</strong><small>Focused and low-glare</small></span>{#if theme === 'dark'}<span class="theme-check">✓</span>{/if}</button></div></div></div><aside class="settings-aside"><div class="settings-aside-card"><span class="aside-icon">◎</span><h3>Built for safe handoffs</h3><p>Every mutation records its actor. Scoped agent tokens and optimistic versions keep collaboration predictable.</p><span class="aside-rule"></span><span class="aside-caption">Helm v1 · API-connected</span></div></aside></section>
         {/if}
@@ -3429,8 +3623,25 @@
         <div class="modal-header"><div><span class="eyebrow">Capture an idea</span><h2 id="task-modal-title">Create a task</h2></div><button class="icon-button" type="button" aria-label="Close" on:click={closeTaskModal}>×</button></div>
         {#if taskModalError}<div class="inline-alert error" role="alert"><span>!</span>{taskModalError}</div>{/if}
         <form on:submit|preventDefault={createGlobalTask}>
-          <div class="form-row task-destination-row"><label>Project<select bind:value={taskModalProjectId} on:change={() => loadTaskModalColumns(taskModalProjectId)}>{#each projects as project}<option value={project.id}>{project.key} · {project.name}</option>{/each}</select></label><label>Column<select bind:value={taskModalColumnId} disabled={taskModalLoading || !taskModalColumns.length}>{#each taskModalColumns as column}<option value={column.id}>{column.name}</option>{/each}</select></label></div>
-          <label>Task title<input data-dialog-initial-focus bind:value={taskModalTitle} placeholder="What should move forward?" /></label>
+          <div class="form-row task-destination-row"><label>Project<select bind:value={taskModalProjectId} on:change={changeTaskModalProject}>{#each projects as project}<option value={project.id}>{project.key} · {project.name}</option>{/each}</select></label><label>Column<select bind:value={taskModalColumnId} disabled={taskModalLoading || !taskModalColumns.length}>{#each taskModalColumns as column}<option value={column.id}>{column.name}</option>{/each}</select></label></div>
+          <section class="luna-assist-panel" aria-labelledby="luna-assist-heading">
+            <div class="luna-assist-heading"><div><span class="eyebrow">Optional</span><h3 id="luna-assist-heading">Plan it with Luna</h3><p>Describe the outcome. Luna will use relevant project history to suggest the task and priority.</p></div><span class="luna-mark" aria-hidden="true">✦</span></div>
+            <label>Rough idea<textarea data-dialog-initial-focus rows="2" bind:value={taskModalIdea} placeholder="e.g. Let self-hosted users connect their own Codex subscription"></textarea></label>
+            {#if taskModalAssisting}<div class="luna-progress" aria-live="polite"><span class="button-spinner"></span><span>{taskModalAssistStage}</span><button class="text-button" type="button" on:click={cancelTaskAssist}>Cancel</button></div>
+            {:else}<button class="button luna-button" type="button" disabled={!taskModalIdea.trim() && !taskModalTitle.trim()} on:click={assistTaskWithLuna}>✦ {taskModalSuggestion ? 'Try again with Luna' : 'Assist with Luna'}</button>{/if}
+            {#if taskModalNeedsCodex}
+              <div class="luna-connect" role="status"><div><strong>Connect your Codex subscription</strong><p>This draft stays here while you finish device-code login.</p></div>{#if codexLogin}<div class="codex-code-row"><code>{codexLogin.user_code}</code><button class="button quiet-button compact-button" type="button" on:click={copyCodexCode}>Copy</button></div><div class="form-actions"><button class="text-button" type="button" on:click={cancelCodexLogin}>Cancel login</button><a class="button primary" href={codexLogin.verification_url} target="_blank" rel="noreferrer">Open ChatGPT ↗</a></div>{:else}<button class="button primary" type="button" disabled={codexLoading} on:click={connectCodex}>{#if codexLoading}<span class="button-spinner"></span>{/if}Connect Codex</button>{/if}</div>
+            {/if}
+            {#if taskModalSuggestion}
+              <div class="luna-preview" aria-live="polite"><div class="luna-preview-header"><div><span class="eyebrow">Suggestion ready</span><h4>Review before applying</h4></div><button class="button primary compact-button" type="button" on:click={applyAllLunaFields}>Apply all</button></div>
+                <div class="luna-preview-field"><span><strong>Title</strong>{taskModalSuggestion.title}</span><button class="text-button" type="button" on:click={() => applyLunaField('title')}>Apply</button></div>
+                <div class="luna-preview-field"><span><strong>Description &amp; acceptance criteria</strong>{taskModalSuggestion.description}<small>{taskModalSuggestion.acceptance_criteria.length} measurable criteria</small></span><button class="text-button" type="button" on:click={() => applyLunaField('description')}>Apply</button></div>
+                <div class="luna-preview-field"><span><strong>Priority</strong><span class={`priority-pill priority-${taskModalSuggestion.priority}`}>{priorityLabels[taskModalSuggestion.priority]}</span><small>{taskModalSuggestion.rationale}</small></span><button class="text-button" type="button" on:click={() => applyLunaField('priority')}>Apply</button></div>
+                {#if taskModalSuggestion.supporting_task_keys.length}<div class="luna-sources"><strong>Related tasks</strong>{#each taskModalSuggestion.supporting_task_keys as key}<a href={taskDeepLink(taskModalProject?.slug || activeProjectSlug, key)} on:click={closeTaskModal}>{key}</a>{/each}</div>{/if}
+              </div>
+            {/if}
+          </section>
+          <label>Task title<input bind:value={taskModalTitle} placeholder="What should move forward?" /></label>
           <label>Description <span class="optional">Optional · Markdown supported</span><textarea rows="3" bind:value={taskModalDescription} placeholder="Add the context your future self will need."></textarea></label>
           <div class="form-row"><label>Priority<select bind:value={taskModalPriority}><option value="urgent">Urgent</option><option value="high">High</option><option value="normal">Normal</option><option value="low">Low</option></select></label><label>Due date <span class="optional">Optional</span><input type="date" bind:value={taskModalDueDate} /></label></div>
           <label>Assignee <span class="optional">Optional</span><input bind:value={taskModalAssignee} placeholder="Actor ID" /></label>

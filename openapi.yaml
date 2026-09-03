@@ -464,6 +464,85 @@ paths:
         '503':
           $ref: '#/components/responses/ServiceUnavailable'
 
+  /api/v1/codex/account:
+    get:
+      operationId: getCodexAccount
+      summary: Get the current human user's Codex connection
+      description: Returns display-safe ChatGPT account metadata only. Bearer tokens and agent actors are rejected.
+      tags: [Authentication]
+      parameters:
+        - name: refresh
+          in: query
+          required: false
+          schema: { type: boolean, default: false }
+      responses:
+        '200':
+          description: Codex connection status
+          headers: *commonResponseHeaders
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/CodexAccountStatus' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '503': { $ref: '#/components/responses/ServiceUnavailable' }
+
+  /api/v1/codex/login:
+    post:
+      operationId: startCodexDeviceLogin
+      summary: Start a Codex ChatGPT device-code login
+      description: Starts an actor-isolated, Codex-managed device-code flow. Access and refresh credentials are never returned.
+      tags: [Authentication]
+      responses:
+        '200':
+          description: One-time device-code instructions
+          headers: *commonResponseHeaders
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/CodexDeviceLogin' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '503': { $ref: '#/components/responses/ServiceUnavailable' }
+
+  /api/v1/codex/login/cancel:
+    post:
+      operationId: cancelCodexDeviceLogin
+      summary: Cancel the current human user's pending Codex login
+      tags: [Authentication]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CodexCancelLoginRequest' }
+      responses:
+        '200':
+          description: Cancellation result
+          headers: *commonResponseHeaders
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/CodexCancelLoginResponse' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '503': { $ref: '#/components/responses/ServiceUnavailable' }
+
+  /api/v1/codex/logout:
+    post:
+      operationId: logoutCodexAccount
+      summary: Remove the current human user's Codex connection
+      description: Logs out through Codex App Server and closes the actor-isolated runtime.
+      tags: [Authentication]
+      responses:
+        '200':
+          description: Codex account disconnected
+          headers: *commonResponseHeaders
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/OkResponse' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '503': { $ref: '#/components/responses/ServiceUnavailable' }
+
   /api/v1/projects:
     get:
       operationId: listProjects
@@ -916,6 +995,7 @@ paths:
           $ref: '#/components/responses/InternalServerError'
         '503':
           $ref: '#/components/responses/ServiceUnavailable'
+
     post:
       operationId: createTask
       summary: Create a task
@@ -978,6 +1058,72 @@ paths:
           $ref: '#/components/responses/InternalServerError'
         '503':
           $ref: '#/components/responses/ServiceUnavailable'
+
+  /api/v1/projects/{project}/task-context:
+    parameters:
+      - $ref: '#/components/parameters/ProjectPath'
+    post:
+      operationId: buildTaskDraftContext
+      summary: Build bounded project context for assisted task drafting
+      description: Returns a deterministic, project-scoped selection of live task metadata. Historical text is untrusted context and is never executed by this endpoint.
+      tags:
+        - Tasks
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/TaskContextRequest'
+      responses:
+        '200':
+          description: Bounded project context
+          headers: *commonResponseHeaders
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TaskDraftContext'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+
+  /api/v1/projects/{project}/task-draft:
+    parameters:
+      - $ref: '#/components/parameters/ProjectPath'
+    post:
+      operationId: draftTaskWithLuna
+      summary: Generate a structured Luna task suggestion
+      description: Uses the requesting human's connected Codex subscription and bounded project context. This preview never creates or mutates a task.
+      tags: [Tasks]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/TaskContextRequest' }
+      responses:
+        '200':
+          description: Validated task suggestion
+          headers: *commonResponseHeaders
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/TaskDraftSuggestion' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+        '503': { $ref: '#/components/responses/ServiceUnavailable' }
 
   /api/v1/projects/{project}/timeline:
     parameters:
@@ -4116,6 +4262,42 @@ components:
           writeOnly: true
       additionalProperties: false
 
+    CodexAccountStatus:
+      type: object
+      required: [connected, requires_openai_auth]
+      properties:
+        connected: { type: boolean }
+        account_type: { type: string, description: Display-safe provider type; Helm assistance requires chatgpt. }
+        email: { type: string, format: email }
+        plan_type: { type: string }
+        requires_openai_auth: { type: boolean }
+      additionalProperties: false
+
+    CodexDeviceLogin:
+      type: object
+      required: [login_id, verification_url, user_code]
+      properties:
+        login_id: { type: string, minLength: 1, maxLength: 200 }
+        verification_url: { type: string, format: uri, pattern: '^https://' }
+        user_code: { type: string, minLength: 1, maxLength: 100 }
+      additionalProperties: false
+
+    CodexCancelLoginRequest:
+      type: object
+      required: [login_id]
+      properties:
+        login_id: { type: string, minLength: 1, maxLength: 200 }
+      additionalProperties: false
+
+    CodexCancelLoginResponse:
+      type: object
+      required: [status]
+      properties:
+        status:
+          type: string
+          enum: [canceled, notFound]
+      additionalProperties: false
+
     LoginRequest:
       type: object
       required:
@@ -4272,6 +4454,135 @@ components:
         favorite:
           type: boolean
           default: false
+      additionalProperties: false
+
+    TaskContextRequest:
+      type: object
+      required:
+        - query
+      properties:
+        query:
+          type: string
+          minLength: 1
+          maxLength: 4000
+          description: Rough task intent used only to rank project-local context.
+      additionalProperties: false
+
+    TaskContextProject:
+      type: object
+      required:
+        - id
+        - key
+        - name
+        - description
+        - open_task_count
+        - completed_task_count
+      properties:
+        id:
+          $ref: '#/components/schemas/Identifier'
+        key:
+          type: string
+        name:
+          type: string
+        description:
+          type: string
+        open_task_count:
+          type: integer
+          minimum: 0
+        completed_task_count:
+          type: integer
+          minimum: 0
+      additionalProperties: false
+
+    TaskContextReference:
+      type: object
+      required:
+        - id
+        - key
+        - title
+        - description
+        - priority
+        - semantic_state
+        - labels
+        - prerequisite_count
+        - dependent_count
+        - updated_at
+      properties:
+        id:
+          $ref: '#/components/schemas/Identifier'
+        key:
+          type: string
+        title:
+          type: string
+        description:
+          type: string
+          maxLength: 1200
+        priority:
+          $ref: '#/components/schemas/Priority'
+        semantic_state:
+          $ref: '#/components/schemas/SemanticState'
+        labels:
+          type: array
+          items:
+            type: string
+        prerequisite_count:
+          type: integer
+          minimum: 0
+        dependent_count:
+          type: integer
+          minimum: 0
+        completed_at:
+          $ref: '#/components/schemas/Timestamp'
+        updated_at:
+          $ref: '#/components/schemas/Timestamp'
+      additionalProperties: false
+
+    TaskDraftContext:
+      type: object
+      required:
+        - project
+        - completed_tasks
+        - open_tasks
+        - candidate_count
+        - truncated
+      properties:
+        project:
+          $ref: '#/components/schemas/TaskContextProject'
+        completed_tasks:
+          type: array
+          maxItems: 12
+          items:
+            $ref: '#/components/schemas/TaskContextReference'
+        open_tasks:
+          type: array
+          maxItems: 12
+          items:
+            $ref: '#/components/schemas/TaskContextReference'
+        candidate_count:
+          type: integer
+          minimum: 0
+        truncated:
+          type: boolean
+      additionalProperties: false
+
+    TaskDraftSuggestion:
+      type: object
+      required: [title, description, acceptance_criteria, priority, rationale, supporting_task_keys]
+      properties:
+        title: { type: string, minLength: 1, maxLength: 500 }
+        description: { type: string, maxLength: 12000 }
+        acceptance_criteria:
+          type: array
+          minItems: 1
+          maxItems: 12
+          items: { type: string, minLength: 1, maxLength: 500 }
+        priority: { $ref: '#/components/schemas/Priority' }
+        rationale: { type: string, minLength: 1, maxLength: 2000 }
+        supporting_task_keys:
+          type: array
+          maxItems: 12
+          uniqueItems: true
+          items: { type: string, minLength: 1, maxLength: 80 }
       additionalProperties: false
 
     ProjectPatchRequest:

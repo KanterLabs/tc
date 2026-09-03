@@ -8,6 +8,8 @@ import {
   type ApiErrorShape,
   type ApiToken,
   type AuthStatus,
+  type CodexAccountStatus,
+  type CodexDeviceLogin,
   type AuditDetail,
   type AuditFinding,
   type AuditFindingPatch,
@@ -23,6 +25,7 @@ import {
   type BugResolution,
   type RoadmapSummary,
   type Task,
+  type TaskDraftSuggestion,
   type TaskDependencies,
   type TaskTimelineCollection,
   type TaskTimelineKind,
@@ -183,6 +186,10 @@ export const api = {
     request<Actor | { user: Actor }>('/auth/login', { method: 'POST', body: input }),
   authLogout: () => request<{ ok: boolean }>('/auth/logout', { method: 'POST' }),
   authMe: () => request<Actor>('/auth/me'),
+  codexAccount: (refresh = false) => request<CodexAccountStatus>(pathWithQuery('/codex/account', { refresh })),
+  startCodexLogin: () => request<CodexDeviceLogin>('/codex/login', { method: 'POST' }),
+  cancelCodexLogin: (loginId: string) => request<{ status: string }>('/codex/login/cancel', { method: 'POST', body: { login_id: loginId } }),
+  logoutCodex: () => request<{ ok: boolean }>('/codex/logout', { method: 'POST' }),
 
   listProjects: (params: { cursor?: string; limit?: number } = {}) =>
     request<Collection<Project>>(
@@ -227,6 +234,7 @@ export const api = {
         limit: params.limit ?? 200
       })
     ).then(collectionFrom),
+  draftTask: (project: string, query: string, signal?: AbortSignal) => request<TaskDraftSuggestion>(`/projects/${encodeURIComponent(project)}/task-draft`, { method: 'POST', body: { query }, signal }),
   listIssues: (params: IssueListParams = {}) =>
     request<Collection<Task> | Task[]>(
       pathWithQuery('/issues', {

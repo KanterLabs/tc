@@ -42,6 +42,9 @@
   $: claimOwner = actorFromTask(task) || '';
   $: stale = Boolean(work && (work.stale || staleByAge(state, updatedAt, now)));
   $: actionNeeded = Boolean(work && (work.action_needed || stale || state === 'waiting' || state === 'handoff'));
+  // "live" marks a fresh, actively-working pulse; the CSS layer breathes its
+  // icon so a busy board reads as moving without flashing attention states.
+  $: live = Boolean(work && !stale && !actionNeeded && state === 'working');
   $: stateLabel = stale && state !== 'waiting' ? 'Stale' : baseStateLabel;
   $: label = agentPulseAccessibleLabel(task, now, actorLabel || work?.actor_id || '');
 
@@ -123,7 +126,7 @@
   }
 </script>
 
-<div class:compact class:missing class:stale class:needsAction={actionNeeded} class="agent-pulse" role="img" aria-label={label}>
+<div class:compact class:missing class:stale class:live class:needsAction={actionNeeded} class="agent-pulse" role="img" aria-label={label}>
   <span class="agent-pulse-icon" aria-hidden="true">{missing ? '?' : stateIcons[state] || '•'}</span>
   <span class="agent-pulse-copy">
     <strong>{stateLabel}</strong>

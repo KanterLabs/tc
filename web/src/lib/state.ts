@@ -547,6 +547,18 @@ export function moveTaskLocal(tasks: Task[], taskId: string, destinationColumnId
   );
 }
 
+/**
+ * Index at which a dragged card should be inserted, given the vertical
+ * midpoints of the cards currently rendered in the target column and the
+ * pointer's clientY. Pure so the DOM measuring stays in the component.
+ */
+export function dropIndexForPointer(cardMidpoints: number[], pointerY: number): number {
+  for (let i = 0; i < cardMidpoints.length; i += 1) {
+    if (pointerY < cardMidpoints[i]) return i;
+  }
+  return cardMidpoints.length;
+}
+
 export function projectInitials(project: Pick<Project, 'name' | 'key'>): string {
   const words = project.name.trim().split(/\s+/).filter(Boolean);
   if (words.length > 1) return words.slice(0, 2).map((word) => word[0]).join('').toUpperCase();

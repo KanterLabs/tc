@@ -10,10 +10,14 @@ func clearConfigEnv(t *testing.T) {
 	for _, name := range []string{
 		"HELM_ADDR", "HELM_DB", "HELM_AUTH_MODE", "HELM_PUBLIC_ORIGIN",
 		"HELM_ADMIN_EMAIL", "HELM_RELEASE_SHA", "HELM_CLOUDFLARE_ISSUER", "HELM_CF_ACCESS_ISSUER",
+		"HELM_CODEX_BINARY", "HELM_CODEX_HOME_ROOT",
+		"HELM_LUNA_ENABLED", "HELM_LUNA_MODEL", "HELM_LUNA_EFFORT",
 		"HELM_CLOUDFLARE_AUDIENCE", "HELM_CLOUDFLARE_AUD", "HELM_CF_ACCESS_AUDIENCES", "HELM_CLOUDFLARE_AUDIENCES",
 		"HELM_CLOUDFLARE_JWKS_URL", "HELM_CF_ACCESS_JWKS_URL", "HELM_CLOUDFLARE_CERTS_URL", "HELM_SECURE_COOKIES",
 		"HELM_DEMO_SEED", "ROADMAP_ADDR", "ROADMAP_DB", "ROADMAP_AUTH_MODE", "ROADMAP_PUBLIC_ORIGIN",
 		"ROADMAP_ADMIN_EMAIL", "ROADMAP_RELEASE_SHA", "ROADMAP_CLOUDFLARE_ISSUER", "ROADMAP_CF_ACCESS_ISSUER",
+		"ROADMAP_CODEX_BINARY", "ROADMAP_CODEX_HOME_ROOT",
+		"ROADMAP_LUNA_ENABLED", "ROADMAP_LUNA_MODEL", "ROADMAP_LUNA_EFFORT",
 		"ROADMAP_CLOUDFLARE_AUDIENCE", "ROADMAP_CLOUDFLARE_AUD", "ROADMAP_CF_ACCESS_AUDIENCES", "ROADMAP_CLOUDFLARE_AUDIENCES",
 		"ROADMAP_CLOUDFLARE_JWKS_URL", "ROADMAP_CF_ACCESS_JWKS_URL", "ROADMAP_CLOUDFLARE_CERTS_URL", "ROADMAP_SECURE_COOKIES",
 		"ROADMAP_DEMO_SEED",
@@ -38,6 +42,12 @@ func TestFromEnvDefaults(t *testing.T) {
 	if cfg.AuthMode != "local" {
 		t.Fatalf("default auth mode = %q, want local", cfg.AuthMode)
 	}
+	if cfg.CodexBinary != "codex" || cfg.CodexHomeRoot != "data/codex-users" {
+		t.Fatalf("default Codex config = binary %q root %q", cfg.CodexBinary, cfg.CodexHomeRoot)
+	}
+	if cfg.LunaDisabled || cfg.CodexModel != "gpt-5.6-luna" || cfg.CodexEffort != "medium" {
+		t.Fatalf("default Luna config = disabled %v model %q effort %q", cfg.LunaDisabled, cfg.CodexModel, cfg.CodexEffort)
+	}
 	if cfg.PublicOrigin != "http://localhost:8080" {
 		t.Fatalf("normalized default origin = %q", cfg.PublicOrigin)
 	}
@@ -46,6 +56,34 @@ func TestFromEnvDefaults(t *testing.T) {
 	}
 	if cfg.DemoSeed {
 		t.Fatal("demo seed defaulted to true")
+	}
+}
+
+func TestFromEnvLunaControls(t *testing.T) {
+	clearConfigEnv(t)
+	t.Setenv("HELM_AUTH_MODE", "disabled")
+	t.Setenv("HELM_ADDR", "127.0.0.1:8080")
+	t.Setenv("HELM_LUNA_ENABLED", "false")
+	t.Setenv("HELM_LUNA_MODEL", "custom-luna")
+	t.Setenv("HELM_LUNA_EFFORT", "high")
+	cfg, err := FromEnv()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cfg.LunaDisabled || cfg.CodexModel != "custom-luna" || cfg.CodexEffort != "high" {
+		t.Fatalf("Luna config = %+v", cfg)
+	}
+
+	for name, value := range map[string]string{"HELM_LUNA_ENABLED": "sometimes", "HELM_LUNA_EFFORT": "extreme"} {
+		t.Run(name, func(t *testing.T) {
+			clearConfigEnv(t)
+			t.Setenv("HELM_AUTH_MODE", "disabled")
+			t.Setenv("HELM_ADDR", "127.0.0.1:8080")
+			t.Setenv(name, value)
+			if _, err := FromEnv(); err == nil {
+				t.Fatal("invalid Luna control accepted")
+			}
+		})
 	}
 }
 
@@ -82,6 +120,16 @@ func TestFromEnvCanonicalAndLegacySettings(t *testing.T) {
 			name: "administrator", canonical: "HELM_ADMIN_EMAIL", legacy: "ROADMAP_ADMIN_EMAIL",
 			value: "owner@example.com", want: "owner@example.com",
 			field: func(cfg Config) string { return cfg.AdminEmail },
+		},
+		{
+			name: "Codex binary", canonical: "HELM_CODEX_BINARY", legacy: "ROADMAP_CODEX_BINARY",
+			value: "/usr/local/bin/codex", want: "/usr/local/bin/codex",
+			field: func(cfg Config) string { return cfg.CodexBinary },
+		},
+		{
+			name: "Codex home root", canonical: "HELM_CODEX_HOME_ROOT", legacy: "ROADMAP_CODEX_HOME_ROOT",
+			value: "/var/lib/helm/codex-users", want: "/var/lib/helm/codex-users",
+			field: func(cfg Config) string { return cfg.CodexHomeRoot },
 		},
 		{
 			name: "release SHA", canonical: "HELM_RELEASE_SHA", legacy: "ROADMAP_RELEASE_SHA",
@@ -174,6 +222,8 @@ func TestFromEnvConflictingSettingsFailClosed(t *testing.T) {
 		{name: "auth mode", canonical: "HELM_AUTH_MODE", legacy: "ROADMAP_AUTH_MODE", leftValue: "disabled", rightValue: "local"},
 		{name: "public origin", canonical: "HELM_PUBLIC_ORIGIN", legacy: "ROADMAP_PUBLIC_ORIGIN", leftValue: "https://helm-a.example", rightValue: "https://helm-b.example"},
 		{name: "administrator", canonical: "HELM_ADMIN_EMAIL", legacy: "ROADMAP_ADMIN_EMAIL", leftValue: "a@example.com", rightValue: "b@example.com"},
+		{name: "Codex binary", canonical: "HELM_CODEX_BINARY", legacy: "ROADMAP_CODEX_BINARY", leftValue: "/opt/a/codex", rightValue: "/opt/b/codex"},
+		{name: "Codex home root", canonical: "HELM_CODEX_HOME_ROOT", legacy: "ROADMAP_CODEX_HOME_ROOT", leftValue: "/var/lib/helm/a", rightValue: "/var/lib/helm/b"},
 		{name: "release SHA", canonical: "HELM_RELEASE_SHA", legacy: "ROADMAP_RELEASE_SHA", leftValue: strings.Repeat("a", 40), rightValue: strings.Repeat("b", 40)},
 		{name: "secure cookies", canonical: "HELM_SECURE_COOKIES", legacy: "ROADMAP_SECURE_COOKIES", leftValue: "true", rightValue: "false"},
 		{name: "demo seed", canonical: "HELM_DEMO_SEED", legacy: "ROADMAP_DEMO_SEED", leftValue: "true", rightValue: "false"},

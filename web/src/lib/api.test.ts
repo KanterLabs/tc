@@ -12,6 +12,33 @@ function response(body: unknown, status = 200, headers: Record<string, string> =
 afterEach(() => vi.restoreAllMocks());
 
 describe('public API client', () => {
+  it('uses the human Codex subscription lifecycle endpoints', async () => {
+    const fetchMock = vi.spyOn(globalThis, 'fetch')
+      .mockResolvedValueOnce(response({ connected: false, requires_openai_auth: true }))
+      .mockResolvedValueOnce(response({ login_id: 'login-1', verification_url: 'https://auth.openai.test/device', user_code: 'ABCD' }))
+      .mockResolvedValueOnce(response({ status: 'canceled' }))
+      .mockResolvedValueOnce(response({ ok: true }));
+    await api.codexAccount(true);
+    await api.startCodexLogin();
+    await api.cancelCodexLogin('login-1');
+    await api.logoutCodex();
+    expect(String(fetchMock.mock.calls[0][0])).toContain('/api/v1/codex/account?refresh=true');
+    expect((fetchMock.mock.calls[1][1] as RequestInit).method).toBe('POST');
+    expect(JSON.parse(String((fetchMock.mock.calls[2][1] as RequestInit).body))).toEqual({ login_id: 'login-1' });
+    expect(String(fetchMock.mock.calls[3][0])).toContain('/api/v1/codex/logout');
+  });
+
+  it('requests a project-scoped Luna draft without creating a task', async () => {
+    const fetchMock = vi.spyOn(globalThis, 'fetch').mockResolvedValue(response({
+      title: 'Draft', description: 'Description', acceptance_criteria: ['Outcome'], priority: 'normal', rationale: 'Reason', supporting_task_keys: []
+    }));
+    await api.draftTask('project/one', 'rough idea');
+    const [url, init] = fetchMock.mock.calls[0];
+    expect(String(url)).toContain('/api/v1/projects/project%2Fone/task-draft');
+    expect((init as RequestInit).method).toBe('POST');
+    expect(JSON.parse(String((init as RequestInit).body))).toEqual({ query: 'rough idea' });
+  });
+
   it('uses the version ETag format required by task mutations', () => {
     expect(etagForVersion(14)).toBe('"v14"');
   });

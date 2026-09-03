@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/KanterLabs/helm/internal/auth"
+	"github.com/KanterLabs/helm/internal/codexruntime"
 	"github.com/KanterLabs/helm/internal/config"
 	"github.com/KanterLabs/helm/internal/db"
 	"github.com/KanterLabs/helm/internal/httpapi"
@@ -98,8 +99,13 @@ func main() {
 		}
 	}
 	manager := auth.NewManager(data, cfg)
-	api := httpapi.New(data, manager, cfg)
-	server := &http.Server{Addr: cfg.Addr, Handler: api, ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 15 * time.Second, WriteTimeout: 30 * time.Second, IdleTimeout: 60 * time.Second, MaxHeaderBytes: 64 * 1024}
+	codexManager := codexruntime.NewManager(codexruntime.Options{
+		Binary:     cfg.CodexBinary,
+		HomeRoot:   cfg.CodexHomeRoot,
+		WorkingDir: ".",
+	})
+	api := httpapi.New(data, manager, cfg, codexManager)
+	server := &http.Server{Addr: cfg.Addr, Handler: api, ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 15 * time.Second, WriteTimeout: 2 * time.Minute, IdleTimeout: 60 * time.Second, MaxHeaderBytes: 64 * 1024}
 	go func() {
 		log.Printf(`{"level":"info","msg":"helm listening","addr":%q}`, cfg.Addr)
 		if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
@@ -113,6 +119,9 @@ func main() {
 	defer cancel()
 	if err := server.Shutdown(shutdownCtx); err != nil {
 		log.Printf("shutdown: %v", err)
+	}
+	if err := codexManager.Close(shutdownCtx); err != nil {
+		log.Printf("Codex shutdown: %v", err)
 	}
 }
 

@@ -24,6 +24,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/KanterLabs/helm/internal/auth"
+	"github.com/KanterLabs/helm/internal/codexruntime"
 	"github.com/KanterLabs/helm/internal/config"
 	"github.com/KanterLabs/helm/internal/store"
 	"github.com/KanterLabs/helm/internal/webassets"
@@ -33,6 +34,7 @@ type Server struct {
 	Store  *store.Store
 	Auth   *auth.Manager
 	Cfg    config.Config
+	Codex  CodexAccountService
 	idemMu sync.Mutex
 	// mutationLimiter is initialized by New and is intentionally process-local.
 	// Persistent agent accounting lives in store so a restart cannot reset the
@@ -149,8 +151,19 @@ func (p *bodyBufferPool) release(class bodyBufferClass) {
 var processBodyBufferPool = newBodyBufferPool(defaultBodyBufferTotalSlots, defaultBodyBufferAgentSlots, defaultBodyBufferPublicSlots)
 var processBearerAuthSlots = make(chan struct{}, defaultBearerAuthSlots)
 
-func New(s *store.Store, manager *auth.Manager, cfg config.Config) *Server {
-	return &Server{Store: s, Auth: manager, Cfg: cfg, mutationLimiter: newDefaultMutationRateLimiter(), agentRequestLimiter: newDefaultAgentRequestLimiter(), bearerCredentialLimiter: newDefaultBearerCredentialLimiter(), bodyBufferPool: processBodyBufferPool, bearerAuthSlots: processBearerAuthSlots}
+type CodexAccountService interface {
+	Account(context.Context, string, bool) (codexruntime.AccountStatus, error)
+	StartDeviceLogin(context.Context, string) (codexruntime.DeviceLogin, error)
+	CancelDeviceLogin(context.Context, string, string) (codexruntime.CancelLoginResult, error)
+	LogoutAccount(context.Context, string) error
+}
+
+func New(s *store.Store, manager *auth.Manager, cfg config.Config, codexManagers ...CodexAccountService) *Server {
+	var codexManager CodexAccountService
+	if len(codexManagers) > 0 {
+		codexManager = codexManagers[0]
+	}
+	return &Server{Store: s, Auth: manager, Cfg: cfg, Codex: codexManager, mutationLimiter: newDefaultMutationRateLimiter(), agentRequestLimiter: newDefaultAgentRequestLimiter(), bearerCredentialLimiter: newDefaultBearerCredentialLimiter(), bodyBufferPool: processBodyBufferPool, bearerAuthSlots: processBearerAuthSlots}
 }
 
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -564,6 +577,10 @@ func (s *Server) dispatchAuthed(w http.ResponseWriter, r *http.Request, identity
 			switch parts[2] {
 			case "tasks":
 				s.tasks(w, r, identity, parts[1])
+			case "task-context":
+				s.taskContext(w, r, identity, parts[1])
+			case "task-draft":
+				s.taskDraft(w, r, identity, parts[1])
 			case "timeline":
 				s.projectTimeline(w, r, identity, parts[1])
 			case "columns":
@@ -579,6 +596,10 @@ func (s *Server) dispatchAuthed(w http.ResponseWriter, r *http.Request, identity
 			}
 			return
 		}
+	}
+	if parts[0] == "codex" {
+		s.codexAccount(w, r, identity, parts[1:])
+		return
 	}
 	if parts[0] == "columns" && len(parts) == 2 {
 		s.column(w, r, identity, parts[1])

@@ -64,6 +64,29 @@ export interface Actor {
   updated_at?: string;
 }
 
+export interface CodexAccountStatus {
+  connected: boolean;
+  account_type?: string;
+  email?: string;
+  plan_type?: string;
+  requires_openai_auth: boolean;
+}
+
+export interface CodexDeviceLogin {
+  login_id: string;
+  verification_url: string;
+  user_code: string;
+}
+
+export interface TaskDraftSuggestion {
+  title: string;
+  description: string;
+  acceptance_criteria: string[];
+  priority: Priority;
+  rationale: string;
+  supporting_task_keys: string[];
+}
+
 /** Small actor shape used by read-only coordination surfaces. */
 export type ActorSummary = Pick<Actor, 'id' | 'kind' | 'name'>;
 

@@ -95,6 +95,20 @@ docker compose down
 `docker compose down -v` also deletes the local `roadmap-data` volume; use it
 only when intentionally discarding local data.
 
+Each signed-in human can connect their own Codex-enabled ChatGPT subscription
+from **Settings → Your Codex subscription**. The container includes Codex and
+uses the device-code flow, so this works on remote or headless installations.
+Codex credentials remain in actor-isolated directories under the persistent
+`/data/codex-users` volume; Helm never shares a host API key between users.
+Non-container installs must make `codex` available on `PATH` or set
+`HELM_CODEX_BINARY`, and may relocate the protected state root with
+`HELM_CODEX_HOME_ROOT`.
+
+Operators can immediately stop model turns without removing anyone's saved
+connection by setting `HELM_LUNA_ENABLED=false` and restarting Helm. See
+[`docs/LUNA_TASK_ASSIST.md`](docs/LUNA_TASK_ASSIST.md) for tuning, fallbacks,
+privacy-safe metrics, and validation thresholds.
+
 ## Authentication and agent access
 
 `HELM_AUTH_MODE` selects the human-facing mode:
