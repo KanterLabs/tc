@@ -118,7 +118,10 @@ Task references accept an opaque task ID or a project-local key such as
 `agent_work`; this field is omitted until an agent publishes progress. `kind`
 is `task` or `bug`; bug tasks also contain the optional nested `bug` details
 described below. The assignee, current claimant, claim expiry, due date, and
-completion timestamp are omitted when unset.
+completion timestamp are omitted when unset. Task responses may also include a
+bounded `dependency_summary` with `prerequisite_count`,
+`unmet_prerequisite_count`, `dependent_count`, and `blocked`; the counts cover
+only live, same-project direct relations and each count is capped at 200.
 
 Task PATCH requires at least one recognized field. `{}` and unknown-only bodies
 return `400`. `column_id`/`column`, `position`, and other non-null fields
@@ -166,6 +169,90 @@ compatibility alias `duration_seconds`) must be an integer from 30 through
 the current owner may renew or release an active lease. A non-owner cannot
 complete or block a task with an active claim (`403`), except for a human
 administrator explicitly overriding that claim.
+
+### Task dependencies
+
+The dependency graph is a direct-edge graph scoped to one live project. The
+routes are:
+
+- `GET /api/v1/tasks/{task}/dependencies`
+- `POST /api/v1/tasks/{task}/dependencies`
+- `DELETE /api/v1/tasks/{task}/dependencies/{prerequisite}`
+
+`{task}` and `{prerequisite}` accept an opaque task ID or a case-insensitive
+project-local key such as `OPS-42`. Reads require `tasks:read`; bearer tokens
+may only read tasks in their project access ceiling. The GET response is:
+
+```json
+{
+  "prerequisites": [
+    {
+      "id": "task_41",
+      "key": "OPS-41",
+      "title": "Define event cursor contract",
+      "completed_at": "2026-08-27T10:15:00Z",
+      "satisfied": true
+    }
+  ],
+  "dependents": []
+}
+```
+
+Both arrays contain direct, live, same-project relations only and are capped
+at 200 entries. Deleted tasks and dangling historical edges are omitted. Each
+relation has `id`, `key`, `title`, `completed_at` (or JSON `null`), and
+`satisfied`; a relation is satisfied only when its task is complete in the
+completed semantic column. The GET response includes the referenced task's
+strong `ETag: "vN"`.
+
+Adding and removing an edge require `tasks:write`, the exact current dependent
+task ETag in `If-Match: "vN"`, and an explicitly non-empty,
+non-whitespace `Idempotency-Key`. The POST body is exactly:
+
+```json
+{"prerequisite":"OPS-41"}
+```
+
+The DELETE path identifies the prerequisite. Both mutations enforce the
+caller's project access ceiling, the same-project rule, 200 direct
+prerequisite and 200 direct dependent limits, and cycle prevention. A task
+with a live claim may be changed only by its claim owner; a human administrator
+may explicitly override another actor's claim. A successful mutation advances
+only the dependent task version, returns the updated Task and its new strong
+ETag (or `{ "id": "...", "version": N }` for a write-only bearer without
+`tasks:read`), and emits the corresponding dependency event. Idempotent
+retries replay the original body and ETag before mutable task lookup.
+
+The stable dependency error codes are:
+
+- `dependency_self_reference`: the task was supplied as its own prerequisite.
+- `dependency_cross_project`: the two visible tasks are not in the same
+  project. References outside a bearer token's project ceiling are masked as
+  `not_found` (or `forbidden` for a directly requested task) rather than
+  disclosing another project.
+- `dependency_already_exists`: the requested direct edge already exists.
+- `dependency_limit_exceeded`: a 200 direct-prerequisite or direct-dependent
+  limit would be exceeded.
+- `dependency_cycle`: the edge would create a direct or transitive cycle.
+- `dependency_not_found`: the referenced task or edge does not exist as a live
+  relation.
+- `unmet_dependencies`: a lifecycle transition attempted to activate or
+  complete a task while a prerequisite remained unsatisfied.
+- `dependency_in_use`: deleting a prerequisite task would leave a live
+  dependent edge; remove the edge first.
+
+These codes appear in the normal error envelope. Validation-style dependency
+errors use `400`; graph, stale-task, active-claim, and idempotency conflicts
+use `409`; missing `If-Match` uses `428` with `if_match_required`; malformed
+preconditions use `400`. Reusing a key under the same authenticated principal
+for another method, path, or payload returns `409` with
+`idempotency_key_reused`; different principals (and bearer credentials) have
+isolated key namespaces. A missing or blank required key returns `400` with
+`idempotency_required`. Error details
+are scope-aware: callers without `tasks:read` never receive task titles,
+descriptions, or other read-protected fields. Conflict details are reduced to
+the IDs and versions needed to retry, and cycle details contain identifiers or
+keys only.
 
 ### Board audits and guarded moves
 
@@ -446,8 +533,12 @@ and agent `disabled`) reject empty, malformed, or repeated values. Agents are li
 `disabled=true` to include them.
 
 Task listings support `state`, `column`, `kind`, `priority`, `severity`,
-`label`, `assignee`, `reporter`, `resolution`, `q`, `updated_after`, `cursor`,
-`agent_state`, `action_needed`, and `limit`. `kind` filters `task` or `bug`;
+`label`, `assignee`, `reporter`, `resolution`, `dependency`, `q`,
+`updated_after`, `cursor`, `agent_state`, `action_needed`, and `limit`.
+`dependency=blocked` selects tasks with at least one unmet live,
+same-project prerequisite. `dependency=ready` selects tasks with at least one
+live prerequisite and none unmet; tasks with no prerequisites do not match.
+`kind` filters `task` or `bug`;
 `severity`, `reporter`, and `resolution` apply to bug details. `agent_state`
 accepts the published states `working`, `waiting`, `verifying`, and `handoff`,
 plus the read-time conditions `stale` and `missing`. `missing` selects tasks
@@ -467,8 +558,11 @@ and repeated values are rejected.
 `GET /api/v1/my-work` defaults to the existing assigned-or-actively-claimed
 view for the current actor. `view=live` instead lists tasks with published
 agent-work snapshots, including work by other agents, and accepts the
-`agent_state`, `action_needed`, `state`, `priority`, `label`, `q`,
-`updated_after`, `cursor`, and `limit` filters. For an unscoped human identity,
+`agent_state`, `action_needed`, `dependency`, `state`, `priority`, `label`, `q`,
+`updated_after`, `cursor`, and `limit` filters. `dependency=blocked` selects
+work with an unmet live prerequisite. `dependency=ready` requires at least one
+live prerequisite and none unmet; tasks with no prerequisites do not match. For
+an unscoped human identity,
 `view=live` can aggregate across all visible projects. A project-scoped bearer
 token must supply `project` and may select only one permitted project;
 omitting it returns `403`, just as for the global roadmap route. The normal
@@ -554,3 +648,24 @@ database transaction. Bug lifecycle actions append `bug.triaged`,
 the selected resolution, while a reopen reason is retained in the atomic
 `comment.created` event and task comment. They are available through the same
 `/api/v1/events` cursor and require `events:read` for bearer tokens.
+
+Dependency mutations append `task.dependency_added` or
+`task.dependency_removed` in the same transaction. The enclosing event's
+`task_id` is the dependent task, and the payload shape is:
+
+```json
+{
+  "dependent_id": "task_42",
+  "dependent_key": "OPS-42",
+  "prerequisite_id": "task_41",
+  "prerequisite_key": "OPS-41",
+  "version": 8
+}
+```
+
+The `version` is the resulting dependent-task version. The current TC-103
+implementation does not emit a targeted dependent-invalidation event when a
+prerequisite is completed or reopened. `task.dependency_state_changed` is
+pending TC-104; consumers must not assume it is available until that work is
+deployed. Until then, clients that need fresh readiness state must refetch the
+affected task's dependency graph or use `dependency=blocked|ready`.

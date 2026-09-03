@@ -595,6 +595,8 @@ func (s *Server) dispatchAuthed(w http.ResponseWriter, r *http.Request, identity
 				s.comments(w, r, identity, parts[1])
 			case "timeline":
 				s.taskTimeline(w, r, identity, parts[1])
+			case "dependencies":
+				s.taskDependencies(w, r, identity, parts[1], "")
 			case "progress":
 				s.taskProgress(w, r, identity, parts[1])
 			case "heartbeat":
@@ -616,6 +618,10 @@ func (s *Server) dispatchAuthed(w http.ResponseWriter, r *http.Request, identity
 			default:
 				s.writeError(w, http.StatusNotFound, "not_found", "route not found", nil)
 			}
+			return
+		}
+		if len(parts) == 4 && parts[2] == "dependencies" {
+			s.taskDependencies(w, r, identity, parts[1], parts[3])
 			return
 		}
 	}
@@ -1196,6 +1202,22 @@ func (s *Server) writeStoreErrorForIdentity(w http.ResponseWriter, identity auth
 	}
 	status, code, message, details := http.StatusInternalServerError, "internal_error", "internal server error", any(map[string]any{})
 	switch {
+	case errors.Is(err, store.ErrDependencySelfReference):
+		status, code, message = http.StatusBadRequest, "dependency_self_reference", err.Error()
+	case errors.Is(err, store.ErrDependencyCrossProject):
+		status, code, message = http.StatusBadRequest, "dependency_cross_project", err.Error()
+	case errors.Is(err, store.ErrDependencyAlreadyExists):
+		status, code, message = http.StatusConflict, "dependency_already_exists", err.Error()
+	case errors.Is(err, store.ErrDependencyLimitExceeded):
+		status, code, message = http.StatusBadRequest, "dependency_limit_exceeded", err.Error()
+	case errors.Is(err, store.ErrDependencyCycle):
+		status, code, message = http.StatusConflict, "dependency_cycle", err.Error()
+	case errors.Is(err, store.ErrDependencyNotFound):
+		status, code, message = http.StatusNotFound, "dependency_not_found", err.Error()
+	case errors.Is(err, store.ErrUnmetDependencies):
+		status, code, message = http.StatusConflict, "unmet_dependencies", err.Error()
+	case errors.Is(err, store.ErrDependencyInUse):
+		status, code, message = http.StatusConflict, "dependency_in_use", err.Error()
 	case errors.Is(err, store.ErrInvalid):
 		status, code, message = http.StatusBadRequest, "invalid_request", err.Error()
 	case errors.Is(err, store.ErrNotFound):
@@ -1231,7 +1253,75 @@ func (s *Server) writeStoreErrorForIdentity(w http.ResponseWriter, identity auth
 		}
 	}
 	details = redactTaskConflictDetails(identity, details)
+	details = redactDependencyDetails(identity, err, details)
 	s.writeError(w, status, code, message, details)
+}
+
+// redactDependencyDetails keeps dependency error envelopes useful to tokens
+// that can mutate a task but cannot read task content. Relation/path details
+// may contain keys, titles, completion timestamps, and graph state for a
+// second task; those fields, including opaque relation IDs, are removed. This
+// deliberately fails closed because a write-only token has no read contract
+// for either side of the relation.
+func redactDependencyDetails(identity auth.Identity, err error, details any) any {
+	if !identity.IsToken || identity.HasScope("tasks:read") || !isDependencyError(err) {
+		return details
+	}
+	// Store error details are intentionally small maps today, but future
+	// lifecycle guards may return typed TaskReference slices. Normalize through
+	// JSON first so the redaction policy covers both representations and fails
+	// closed if a detail value cannot be serialized.
+	encoded, marshalErr := json.Marshal(details)
+	if marshalErr != nil {
+		return map[string]any{}
+	}
+	var generic any
+	if unmarshalErr := json.Unmarshal(encoded, &generic); unmarshalErr != nil {
+		return map[string]any{}
+	}
+	return redactDependencyValue(generic)
+}
+
+func isDependencyError(err error) bool {
+	for _, candidate := range []error{
+		store.ErrDependencySelfReference,
+		store.ErrDependencyCrossProject,
+		store.ErrDependencyAlreadyExists,
+		store.ErrDependencyLimitExceeded,
+		store.ErrDependencyCycle,
+		store.ErrDependencyNotFound,
+		store.ErrUnmetDependencies,
+		store.ErrDependencyInUse,
+	} {
+		if errors.Is(err, candidate) {
+			return true
+		}
+	}
+	return false
+}
+
+func redactDependencyValue(value any) any {
+	switch typed := value.(type) {
+	case map[string]any:
+		redacted := make(map[string]any, len(typed))
+		for key, child := range typed {
+			switch key {
+			case "id", "key", "title", "completed_at", "satisfied", "task_id", "prerequisite_id", "dependent_id", "prerequisite_task_id", "task_key", "prerequisite_key", "path", "path_ids", "task_project_id", "prerequisite_project_id":
+				continue
+			default:
+				redacted[key] = redactDependencyValue(child)
+			}
+		}
+		return redacted
+	case []any:
+		redacted := make([]any, len(typed))
+		for index, child := range typed {
+			redacted[index] = redactDependencyValue(child)
+		}
+		return redacted
+	default:
+		return value
+	}
 }
 
 func redactTaskConflictDetails(identity auth.Identity, details any) any {

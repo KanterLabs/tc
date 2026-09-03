@@ -219,11 +219,39 @@ func dependencyCycleDetails(ctx context.Context, q dependencySQL, prerequisite, 
 	}, nil
 }
 
-func (s *Store) addTaskDependency(ctx context.Context, dependentReference, prerequisiteReference string, expectedVersion int64, actorID string) error {
+func dependencyClaimConflict(ctx context.Context, q dependencySQL, taskID, actorID string) error {
+	var claimedBy, claimExpiresAt string
+	err := q.QueryRowContext(ctx, `SELECT claimed_by, claim_expires_at
+		FROM tasks
+		WHERE id=?
+		  AND deleted_at IS NULL
+		  AND claimed_by IS NOT NULL
+		  AND claimed_by<>?
+		  AND claim_expires_at IS NOT NULL
+		  AND julianday(claim_expires_at) > julianday('now')`, taskID, actorID).Scan(&claimedBy, &claimExpiresAt)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	return &Error{
+		Kind:    ErrClaimUnavailable,
+		Message: "task is currently claimed by another actor",
+		Details: map[string]any{"task_id": taskID, "claimed_by": claimedBy, "claim_expires_at": claimExpiresAt},
+	}
+}
+
+func (s *Store) addTaskDependency(ctx context.Context, dependentReference, prerequisiteReference string, expectedVersion int64, actorID string, allowClaimOverride bool) error {
 	return s.withImmediateDependencyTx(ctx, func(q dependencySQL) error {
 		dependent, err := resolveDependencyTask(ctx, q, dependentReference)
 		if err != nil {
 			return err
+		}
+		if !allowClaimOverride {
+			if err := dependencyClaimConflict(ctx, q, dependent.ID, actorID); err != nil {
+				return err
+			}
 		}
 		prerequisite, err := resolveDependencyTask(ctx, q, prerequisiteReference)
 		if err != nil {
@@ -336,11 +364,16 @@ func (s *Store) addTaskDependency(ctx context.Context, dependentReference, prere
 	})
 }
 
-func (s *Store) removeTaskDependency(ctx context.Context, dependentReference, prerequisiteReference string, expectedVersion int64, actorID string) error {
+func (s *Store) removeTaskDependency(ctx context.Context, dependentReference, prerequisiteReference string, expectedVersion int64, actorID string, allowClaimOverride bool) error {
 	return s.withImmediateDependencyTx(ctx, func(q dependencySQL) error {
 		dependent, err := resolveDependencyTask(ctx, q, dependentReference)
 		if err != nil {
 			return err
+		}
+		if !allowClaimOverride {
+			if err := dependencyClaimConflict(ctx, q, dependent.ID, actorID); err != nil {
+				return err
+			}
 		}
 		prerequisite, err := resolveDependencyTask(ctx, q, prerequisiteReference)
 		if err != nil {
@@ -419,10 +452,23 @@ func (s *Store) removeTaskDependency(ctx context.Context, dependentReference, pr
 // optimistic-concurrency contract as other task writes. The returned task is
 // the dependent and only its editable version advances.
 func (s *Store) AddTaskDependency(ctx context.Context, dependentReference, prerequisiteReference string, expectedVersion int64, actorID string) (Task, error) {
+	return s.addTaskDependencyWithClaimOverride(ctx, dependentReference, prerequisiteReference, expectedVersion, actorID, false)
+}
+
+// AddTaskDependencyWithClaimOverride is the administrator variant used by the
+// HTTP layer for a human administrator. The claim check remains inside the
+// dependency transaction; callers must not pass true based only on a
+// preflight read. Bearer identities are never granted this override by the
+// HTTP layer.
+func (s *Store) AddTaskDependencyWithClaimOverride(ctx context.Context, dependentReference, prerequisiteReference string, expectedVersion int64, actorID string, allowClaimOverride bool) (Task, error) {
+	return s.addTaskDependencyWithClaimOverride(ctx, dependentReference, prerequisiteReference, expectedVersion, actorID, allowClaimOverride)
+}
+
+func (s *Store) addTaskDependencyWithClaimOverride(ctx context.Context, dependentReference, prerequisiteReference string, expectedVersion int64, actorID string, allowClaimOverride bool) (Task, error) {
 	if expectedVersion <= 0 {
 		return Task{}, ErrPrecondition
 	}
-	if err := s.addTaskDependency(ctx, dependentReference, prerequisiteReference, expectedVersion, actorID); err != nil {
+	if err := s.addTaskDependency(ctx, dependentReference, prerequisiteReference, expectedVersion, actorID, allowClaimOverride); err != nil {
 		return Task{}, err
 	}
 	return s.ResolveTaskReference(ctx, dependentReference)
@@ -432,10 +478,20 @@ func (s *Store) AddTaskDependency(ctx context.Context, dependentReference, prere
 // version is required to preserve optimistic concurrency and is incremented
 // only on the dependent task.
 func (s *Store) RemoveTaskDependency(ctx context.Context, dependentReference, prerequisiteReference string, expectedVersion int64, actorID string) (Task, error) {
+	return s.removeTaskDependencyWithClaimOverride(ctx, dependentReference, prerequisiteReference, expectedVersion, actorID, false)
+}
+
+// RemoveTaskDependencyWithClaimOverride is the administrator counterpart to
+// AddTaskDependencyWithClaimOverride. See that method for the trust boundary.
+func (s *Store) RemoveTaskDependencyWithClaimOverride(ctx context.Context, dependentReference, prerequisiteReference string, expectedVersion int64, actorID string, allowClaimOverride bool) (Task, error) {
+	return s.removeTaskDependencyWithClaimOverride(ctx, dependentReference, prerequisiteReference, expectedVersion, actorID, allowClaimOverride)
+}
+
+func (s *Store) removeTaskDependencyWithClaimOverride(ctx context.Context, dependentReference, prerequisiteReference string, expectedVersion int64, actorID string, allowClaimOverride bool) (Task, error) {
 	if expectedVersion <= 0 {
 		return Task{}, ErrPrecondition
 	}
-	if err := s.removeTaskDependency(ctx, dependentReference, prerequisiteReference, expectedVersion, actorID); err != nil {
+	if err := s.removeTaskDependency(ctx, dependentReference, prerequisiteReference, expectedVersion, actorID, allowClaimOverride); err != nil {
 		return Task{}, err
 	}
 	return s.ResolveTaskReference(ctx, dependentReference)

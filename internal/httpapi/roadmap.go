@@ -166,7 +166,12 @@ func (s *Server) myWork(w http.ResponseWriter, r *http.Request, identity auth.Id
 		s.writeError(w, http.StatusBadRequest, "invalid_request", err.Error(), nil)
 		return
 	}
-	filter := store.TaskFilter{State: state, Priority: priority, Label: label, AgentState: agentState, ActionNeeded: actionNeeded, LiveWork: view == "live", Query: query, Cursor: offset, Limit: limit, UpdatedAfter: updatedAfter}
+	dependency, err := parseOptionalEnum(r, "dependency", dependencyFilters)
+	if err != nil {
+		s.writeError(w, http.StatusBadRequest, "invalid_request", err.Error(), nil)
+		return
+	}
+	filter := store.TaskFilter{State: state, Priority: priority, Label: label, Dependency: dependency, AgentState: agentState, ActionNeeded: actionNeeded, LiveWork: view == "live", Query: query, Cursor: offset, Limit: limit, UpdatedAfter: updatedAfter}
 	tasks, more, err := s.Store.ListMyWorkFilteredWithExtra(r.Context(), identity.Actor.ID, projectIDs, filter)
 	if err != nil {
 		s.writeInternal(w, err)

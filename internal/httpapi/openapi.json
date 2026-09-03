@@ -1352,7 +1352,7 @@
       "get": {
         "operationId": "listProjectTasks",
         "summary": "List tasks in a project",
-        "description": "Results are ordered by column position and task position. `state`,\n`column`, `kind`, `priority`, `severity`, `label`, `assignee`,\n`reporter`, `resolution`, `agent_state`, `action_needed`, `q`, and\n`updated_after` can be combined. `agent_state` filters the latest\nstructured agent-work snapshot; `stale` and `missing` identify\nread-time liveness conditions. `action_needed=true` selects waiting,\nhandoff, or stale snapshots among unfinished tasks; completed tasks\nretain their snapshot as history but never match an agent-work filter.\n`action_needed=false` is accepted as an explicit no-op filter for\nclients that build filters dynamically.\n`state` filters by a column's semantic state. Supplied scalar filters\nare single-valued; empty identifier/enum/timestamp values and values\noutside their declared enum, format, or length are rejected with\n`400`.\n",
+        "description": "Results are ordered by column position and task position. `state`,\n`column`, `kind`, `priority`, `severity`, `label`, `assignee`,\n`reporter`, `resolution`, `agent_state`, `action_needed`, `dependency`,\n`q`, and `updated_after` can be combined. `agent_state` filters the latest\nstructured agent-work snapshot; `stale` and `missing` identify\nread-time liveness conditions. `action_needed=true` selects waiting,\nhandoff, or stale snapshots among unfinished tasks; completed tasks\nretain their snapshot as history but never match an agent-work filter.\n`action_needed=false` is accepted as an explicit no-op filter for\nclients that build filters dynamically.\n`state` filters by a column's semantic state. `dependency=blocked`\nselects tasks with an unmet live prerequisite; `dependency=ready`\nselects tasks with at least one live prerequisite and none unmet (so a\ntask with no prerequisites does not match). Supplied scalar filters are\nsingle-valued; empty identifier/enum/timestamp values and values outside\ntheir declared enum, format, or length are rejected with `400`.\n",
         "tags": [
           "Tasks"
         ],
@@ -1389,6 +1389,9 @@
           },
           {
             "$ref": "#/components/parameters/ActionNeededFilter"
+          },
+          {
+            "$ref": "#/components/parameters/DependencyFilter"
           },
           {
             "$ref": "#/components/parameters/SearchQuery"
@@ -2587,6 +2590,273 @@
           },
           "409": {
             "$ref": "#/components/responses/TaskMutationConflict"
+          },
+          "413": {
+            "$ref": "#/components/responses/RequestTooLarge"
+          },
+          "428": {
+            "$ref": "#/components/responses/PreconditionRequired"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalServerError"
+          },
+          "503": {
+            "$ref": "#/components/responses/ServiceUnavailable"
+          },
+          "507": {
+            "$ref": "#/components/responses/InsufficientStorage"
+          }
+        }
+      }
+    },
+    "/api/v1/tasks/{task}/dependencies": {
+      "parameters": [
+        {
+          "$ref": "#/components/parameters/TaskPath"
+        }
+      ],
+      "get": {
+        "operationId": "getTaskDependencies",
+        "summary": "Get a task's direct dependencies",
+        "description": "Return the live, same-project direct prerequisites and dependents for\na task. The `{task}` path value accepts an opaque task ID or a\ncase-insensitive project-local key such as `OPS-42`. Each direction is\ncapped at 200 relations and ordered deterministically. The response's\nstrong ETag is the current ETag of the referenced task and can be sent\nas `If-Match` when changing its graph.\n",
+        "tags": [
+          "Tasks"
+        ],
+        "security": [
+          {
+            "cookieAuth": []
+          },
+          {
+            "cloudflareAccess": []
+          },
+          {
+            "bearerAuth": [
+              "tasks:read"
+            ]
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Direct live dependency graph for the task",
+            "headers": {
+              "X-Request-ID": {
+                "$ref": "#/components/headers/XRequestID"
+              },
+              "X-Roadmap-Revision": {
+                "$ref": "#/components/headers/XRoadmapRevision"
+              },
+              "ETag": {
+                "$ref": "#/components/headers/ETag"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TaskDependencies"
+                },
+                "examples": {
+                  "dependencies": {
+                    "$ref": "#/components/examples/TaskDependenciesExample"
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalServerError"
+          },
+          "503": {
+            "$ref": "#/components/responses/ServiceUnavailable"
+          }
+        }
+      },
+      "post": {
+        "operationId": "addTaskDependency",
+        "summary": "Add a direct prerequisite",
+        "description": "Add the referenced task as one direct prerequisite of `{task}`. The\nprerequisite accepts an opaque task ID or a case-insensitive\nproject-local key. The caller must have `tasks:write`, send the exact\ncurrent task ETag in `If-Match`, and send a non-empty,\nnon-whitespace `Idempotency-Key`. The task must be in the caller's\nproject access ceiling; references outside that ceiling are masked as\nnot found. A live claim may be changed only by its owner;\na human administrator may explicitly override another actor's claim.\nDependencies are limited to 200 direct prerequisites and 200 direct\ndependents, must remain within the same project, and may not create a\ncycle. A successful mutation advances only the dependent task version,\nemits `task.dependency_added`, returns the updated task (or the\nid/version redacted form for a write-only bearer), and sets its strong\nETag. Repeating the same idempotency key with the same request replays\nthe original response.\n",
+        "tags": [
+          "Tasks"
+        ],
+        "security": [
+          {
+            "cookieAuth": []
+          },
+          {
+            "cloudflareAccess": []
+          },
+          {
+            "bearerAuth": [
+              "tasks:write"
+            ]
+          }
+        ],
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/IfMatch"
+          },
+          {
+            "$ref": "#/components/parameters/RequiredIdempotencyKey"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/TaskDependencyRequest"
+              },
+              "example": {
+                "prerequisite": "OPS-41"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Updated dependent task and its new strong ETag",
+            "headers": {
+              "X-Request-ID": {
+                "$ref": "#/components/headers/XRequestID"
+              },
+              "X-Roadmap-Revision": {
+                "$ref": "#/components/headers/XRoadmapRevision"
+              },
+              "ETag": {
+                "$ref": "#/components/headers/ETag"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TaskMutationResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "#/components/responses/DependencyConflict"
+          },
+          "413": {
+            "$ref": "#/components/responses/RequestTooLarge"
+          },
+          "428": {
+            "$ref": "#/components/responses/PreconditionRequired"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalServerError"
+          },
+          "503": {
+            "$ref": "#/components/responses/ServiceUnavailable"
+          },
+          "507": {
+            "$ref": "#/components/responses/InsufficientStorage"
+          }
+        }
+      }
+    },
+    "/api/v1/tasks/{task}/dependencies/{prerequisite}": {
+      "parameters": [
+        {
+          "$ref": "#/components/parameters/TaskPath"
+        },
+        {
+          "$ref": "#/components/parameters/DependencyPath"
+        }
+      ],
+      "delete": {
+        "operationId": "removeTaskDependency",
+        "summary": "Remove a direct prerequisite",
+        "description": "Remove one direct prerequisite edge from `{task}`. The prerequisite\npath value accepts an opaque task ID or a case-insensitive\nproject-local key. The caller must have `tasks:write`, send the exact\ncurrent task ETag in `If-Match`, and send a non-empty,\nnon-whitespace `Idempotency-Key`. The task must be in the caller's\nproject access ceiling; references outside that ceiling are masked as\nnot found. A live claim may be changed only by its owner;\na human administrator may explicitly override another actor's claim.\nA successful mutation advances only the dependent task version, emits\n`task.dependency_removed`, returns the updated task (or the id/version\nredacted form for a write-only bearer), and sets its strong ETag.\nRepeating the same idempotency key with the same request replays the\noriginal response.\n",
+        "tags": [
+          "Tasks"
+        ],
+        "security": [
+          {
+            "cookieAuth": []
+          },
+          {
+            "cloudflareAccess": []
+          },
+          {
+            "bearerAuth": [
+              "tasks:write"
+            ]
+          }
+        ],
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/IfMatch"
+          },
+          {
+            "$ref": "#/components/parameters/RequiredIdempotencyKey"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Updated dependent task and its new strong ETag",
+            "headers": {
+              "X-Request-ID": {
+                "$ref": "#/components/headers/XRequestID"
+              },
+              "X-Roadmap-Revision": {
+                "$ref": "#/components/headers/XRoadmapRevision"
+              },
+              "ETag": {
+                "$ref": "#/components/headers/ETag"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TaskMutationResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "#/components/responses/DependencyConflict"
           },
           "413": {
             "$ref": "#/components/responses/RequestTooLarge"
@@ -4064,7 +4334,7 @@
       "get": {
         "operationId": "listMyWork",
         "summary": "List work assigned to the current actor",
-        "description": "By default, returns tasks assigned to the authenticated actor across\nall projects, or across the requested project. Results include\nassigned tasks and tasks with an active claim owned by the actor. Set\n`view=live` for the coordination pulse view: it returns unfinished\ntasks that have a structured agent-work snapshot, ordered with\naction-needed pulses first. `view=assigned` is an explicit spelling of\nthe legacy actor-assignment and active-claim view. `agent_state` and\n`action_needed` can be combined with either view. An unknown requested\nproject returns 404; a project-scoped token must name a project.\n",
+        "description": "By default, returns tasks assigned to the authenticated actor across\nall projects, or across the requested project. Results include\nassigned tasks and tasks with an active claim owned by the actor. Set\n`view=live` for the coordination pulse view: it returns unfinished\ntasks that have a structured agent-work snapshot, ordered with\naction-needed pulses first. `view=assigned` is an explicit spelling of\nthe legacy actor-assignment and active-claim view. `agent_state`,\n`action_needed`, and `dependency` can be combined with either view.\n`dependency=blocked` selects work with an unmet live prerequisite;\n`dependency=ready` requires at least one live prerequisite and none\nunmet, so tasks with no prerequisites do not match. An unknown requested\nproject returns 404; a project-scoped token must name a project.\n",
         "tags": [
           "My work"
         ],
@@ -4086,6 +4356,9 @@
           },
           {
             "$ref": "#/components/parameters/ActionNeededFilter"
+          },
+          {
+            "$ref": "#/components/parameters/DependencyFilter"
           },
           {
             "$ref": "#/components/parameters/SearchQuery"
@@ -4801,6 +5074,16 @@
         },
         "example": "task_42"
       },
+      "DependencyPath": {
+        "name": "prerequisite",
+        "in": "path",
+        "required": true,
+        "description": "Opaque prerequisite task ID or project-local task key such as OPS-41; task keys are matched case-insensitively.",
+        "schema": {
+          "$ref": "#/components/schemas/Identifier"
+        },
+        "example": "OPS-41"
+      },
       "AuditPath": {
         "name": "audit",
         "in": "path",
@@ -4924,6 +5207,19 @@
           "maxLength": 255
         },
         "example": "3d4f3b4c-3a14-4a84-a1f7-6a2d7ec5de8d"
+      },
+      "RequiredIdempotencyKey": {
+        "name": "Idempotency-Key",
+        "in": "header",
+        "required": true,
+        "description": "Required client-generated key for safely retrying this dependency\nmutation. The value must contain at least one non-whitespace character\nand be at most 255 characters. Reusing it with the same authenticated\nprincipal, method, path, and payload replays the original response;\nusing it for a different method, path, or payload under that same\nprincipal returns 409 with `idempotency_key_reused`. Different\nprincipals (and bearer credentials) have isolated key namespaces.\n",
+        "schema": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 255,
+          "pattern": ".*\\S.*"
+        },
+        "example": "dependency-add-20260903-01"
       },
       "IfMatch": {
         "name": "If-Match",
@@ -5111,6 +5407,20 @@
           "type": "boolean"
         },
         "example": true
+      },
+      "DependencyFilter": {
+        "name": "dependency",
+        "in": "query",
+        "required": false,
+        "description": "Filter by direct dependency readiness. `blocked` selects tasks with at\nleast one live, same-project prerequisite that is not complete;\n`ready` selects tasks with at least one live prerequisite and no unmet\nprerequisites. Tasks with no prerequisites never match `ready`.\nEmpty, repeated, or unsupported values return 400.\n",
+        "schema": {
+          "type": "string",
+          "enum": [
+            "blocked",
+            "ready"
+          ]
+        },
+        "example": "blocked"
       },
       "MyWorkView": {
         "name": "view",
@@ -5315,6 +5625,47 @@
                 "$ref": "#/components/examples/TaskAlreadyClaimedExample"
               },
               "idempotencyKeyReused": {
+                "$ref": "#/components/examples/ConflictExample"
+              }
+            }
+          }
+        }
+      },
+      "DependencyConflict": {
+        "description": "Dependency mutations use stable conflict codes. `dependency_cycle`,\n`dependency_already_exists`, `dependency_in_use`, `stale_task`,\n`task_already_claimed`, and `idempotency_key_reused` are returned with\nHTTP 409 when the graph or mutation precondition conflicts with current\nstate. `details` is scope-aware and never discloses read-protected task\nfields to a bearer token without `tasks:read`.\n",
+        "headers": {
+          "X-Request-ID": {
+            "$ref": "#/components/headers/XRequestID"
+          },
+          "X-Roadmap-Revision": {
+            "$ref": "#/components/headers/XRoadmapRevision"
+          }
+        },
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/ErrorResponse"
+            },
+            "examples": {
+              "cycle": {
+                "value": {
+                  "error": {
+                    "code": "dependency_cycle",
+                    "message": "dependency would create a cycle",
+                    "details": {
+                      "path": [
+                        "OPS-41",
+                        "OPS-42",
+                        "OPS-41"
+                      ]
+                    }
+                  }
+                }
+              },
+              "stale": {
+                "$ref": "#/components/examples/StaleTaskExample"
+              },
+              "idempotency": {
                 "$ref": "#/components/examples/ConflictExample"
               }
             }
@@ -6616,6 +6967,109 @@
         ],
         "additionalProperties": false
       },
+      "TaskDependencyRequest": {
+        "type": "object",
+        "required": [
+          "prerequisite"
+        ],
+        "description": "Direct prerequisite reference for a dependency mutation.",
+        "properties": {
+          "prerequisite": {
+            "$ref": "#/components/schemas/Identifier",
+            "description": "Opaque task ID or case-insensitive project-local task key."
+          }
+        },
+        "additionalProperties": false
+      },
+      "TaskReference": {
+        "type": "object",
+        "required": [
+          "id",
+          "key",
+          "title",
+          "completed_at",
+          "satisfied"
+        ],
+        "description": "Compact direct dependency reference. `completed_at` is null until the\ntask is complete; `satisfied` is true only when the referenced task is\ncomplete in its completed semantic column. Relation fields are\nredacted according to the caller's task-read permission.\n",
+        "properties": {
+          "id": {
+            "$ref": "#/components/schemas/Identifier"
+          },
+          "key": {
+            "type": "string",
+            "pattern": "^[A-Z][A-Z0-9_-]{0,15}-[1-9][0-9]*$",
+            "example": "OPS-41"
+          },
+          "title": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 500
+          },
+          "completed_at": {
+            "$ref": "#/components/schemas/NullableTimestamp"
+          },
+          "satisfied": {
+            "type": "boolean"
+          }
+        },
+        "additionalProperties": false
+      },
+      "TaskDependencies": {
+        "type": "object",
+        "required": [
+          "prerequisites",
+          "dependents"
+        ],
+        "description": "Direct live dependency edges for one task. Both arrays are limited to\n200 items and contain only relations within the task's project; deleted\ntasks and historical dangling edges are omitted.\n",
+        "properties": {
+          "prerequisites": {
+            "type": "array",
+            "maxItems": 200,
+            "items": {
+              "$ref": "#/components/schemas/TaskReference"
+            }
+          },
+          "dependents": {
+            "type": "array",
+            "maxItems": 200,
+            "items": {
+              "$ref": "#/components/schemas/TaskReference"
+            }
+          }
+        },
+        "additionalProperties": false
+      },
+      "DependencySummary": {
+        "type": "object",
+        "required": [
+          "prerequisite_count",
+          "unmet_prerequisite_count",
+          "dependent_count",
+          "blocked"
+        ],
+        "description": "Bounded derived summary included in task responses and collections.\nCounts cover direct live, same-project relations only. `blocked` is\ntrue when one or more direct prerequisites are not satisfied.\n",
+        "properties": {
+          "prerequisite_count": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 200
+          },
+          "unmet_prerequisite_count": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 200
+          },
+          "dependent_count": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 200
+          },
+          "blocked": {
+            "type": "boolean"
+          }
+        },
+        "additionalProperties": false
+      },
       "Task": {
         "type": "object",
         "required": [
@@ -6727,6 +7181,10 @@
           "comment_count": {
             "type": "integer",
             "minimum": 0
+          },
+          "dependency_summary": {
+            "$ref": "#/components/schemas/DependencySummary",
+            "description": "Bounded direct dependency counts; omitted by legacy servers that predate dependency support."
           }
         },
         "additionalProperties": false
@@ -7701,6 +8159,7 @@
           },
           "payload": {
             "type": "object",
+            "description": "For task.dependency_added and task.dependency_removed, payload conforms to DependencyEventPayload; other event types define their own payload fields.",
             "additionalProperties": true
           }
         },
@@ -8032,6 +8491,39 @@
           }
         ]
       },
+      "DependencyEventPayload": {
+        "type": "object",
+        "required": [
+          "dependent_id",
+          "dependent_key",
+          "prerequisite_id",
+          "prerequisite_key",
+          "version"
+        ],
+        "description": "Payload for `task.dependency_added` and `task.dependency_removed`.\n`task_id` on the enclosing event is the dependent task; `version` is\nits resulting version after the graph mutation.\n",
+        "properties": {
+          "dependent_id": {
+            "$ref": "#/components/schemas/Identifier"
+          },
+          "dependent_key": {
+            "type": "string",
+            "pattern": "^[A-Z][A-Z0-9_-]{0,15}-[1-9][0-9]*$"
+          },
+          "prerequisite_id": {
+            "$ref": "#/components/schemas/Identifier"
+          },
+          "prerequisite_key": {
+            "type": "string",
+            "pattern": "^[A-Z][A-Z0-9_-]{0,15}-[1-9][0-9]*$"
+          },
+          "version": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 1
+          }
+        },
+        "additionalProperties": false
+      },
       "Event": {
         "type": "object",
         "required": [
@@ -8055,7 +8547,7 @@
           "type": {
             "type": "string",
             "minLength": 1,
-            "description": "Event type, for example task.claimed, task.progressed, task.moved, task.completed, bug.triaged, bug.resolved, bug.duplicated, or bug.reopened.",
+            "description": "Event type, for example task.claimed, task.progressed, task.moved, task.completed, task.dependency_added, task.dependency_removed, bug.triaged, bug.resolved, bug.duplicated, or bug.reopened.",
             "example": "task.claimed"
           },
           "actor_id": {
@@ -8770,7 +9262,36 @@
               "updated_at": "2026-08-27T09:00:00Z"
             }
           ],
-          "comment_count": 1
+          "comment_count": 1,
+          "dependency_summary": {
+            "prerequisite_count": 1,
+            "unmet_prerequisite_count": 0,
+            "dependent_count": 2,
+            "blocked": false
+          }
+        }
+      },
+      "TaskDependenciesExample": {
+        "summary": "Direct task dependencies",
+        "value": {
+          "prerequisites": [
+            {
+              "id": "task_41",
+              "key": "OPS-41",
+              "title": "Define event cursor contract",
+              "completed_at": "2026-08-27T10:15:00Z",
+              "satisfied": true
+            }
+          ],
+          "dependents": [
+            {
+              "id": "task_43",
+              "key": "OPS-43",
+              "title": "Add polling client",
+              "completed_at": null,
+              "satisfied": false
+            }
+          ]
         }
       },
       "AuditRunExample": {
@@ -9301,6 +9822,44 @@
             "actor_id": "agent_ada",
             "source": "board_audit",
             "reason": "Approved board-audit recommendation."
+          }
+        }
+      },
+      "TaskDependencyAddedEventExample": {
+        "summary": "Dependency edge added event",
+        "value": {
+          "cursor": 46,
+          "id": "event_46",
+          "type": "task.dependency_added",
+          "actor_id": "agent_ada",
+          "project_id": "proj_ops",
+          "task_id": "task_42",
+          "created_at": "2026-08-27T10:40:00Z",
+          "payload": {
+            "dependent_id": "task_42",
+            "dependent_key": "OPS-42",
+            "prerequisite_id": "task_41",
+            "prerequisite_key": "OPS-41",
+            "version": 8
+          }
+        }
+      },
+      "TaskDependencyRemovedEventExample": {
+        "summary": "Dependency edge removed event",
+        "value": {
+          "cursor": 47,
+          "id": "event_47",
+          "type": "task.dependency_removed",
+          "actor_id": "agent_ada",
+          "project_id": "proj_ops",
+          "task_id": "task_42",
+          "created_at": "2026-08-27T10:45:00Z",
+          "payload": {
+            "dependent_id": "task_42",
+            "dependent_key": "OPS-42",
+            "prerequisite_id": "task_41",
+            "prerequisite_key": "OPS-41",
+            "version": 9
           }
         }
       },
