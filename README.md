@@ -360,10 +360,10 @@ and save its one-time secret with the manual `cloudflare.sh prepare` procedure
 before enabling CI; CI refuses to create a token whose secret would remain
 only on an ephemeral runner.
 
-Beta uses corresponding `BETA_*` environment secrets and a distinct forced
-SSH account and release-signing key. Dispatch `rollback_sha` from `beta` to
-roll back beta, or from `main` to roll back production; neither environment's
-job can select the other gateway.
+Beta uses corresponding `BETA_*` environment secrets, including
+`BETA_ADMIN_EMAIL`, and a distinct forced SSH account and release-signing key.
+Dispatch `rollback_sha` from `beta` to roll back beta, or from `main` to roll
+back production; neither environment's job can select the other gateway.
 
 ## Backups and rollback
 

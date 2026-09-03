@@ -315,9 +315,11 @@ jobs:
       - name: Prepare beta Cloudflare Access and tunnel
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.BETA_CLOUDFLARE_API_TOKEN }}
+          HELM_ADMIN_EMAIL: ${{ secrets.BETA_ADMIN_EMAIL }}
           HELM_REQUIRE_DURABLE_SERVICE_TOKEN_CAPTURE: "1"
         run: |
           test -n "$CLOUDFLARE_API_TOKEN"
+          test -n "$HELM_ADMIN_EMAIL"
           chmod 0755 deploy/*.sh deploy/helm-deploy-gateway
           cloudflare_dir="$RUNNER_TEMP/helm-cloudflare"
           install -d -m 0700 "$cloudflare_dir"
