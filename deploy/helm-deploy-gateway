@@ -24,6 +24,27 @@ ARCHIVE_MAX_BYTES=536870912
 ARCHIVE_INGEST_TIMEOUT=120
 SIGNING_PUBLIC_KEY=/etc/roadmap-deploy/release-signing-public.pem
 VERIFY_SCRIPT=/usr/local/sbin/helm-verify-release
+CT_TAGS='roadmap;service;lan'
+
+# The bootstrap installs this same root-owned script at two different paths.
+# The installed basename is the trust boundary: the production key can only
+# reach the production path, while the beta key can only reach the beta path.
+# Do not select a profile from SSH_ORIGINAL_COMMAND or an argv supplied by the
+# deploy account. Unknown/local names remain production-compatible and can
+# never opt into the beta identity.
+GATEWAY_BASENAME=${BASH_SOURCE[0]##*/}
+PROFILE=production
+if [[ "$GATEWAY_BASENAME" = helm-beta-deploy-gateway ]]; then
+	PROFILE=beta
+	DEPLOY_ROOT=/var/lib/helm-beta-deploy
+	STAGING_DIR="$DEPLOY_ROOT/staging"
+	CTID=106
+	CT_NAME=helm-beta
+	CT_IP=10.0.0.39
+	SIGNING_PUBLIC_KEY=/etc/helm-beta-deploy/release-signing-public.pem
+	VERIFY_SCRIPT=/usr/local/sbin/helm-beta-verify-release
+	CT_TAGS='beta;service;lan'
+fi
 CT_CONFIG_ERROR=''
 
 log() { printf '[helm-gateway] %s\n' "$*" >&2; }
@@ -155,15 +176,16 @@ ct_rootfs_is_exact() {
 }
 
 ct_tags_are_exact() {
-	local tags=$1
-	awk -F';' '
+	local tags=$1 marker=roadmap
+	[[ "${PROFILE:-production}" = beta ]] && marker=beta
+	awk -F';' -v marker="$marker" '
 		{
 			for (i = 1; i <= NF; i++) {
-				if ($i != "lan" && $i != "roadmap" && $i != "service") exit 1
+				if ($i != "lan" && $i != marker && $i != "service") exit 1
 				seen[$i]++
 			}
 		}
-		END { exit !(NF == 3 && seen["lan"] == 1 && seen["roadmap"] == 1 && seen["service"] == 1) }
+		END { exit !(NF == 3 && seen["lan"] == 1 && seen[marker] == 1 && seen["service"] == 1) }
 	' <<<"$tags"
 }
 
@@ -464,7 +486,7 @@ if ! pct config "$CTID" >/dev/null 2>&1; then
 		--onboot 1 \
 		--ostype debian \
 		--startup 'order=5,up=10,down=30' \
-		--tags 'roadmap;service;lan' \
+		--tags "$CT_TAGS" \
 		--start 1; then
 		# A non-zero pct create may leave a partial config. Keep created=0
 		# until pct has reported success so cleanup cannot destroy a CT that

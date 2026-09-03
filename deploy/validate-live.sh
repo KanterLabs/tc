@@ -19,6 +19,14 @@ compat_env() {
 }
 CF_ACCESS_CLIENT_ID=${CF_ACCESS_CLIENT_ID:-}
 CF_ACCESS_CLIENT_SECRET=${CF_ACCESS_CLIENT_SECRET:-}
+DEPLOY_ENVIRONMENT=${HELM_DEPLOY_ENVIRONMENT:-production}
+case "$DEPLOY_ENVIRONMENT" in
+	production|beta) ;;
+	*)
+		printf 'HELM_DEPLOY_ENVIRONMENT must be exactly production or beta\n' >&2
+		exit 1
+		;;
+esac
 REQUIRE_SERVICE_AUTH_PROBE=$(compat_env HELM_REQUIRE_SERVICE_AUTH_PROBE ROADMAP_REQUIRE_SERVICE_AUTH_PROBE 0)
 [[ "$REQUIRE_SERVICE_AUTH_PROBE" = 0 || "$REQUIRE_SERVICE_AUTH_PROBE" = 1 ]] || {
 	printf 'HELM_REQUIRE_SERVICE_AUTH_PROBE must be 0 or 1\n' >&2
@@ -78,19 +86,35 @@ chmod 0600 "$CF_HEADER_FILE"
 printf 'Authorization: Bearer %s\n' "$CLOUDFLARE_API_TOKEN" > "$CF_HEADER_FILE"
 ACCOUNT_ID=090ae73dce25f4eca9a53ee396fdc916
 ZONE_ID=1206ce4daa0fe3c4791f9df9069764f6
-PUBLIC_HOST=tc.shanekanterman.dev
-PUBLIC_URL=https://tc.shanekanterman.dev
+case "$DEPLOY_ENVIRONMENT" in
+	production)
+		PUBLIC_HOST=tc.shanekanterman.dev
+		PUBLIC_URL=https://tc.shanekanterman.dev
+		API_PATH="$PUBLIC_HOST/api/v1/*"
+		TUNNEL_NAME=roadmap-homelab
+		UI_APP_NAME='Helm owner UI'
+		API_APP_NAME='Helm agents API'
+		OWNER_POLICY_NAME='Helm owner only'
+		SERVICE_TOKEN_NAME='Helm agents'
+		SERVICE_POLICY_NAME='Helm agents Service Auth'
+		;;
+	beta)
+		PUBLIC_HOST=beta.tc.shanekanterman.dev
+		PUBLIC_URL=https://beta.tc.shanekanterman.dev
+		API_PATH="$PUBLIC_HOST/api/v1/*"
+		TUNNEL_NAME=helm-beta-homelab
+		UI_APP_NAME='Helm beta owner UI'
+		API_APP_NAME='Helm beta agents API'
+		OWNER_POLICY_NAME='Helm beta owner only'
+		SERVICE_TOKEN_NAME='Helm beta agents'
+		SERVICE_POLICY_NAME='Helm beta agents Service Auth'
+		;;
+esac
 CONFIGURED_PUBLIC_ORIGIN=$(compat_env HELM_PUBLIC_ORIGIN ROADMAP_PUBLIC_ORIGIN)
 if [[ -n "$CONFIGURED_PUBLIC_ORIGIN" && "$CONFIGURED_PUBLIC_ORIGIN" != "$PUBLIC_URL" ]]; then
 	printf 'HELM_PUBLIC_ORIGIN must be exactly %s\n' "$PUBLIC_URL" >&2
 	exit 1
 fi
-TUNNEL_NAME=roadmap-homelab
-UI_APP_NAME='Helm owner UI'
-API_APP_NAME='Helm agents API'
-OWNER_POLICY_NAME='Helm owner only'
-SERVICE_TOKEN_NAME='Helm agents'
-SERVICE_POLICY_NAME='Helm agents Service Auth'
 
 cf_request() {
 	local method=$1 path=$2 response

@@ -298,7 +298,7 @@ The Playwright suite (`npm run e2e`) expects an already-running server at
 `npm run e2e:install`. CI shows the complete disposable-server setup in
 [`.github/workflows/ci.yml`](.github/workflows/ci.yml).
 
-## Production deployment
+## Beta and production deployment
 
 The intended homelab path is:
 
@@ -310,6 +310,26 @@ Cloudflare Access
   → helm.service on 127.0.0.1:8080
   → /var/lib/roadmap/data/roadmap.db
 ```
+
+Changes are tested through a separate environment before production:
+
+```text
+beta branch
+  → beta GitHub environment and beta-only secrets
+  → beta.tc.shanekanterman.dev
+  → helm-beta-homelab Tunnel
+  → cloudflared in the `helm-beta` LXC (CT 106, 10.0.0.39)
+  → an independent /var/lib/roadmap/data/roadmap.db
+
+explicit pull request or merge to main
+  → production GitHub environment and ROADMAP_* secrets
+  → tc.shanekanterman.dev and the production `roadmap` LXC (CT 103)
+```
+
+The guests do not share databases, backups, releases, tunnel tokens, deploy
+keys, signing keys, or GitHub environments. See
+[`docs/BETA_DEPLOYMENT_PLAN.md`](docs/BETA_DEPLOYMENT_PLAN.md) for the fixed
+identity table, promotion contract, and validation gates.
 
 The data root, database and backup names, Unix account, Compose volume,
 hostname, tunnel/guest identities, `X-Roadmap-Revision` header, Roadmap API
@@ -325,10 +345,12 @@ reconciliation. The full bootstrap, host assumptions, firewall posture, and
 recovery checks are in [`docs/OPERATIONS.md`](docs/OPERATIONS.md).
 
 After the one-time Proxmox and Cloudflare bootstrap described there, pushes to
-the `main` branch run [`.github/workflows/ci.yml`](.github/workflows/ci.yml).
-The workflow runs Go/frontend checks, browser tests, and a container smoke
-test, then deploys the release, publishes the proxied DNS record, and validates
-<https://tc.shanekanterman.dev>. Normal deployment requires the GitHub Actions
+`beta` and `main` run [`.github/workflows/ci.yml`](.github/workflows/ci.yml).
+Both branches run Go/frontend checks, browser tests, and a container smoke
+test. A `beta` push may deploy only through the `beta` environment and validate
+`beta.tc.shanekanterman.dev`; a `main` push may deploy only through the
+`production` environment and validate <https://tc.shanekanterman.dev>. Normal
+production deployment requires the GitHub Actions
 secrets `ROADMAP_CLOUDFLARE_API_TOKEN`, `ROADMAP_DEPLOY_SSH_KEY`,
 `ROADMAP_DEPLOY_KNOWN_HOSTS`, `ROADMAP_RELEASE_SIGNING_KEY`,
 `ROADMAP_CF_ACCESS_CLIENT_ID`, and `ROADMAP_CF_ACCESS_CLIENT_SECRET`; secret
@@ -337,6 +359,11 @@ placed in this README or the repository. Create the Cloudflare service token
 and save its one-time secret with the manual `cloudflare.sh prepare` procedure
 before enabling CI; CI refuses to create a token whose secret would remain
 only on an ephemeral runner.
+
+Beta uses corresponding `BETA_*` environment secrets and a distinct forced
+SSH account and release-signing key. Dispatch `rollback_sha` from `beta` to
+roll back beta, or from `main` to roll back production; neither environment's
+job can select the other gateway.
 
 ## Backups and rollback
 

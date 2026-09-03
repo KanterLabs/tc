@@ -18,6 +18,7 @@ __pycache__/
 /.env
 /.tc-deploy.env
 /.helm-deploy.env
+/.helm-beta-deploy.env
 /.cloudflare-tunnel-token
 /.deploy-key
 /.deploy-key.pub

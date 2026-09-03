@@ -14,7 +14,21 @@ resolve_compat_var() {
 	printf '%s' "${canonical_value:-${legacy_value:-$default_value}}"
 }
 
-CONFIG_FILE=$(resolve_compat_var HELM_DEPLOY_CONFIG ROADMAP_DEPLOY_CONFIG "$ROOT_DIR/.helm-deploy.env")
+# Production remains the default for existing callers. Beta is an explicit,
+# exact opt-in so an unset or malformed environment variable can never switch
+# a production invocation to the beta gateway or credentials.
+DEPLOY_ENVIRONMENT=${HELM_DEPLOY_ENVIRONMENT:-production}
+DEPLOY_PROFILE=production
+DEFAULT_CONFIG="$ROOT_DIR/.helm-deploy.env"
+if [[ "$DEPLOY_ENVIRONMENT" = beta ]]; then
+	DEPLOY_PROFILE=beta
+	DEFAULT_CONFIG="$ROOT_DIR/.helm-beta-deploy.env"
+elif [[ "$DEPLOY_ENVIRONMENT" != production ]]; then
+	printf 'HELM_DEPLOY_ENVIRONMENT must be production or beta\n' >&2
+	exit 1
+fi
+
+CONFIG_FILE=$(resolve_compat_var HELM_DEPLOY_CONFIG ROADMAP_DEPLOY_CONFIG "$DEFAULT_CONFIG")
 ACTION=deploy
 SHA=
 if [[ ${1:-} = deploy || ${1:-} = rollback || ${1:-} = status ]]; then
@@ -23,12 +37,20 @@ if [[ ${1:-} = deploy || ${1:-} = rollback || ${1:-} = status ]]; then
 fi
 SHA=${1:-}
 
-if [[ "$CONFIG_FILE" = "$ROOT_DIR/.helm-deploy.env" && ! -f "$CONFIG_FILE" && -f "$ROOT_DIR/.tc-deploy.env" ]]; then
-	CONFIG_FILE="$ROOT_DIR/.tc-deploy.env"
-elif [[ ! -f "$CONFIG_FILE" && -f "$ROOT_DIR/.helm-deploy.env.example" ]]; then
-	CONFIG_FILE="$ROOT_DIR/.helm-deploy.env.example"
-elif [[ ! -f "$CONFIG_FILE" && -f "$ROOT_DIR/.tc-deploy.env.example" ]]; then
-	CONFIG_FILE="$ROOT_DIR/.tc-deploy.env.example"
+if [[ "$DEPLOY_PROFILE" = production ]]; then
+	if [[ "$CONFIG_FILE" = "$ROOT_DIR/.helm-deploy.env" && ! -f "$CONFIG_FILE" && -f "$ROOT_DIR/.tc-deploy.env" ]]; then
+		CONFIG_FILE="$ROOT_DIR/.tc-deploy.env"
+	elif [[ ! -f "$CONFIG_FILE" && -f "$ROOT_DIR/.helm-deploy.env.example" ]]; then
+		CONFIG_FILE="$ROOT_DIR/.helm-deploy.env.example"
+	elif [[ ! -f "$CONFIG_FILE" && -f "$ROOT_DIR/.tc-deploy.env.example" ]]; then
+		CONFIG_FILE="$ROOT_DIR/.tc-deploy.env.example"
+	fi
+else
+	# Never fall back from beta to a production config or legacy config. A
+	# beta invocation must carry the beta deploy account explicitly.
+	if [[ "$CONFIG_FILE" = "$ROOT_DIR/.helm-beta-deploy.env" && ! -f "$CONFIG_FILE" && -f "$ROOT_DIR/.helm-beta-deploy.env.example" ]]; then
+		CONFIG_FILE="$ROOT_DIR/.helm-beta-deploy.env.example"
+	fi
 fi
 [[ -f "$CONFIG_FILE" ]] || {
 	printf 'missing deployment config: %s\n' "$CONFIG_FILE" >&2
@@ -48,12 +70,19 @@ config_mode=$(stat -c '%a' -- "$CONFIG_FILE")
 source "$CONFIG_FILE"
 : "${PVE_HOST:?PVE_HOST is required}"
 : "${PVE_DEPLOY_USER:?PVE_DEPLOY_USER is required}"
-[[ "$PVE_DEPLOY_USER" = roadmap-deploy ]] || {
-	# The deployment account is an intentional legacy allowlist entry on the
-	# separately managed Proxmox gateway.
-	printf 'PVE_DEPLOY_USER must be roadmap-deploy\n' >&2
-	exit 1
-}
+if [[ "$DEPLOY_PROFILE" = production ]]; then
+	[[ "$PVE_DEPLOY_USER" = roadmap-deploy ]] || {
+		# The deployment account is an intentional legacy allowlist entry on the
+		# separately managed Proxmox gateway.
+		printf 'PVE_DEPLOY_USER must be roadmap-deploy\n' >&2
+		exit 1
+	}
+else
+	[[ "$PVE_DEPLOY_USER" = helm-beta-deploy ]] || {
+		printf 'PVE_DEPLOY_USER must be helm-beta-deploy for beta deployments\n' >&2
+		exit 1
+	}
+fi
 
 case "$ACTION" in
 	deploy|rollback)
