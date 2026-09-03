@@ -143,6 +143,29 @@ export interface ReopenInput {
   reason: string;
 }
 
+/** Derived direct-edge counts embedded in task collections and detail reads. */
+export interface DependencySummary {
+  prerequisite_count: number;
+  unmet_prerequisite_count: number;
+  dependent_count: number;
+  blocked: boolean;
+}
+
+/** One bounded task reference returned by the dependency graph endpoint. */
+export interface TaskReference {
+  id: string;
+  key: string;
+  title: string;
+  completed_at: string | null;
+  satisfied: boolean;
+}
+
+/** Direct dependency edges in both directions for one task. */
+export interface TaskDependencies {
+  prerequisites: TaskReference[];
+  dependents: TaskReference[];
+}
+
 export interface Task {
   id: string;
   number: number;
@@ -169,6 +192,8 @@ export interface Task {
   comment_count?: number;
   /** Structured progress published by the current agent, when present. */
   agent_work?: AgentWork | null;
+  /** Present on current servers; optional keeps retained-server fixtures usable. */
+  dependency_summary?: DependencySummary;
 }
 
 export interface Comment {

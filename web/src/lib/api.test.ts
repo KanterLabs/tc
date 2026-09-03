@@ -125,6 +125,40 @@ describe('public API client', () => {
     expect(JSON.parse(String(init.body))).toEqual({ title: 'Updated' });
   });
 
+  it('reads and mutates task dependencies with encoded references and guarded headers', async () => {
+    const fetchMock = vi.spyOn(globalThis, 'fetch')
+      .mockResolvedValueOnce(response({ prerequisites: [], dependents: [] }))
+      .mockResolvedValueOnce(response({ id: 'task-1', version: 4 }))
+      .mockResolvedValueOnce(response({ id: 'task-1', version: 5 }));
+
+    await api.getTaskDependencies('OPS/1');
+    await api.addTaskDependency('OPS/1', 'OPS-2', 3);
+    await api.removeTaskDependency('OPS/1', 'OPS/2', 4);
+
+    expect(String(fetchMock.mock.calls[0][0])).toContain('/api/v1/tasks/OPS%2F1/dependencies');
+    const add = fetchMock.mock.calls[1];
+    expect(String(add[0])).toContain('/api/v1/tasks/OPS%2F1/dependencies');
+    expect((add[1] as RequestInit).method).toBe('POST');
+    expect(JSON.parse(String((add[1] as RequestInit).body))).toEqual({ prerequisite: 'OPS-2' });
+    expect(((add[1] as RequestInit).headers as Headers).get('If-Match')).toBe('"v3"');
+    expect(((add[1] as RequestInit).headers as Headers).get('Idempotency-Key')).toBeTruthy();
+
+    const remove = fetchMock.mock.calls[2];
+    expect(String(remove[0])).toContain('/api/v1/tasks/OPS%2F1/dependencies/OPS%2F2');
+    expect((remove[1] as RequestInit).method).toBe('DELETE');
+    expect(((remove[1] as RequestInit).headers as Headers).get('If-Match')).toBe('"v4"');
+    expect(((remove[1] as RequestInit).headers as Headers).get('Idempotency-Key')).toBeTruthy();
+  });
+
+  it('forwards dependency readiness filters to task and My Work collections', async () => {
+    const fetchMock = vi.spyOn(globalThis, 'fetch').mockImplementation(() => Promise.resolve(response({ data: [], next_cursor: null })));
+    await api.listTasks('project-1', { dependency: 'blocked' });
+    await api.myWork({ dependency: 'ready' });
+
+    expect(new URL(String(fetchMock.mock.calls[0][0]), 'http://localhost').searchParams.get('dependency')).toBe('blocked');
+    expect(new URL(String(fetchMock.mock.calls[1][0]), 'http://localhost').searchParams.get('dependency')).toBe('ready');
+  });
+
   it('publishes progress and blocks with task version and idempotency protection', async () => {
     const fetchMock = vi.spyOn(globalThis, 'fetch')
       .mockResolvedValueOnce(response({ id: 'task-1', version: 8 }))

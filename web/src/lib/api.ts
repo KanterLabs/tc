@@ -23,6 +23,7 @@ import {
   type BugResolution,
   type RoadmapSummary,
   type Task,
+  type TaskDependencies,
   type TaskTimelineCollection,
   type TaskTimelineKind,
   type TaskMoveInput,
@@ -52,6 +53,7 @@ export interface TaskListParams {
   resolution?: BugResolution | 'unresolved' | 'none';
   agent_state?: AgentWorkStateFilter;
   action_needed?: boolean | string;
+  dependency?: 'blocked' | 'ready';
   q?: string;
   updated_after?: string;
   cursor?: string;
@@ -74,6 +76,7 @@ export interface MyWorkParams {
   view?: WorkView;
   agent_state?: AgentWorkStateFilter;
   action_needed?: boolean | string;
+  dependency?: 'blocked' | 'ready';
   cursor?: string;
   limit?: number;
 }
@@ -217,6 +220,7 @@ export const api = {
         resolution: params.resolution,
         agent_state: params.agent_state,
         action_needed: params.action_needed,
+        dependency: params.dependency,
         q: params.q,
         updated_after: params.updated_after,
         cursor: params.cursor,
@@ -237,6 +241,7 @@ export const api = {
         resolution: params.resolution,
         agent_state: params.agent_state,
         action_needed: params.action_needed,
+        dependency: params.dependency,
         q: params.q,
         updated_after: params.updated_after,
         cursor: params.cursor,
@@ -269,6 +274,21 @@ export const api = {
     request<Task>(`/tasks/${encodeURIComponent(task)}`, {
       method: 'PATCH',
       body: input,
+      ifMatch: version,
+      idempotencyKey: key()
+    }),
+  getTaskDependencies: (task: string) =>
+    request<TaskDependencies>(`/tasks/${encodeURIComponent(task)}/dependencies`),
+  addTaskDependency: (task: string, prerequisite: string, version: number) =>
+    request<Task>(`/tasks/${encodeURIComponent(task)}/dependencies`, {
+      method: 'POST',
+      body: { prerequisite },
+      ifMatch: version,
+      idempotencyKey: key()
+    }),
+  removeTaskDependency: (task: string, prerequisite: string, version: number) =>
+    request<Task>(`/tasks/${encodeURIComponent(task)}/dependencies/${encodeURIComponent(prerequisite)}`, {
+      method: 'DELETE',
       ifMatch: version,
       idempotencyKey: key()
     }),
@@ -404,6 +424,7 @@ export const api = {
         view: params.view,
         agent_state: params.agent_state,
         action_needed: params.action_needed,
+        dependency: params.dependency,
         cursor: params.cursor,
         limit: params.limit
       })
@@ -420,6 +441,7 @@ export const api = {
         view: params.view,
         agent_state: params.agent_state,
         action_needed: params.action_needed,
+        dependency: params.dependency,
         cursor,
         limit: params.limit ?? 200
       })
