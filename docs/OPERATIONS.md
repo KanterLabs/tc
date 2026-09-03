@@ -248,6 +248,9 @@ gateway because its SSH key is forced to
 request or merge from `beta` to `main`; the resulting `main` push remains the
 only automatic production trigger.
 
+The beta environment also stores `BETA_ADMIN_EMAIL` explicitly so its
+least-privilege Cloudflare token does not need account-membership read access.
+
 Read beta status or roll back a retained beta release with:
 
 ```sh
