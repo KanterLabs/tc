@@ -10,6 +10,7 @@ import type {
   Task,
   TaskRouteIntent
 } from './types';
+import { dependencyMatches } from './dependencies';
 
 export interface BoardFilters {
   query: string;
@@ -17,6 +18,7 @@ export interface BoardFilters {
   label: string;
   assignee: string;
   state: string;
+  dependency?: 'all' | 'blocked' | 'ready';
   /** Issue filters remain optional so existing board callers stay source-compatible. */
   kind?: string;
   severity?: string;
@@ -510,6 +512,7 @@ export function filterTasks(tasks: Task[], columns: Column[], filters: BoardFilt
     ) return false;
     if (filters.priority !== 'all' && task.priority !== filters.priority) return false;
     if (filters.state !== 'all' && column?.semantic_state !== filters.state) return false;
+    if (!dependencyMatches(task, filters.dependency)) return false;
     if (filters.assignee !== 'all' && actorId(task.assignee) !== filters.assignee) return false;
     if (filters.label !== 'all' && !(task.labels ?? []).some((label) => label.id === filters.label || label.name === filters.label)) {
       return false;

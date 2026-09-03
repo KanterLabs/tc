@@ -36,6 +36,12 @@
     type BoardFilters
   } from './lib/state';
   import {
+    dependencyActionExplanation,
+    dependencyBlocked,
+    dependencyEventTaskIds,
+    dependencyMoveExplanation
+  } from './lib/dependencies';
+  import {
     ApiError,
     type ActivityEvent,
     type Actor,
@@ -66,6 +72,7 @@
   import RoadmapLiveWork from './lib/components/RoadmapLiveWork.svelte';
   import TaskActivityTimeline from './lib/components/TaskActivityTimeline.svelte';
   import TaskDependencies from './lib/components/TaskDependencies.svelte';
+  import TaskDependencyStatus from './lib/components/TaskDependencyStatus.svelte';
   import {
     mergeAuthoritativeTask,
     mergeAuthoritativeTaskList,
@@ -156,7 +163,7 @@
   let issuesLoading = false;
   let issuesError = '';
   let issueRequest = 0;
-  let filters: BoardFilters = { query: '', priority: 'all', label: 'all', assignee: 'all', state: 'all' };
+  let filters: BoardFilters = { query: '', priority: 'all', label: 'all', assignee: 'all', state: 'all', dependency: 'all' };
   let boardWorkFilter: WorkFilter = 'all';
   let issueFilters: BoardFilters = {
     query: '',
@@ -1432,6 +1439,8 @@
         const currentView = view;
         const boardChanged = result.data.some((event) => !event.project_id || event.project_id === currentProjectId);
         const affectedTaskIds = new Set(result.data.map((event) => event.task_id).filter((id): id is string => Boolean(id)));
+        const dependencyAffectedTaskIds = new Set(result.data.flatMap(dependencyEventTaskIds));
+        dependencyAffectedTaskIds.forEach((taskId) => affectedTaskIds.add(taskId));
         let reloadSucceeded = true;
 
         if (boardChanged && (currentView === 'board' || currentView === 'timeline')) reloadSucceeded = (await loadBoard()) && reloadSucceeded;
@@ -1445,10 +1454,7 @@
 
         if (drawerTask && affectedTaskIds.has(drawerTask.id)) {
           const drawerTaskId = drawerTask.id;
-          const dependencyChanged = result.data.some((event) =>
-            event.task_id === drawerTaskId
-            && ['task.dependency_added', 'task.dependency_removed', 'task.dependency_state_changed'].includes(event.type)
-          );
+          const dependencyChanged = dependencyAffectedTaskIds.has(drawerTaskId);
           reloadSucceeded = (await refreshDrawerTask(drawerTaskId)) && reloadSucceeded;
           if (dependencyChanged && drawerTask?.id === drawerTaskId) {
             if (drawerView === 'details' && drawerDependencyPanel) {
@@ -2040,7 +2046,7 @@
   }
 
   function clearFilters() {
-    filters = { query: '', priority: 'all', label: 'all', assignee: 'all', state: 'all' };
+    filters = { query: '', priority: 'all', label: 'all', assignee: 'all', state: 'all', dependency: 'all' };
     boardWorkFilter = 'all';
   }
 
@@ -2114,6 +2120,12 @@
   }
 
   async function moveTask(task: Task, destinationColumnId: string) {
+    const destination = columns.find((column) => column.id === destinationColumnId);
+    const blockedReason = dependencyMoveExplanation(task, destination);
+    if (blockedReason) {
+      toast('info', blockedReason);
+      return;
+    }
     taskActionLoading = task.id;
     try {
       const updated = await api.patchTask(task.id, { column_id: destinationColumnId, position: nextPosition(tasks, destinationColumnId) }, task.version);
@@ -2129,8 +2141,27 @@
   function keyboardMove(event: KeyboardEvent, task: Task) {
     if (!(event.altKey && (event.key === 'ArrowLeft' || event.key === 'ArrowRight'))) return;
     event.preventDefault();
+    const destination = adjacentTaskColumn(task, event.key === 'ArrowLeft' ? -1 : 1);
+    if (destination) void moveTask(task, destination.id);
+  }
+
+  function adjacentTaskColumn(task: Task, offset: -1 | 1): Column | undefined {
     const index = sortedColumns.findIndex((column) => column.id === task.column_id);
-    const destination = sortedColumns[index + (event.key === 'ArrowLeft' ? -1 : 1)];
+    return sortedColumns[index + offset];
+  }
+
+  function cardMoveReason(task: Task, offset: -1 | 1): string {
+    return dependencyMoveExplanation(task, adjacentTaskColumn(task, offset));
+  }
+
+  function cardMoveLabel(task: Task, offset: -1 | 1): string {
+    const direction = offset < 0 ? 'previous' : 'next';
+    const reason = cardMoveReason(task, offset);
+    return `Move ${task.key} to ${direction} column${reason ? `. Unavailable: ${reason}` : ''}`;
+  }
+
+  function moveTaskBy(task: Task, offset: -1 | 1): void {
+    const destination = adjacentTaskColumn(task, offset);
     if (destination) void moveTask(task, destination.id);
   }
 
@@ -2339,13 +2370,16 @@
     blockReasonDraft = '';
     blockReasonOpen = false;
     syncDraft(task);
+    const openingDraft = drawerDraftFingerprint();
     drawerLoading = true;
     void loadDrawerTimeline(task.id);
     try {
       const detail = await api.getTask(task.id);
       if (requestId !== taskDetailRequest || drawerTask?.id !== task.id) return;
       replaceTask(detail);
-      syncDraft(detail);
+      // A fast editor can type before the detail request settles. Hydrate
+      // only while every draft field still matches the opening snapshot.
+      if (drawerDraftFingerprint() === openingDraft) syncDraft(detail);
     } catch (error) {
       if (requestId === taskDetailRequest && drawerTask?.id === task.id) {
         drawerError = friendlyError(error, 'Some task details could not be loaded.');
@@ -2438,6 +2472,27 @@
     duplicateOfDraft = task.bug?.duplicate_of || '';
     resolutionNoteDraft = '';
     reopenReasonDraft = '';
+  }
+
+  function drawerDraftFingerprint(): string {
+    return JSON.stringify([
+      draftTitle,
+      draftDescription,
+      draftPriority,
+      draftDueDate,
+      draftAssignee,
+      draftLabels,
+      draftBugActual,
+      draftBugExpected,
+      draftBugReproduction,
+      draftBugEnvironment,
+      draftBugVersion,
+      triageSeverityDraft,
+      resolutionDraft,
+      duplicateOfDraft,
+      resolutionNoteDraft,
+      reopenReasonDraft
+    ]);
   }
 
   function findProjectLabel(projectId: string, value: string): Label | undefined {
@@ -2633,6 +2688,13 @@
 
   async function runTaskAction(action: 'claim' | 'renew' | 'release' | 'complete' | 'block', reason = '') {
     if (!drawerTask) return;
+    if (['claim', 'renew', 'complete'].includes(action) && dependencyBlocked(drawerTask)) {
+      drawerError = dependencyActionExplanation(
+        drawerTask,
+        action === 'complete' ? 'complete this task' : action === 'renew' ? 'renew this claim' : 'claim this task'
+      );
+      return;
+    }
     if (action === 'block' && !reason.trim()) {
       drawerError = 'Add a reason before blocking this task.';
       blockReasonOpen = true;
@@ -2679,6 +2741,10 @@
 
   async function triageBug() {
     if (!drawerTask?.bug) return;
+    if (dependencyBlocked(drawerTask)) {
+      drawerError = dependencyActionExplanation(drawerTask, 'start triage');
+      return;
+    }
     taskActionLoading = drawerTask.id;
     drawerError = '';
     try {
@@ -2700,6 +2766,10 @@
 
   async function resolveBug() {
     if (!drawerTask?.bug) return;
+    if (dependencyBlocked(drawerTask)) {
+      drawerError = dependencyActionExplanation(drawerTask, 'resolve this issue');
+      return;
+    }
     if (resolutionDraft === 'duplicate' && !duplicateOfDraft.trim()) {
       drawerError = 'Add the task key or ID this issue duplicates.';
       return;
@@ -3096,8 +3166,8 @@
             {#if view === 'board'}
             <section class="board-toolbar" aria-label="Board filters">
               <div class="filter-search"><span aria-hidden="true">⌕</span><input aria-label="Search tasks" bind:value={filters.query} placeholder="Search tasks…" /><kbd>/</kbd></div>
-              <div class="filter-group"><select aria-label="Filter by state" bind:value={filters.state}><option value="all">All states</option>{#each sortedColumns as column}<option value={column.semantic_state}>{stateLabels[column.semantic_state] || column.name}</option>{/each}</select><select aria-label="Filter by priority" bind:value={filters.priority}><option value="all">All priorities</option><option value="urgent">Urgent</option><option value="high">High</option><option value="normal">Normal</option><option value="low">Low</option></select><select aria-label="Filter by agent work" bind:value={boardWorkFilter}><option value="all">All agent work</option><option value="action-needed">Action needed{boardWorkCounts.actionNeeded ? ` · ${boardWorkCounts.actionNeeded}` : ''}</option><option value="missing">Missing{boardWorkCounts.missing ? ` · ${boardWorkCounts.missing}` : ''}</option><option value="stale">Stale{boardWorkCounts.stale ? ` · ${boardWorkCounts.stale}` : ''}</option><option value="waiting">Waiting{boardWorkCounts.waiting ? ` · ${boardWorkCounts.waiting}` : ''}</option><option value="handoff">Handoff{boardWorkCounts.handoff ? ` · ${boardWorkCounts.handoff}` : ''}</option><option value="working">Working{boardWorkCounts.working ? ` · ${boardWorkCounts.working}` : ''}</option><option value="verifying">Verifying{boardWorkCounts.verifying ? ` · ${boardWorkCounts.verifying}` : ''}</option></select><select aria-label="Filter by label" bind:value={filters.label}><option value="all">All labels</option>{#each labels as label}<option value={label.id}>{label.name}</option>{/each}</select><select aria-label="Filter by assignee" bind:value={filters.assignee}><option value="all">All assignees</option>{#each Array.from(new Map(tasks.map((task) => [actorId(task.assignee), task.assignee])).entries()).filter(([id]) => id) as pair}<option value={pair[0]}>{actorName(pair[1]) || pair[0]}</option>{/each}</select></div>
-              {#if filters.query || filters.priority !== 'all' || filters.label !== 'all' || filters.assignee !== 'all' || filters.state !== 'all' || boardWorkFilter !== 'all'}<button class="clear-filters" type="button" on:click={clearFilters}>Clear filters</button>{/if}
+              <div class="filter-group"><select aria-label="Filter by state" bind:value={filters.state}><option value="all">All states</option>{#each sortedColumns as column}<option value={column.semantic_state}>{stateLabels[column.semantic_state] || column.name}</option>{/each}</select><select aria-label="Filter by priority" bind:value={filters.priority}><option value="all">All priorities</option><option value="urgent">Urgent</option><option value="high">High</option><option value="normal">Normal</option><option value="low">Low</option></select><select aria-label="Filter by agent work" bind:value={boardWorkFilter}><option value="all">All agent work</option><option value="action-needed">Action needed{boardWorkCounts.actionNeeded ? ` · ${boardWorkCounts.actionNeeded}` : ''}</option><option value="missing">Missing{boardWorkCounts.missing ? ` · ${boardWorkCounts.missing}` : ''}</option><option value="stale">Stale{boardWorkCounts.stale ? ` · ${boardWorkCounts.stale}` : ''}</option><option value="waiting">Waiting{boardWorkCounts.waiting ? ` · ${boardWorkCounts.waiting}` : ''}</option><option value="handoff">Handoff{boardWorkCounts.handoff ? ` · ${boardWorkCounts.handoff}` : ''}</option><option value="working">Working{boardWorkCounts.working ? ` · ${boardWorkCounts.working}` : ''}</option><option value="verifying">Verifying{boardWorkCounts.verifying ? ` · ${boardWorkCounts.verifying}` : ''}</option></select><select aria-label="Filter by dependency readiness" bind:value={filters.dependency}><option value="all">All dependencies</option><option value="blocked">Waiting on prerequisites</option><option value="ready">Prerequisites finished</option></select><select aria-label="Filter by label" bind:value={filters.label}><option value="all">All labels</option>{#each labels as label}<option value={label.id}>{label.name}</option>{/each}</select><select aria-label="Filter by assignee" bind:value={filters.assignee}><option value="all">All assignees</option>{#each Array.from(new Map(tasks.map((task) => [actorId(task.assignee), task.assignee])).entries()).filter(([id]) => id) as pair}<option value={pair[0]}>{actorName(pair[1]) || pair[0]}</option>{/each}</select></div>
+              {#if filters.query || filters.priority !== 'all' || filters.label !== 'all' || filters.assignee !== 'all' || filters.state !== 'all' || filters.dependency !== 'all' || boardWorkFilter !== 'all'}<button class="clear-filters" type="button" on:click={clearFilters}>Clear filters</button>{/if}
               <span class="toolbar-spacer"></span><span class="task-total">{visibleTasks.length} {visibleTasks.length === 1 ? 'task' : 'tasks'}</span><button class="icon-button" type="button" aria-label="Refresh board" on:click={loadBoard}>↻</button>
             </section>
 
@@ -3117,15 +3187,16 @@
                         <div class="column-empty"><span>Nothing here yet</span><button class="text-button" type="button" on:click={() => quickAddColumn = column.id}>Add the first task</button></div>
                       {:else}
                         {#each tasksByColumn[column.id] as task (task.id)}
-                          <article class="task-card" class:dragging={draggingTaskId === task.id} draggable="true" on:dragstart={(event) => dragStart(event, task)} on:dragend={() => draggingTaskId = ''}>
+                          <article class="task-card" class:dependency-blocked={dependencyBlocked(task)} class:dragging={draggingTaskId === task.id} draggable="true" on:dragstart={(event) => dragStart(event, task)} on:dragend={() => draggingTaskId = ''}>
                             <button class="task-main" type="button" data-task-trigger on:click={() => openTask(task)} on:keydown={(event) => keyboardMove(event, task)}>
                               <span class="task-card-top"><span class="task-key">{task.key}</span>{#if task.kind === 'bug'}<span class="issue-kind-badge">Bug</span>{#if task.bug?.severity}<span class="severity-badge">{task.bug.severity.toUpperCase()}</span>{/if}{/if}<span class={`priority-dot priority-${task.priority}`} title={`${priorityLabels[task.priority]} priority`}></span>{#if task.claimed_by}<span class="claim-mini" title={`Claimed by ${actorName(task.claimed_by) || 'another actor'}`}>●</span>{/if}</span>
                               <strong class="task-title">{task.title}</strong>
                               {#if task.description}<span class="task-excerpt">{task.description.replace(/[#*_`]/g, '').slice(0, 92)}{task.description.length > 92 ? '…' : ''}</span>{/if}
                               {#if task.labels?.length}<span class="task-labels">{#each task.labels.slice(0, 3) as label}<span class="label-chip" style={`--label-color: ${label.color || '#8b7cf6'}`}>{label.name}</span>{/each}{#if task.labels.length > 3}<span class="label-more">+{task.labels.length - 3}</span>{/if}</span>{/if}
+                              <TaskDependencyStatus {task} />
                             </button>
                             {#if showAgentPulse(task)}<AgentPulse {task} now={pulseClock} actorLabel={agentLabelForTask(task)} />{/if}
-                            <div class="task-card-footer"><span class={`due-date ${taskDueClass(task)}`}>{#if task.due_at}<span aria-hidden="true">◷</span>{formatDate(task.due_at)}{/if}</span><span class="card-footer-spacer"></span>{#if task.assignee}<span class="mini-avatar" title={`Assigned to ${actorName(task.assignee) || actorId(task.assignee)}`}>{(actorName(task.assignee) || actorId(task.assignee)).slice(0, 1).toUpperCase()}</span>{/if}{#if task.comment_count}<span class="comment-count" title={`${task.comment_count} comments`}>◌ {task.comment_count}</span>{/if}<button class="icon-button card-move" type="button" aria-label={`Move ${task.key} to previous column`} disabled={sortedColumns.findIndex((item) => item.id === task.column_id) === 0 || taskActionLoading === task.id} on:click={() => { const index = sortedColumns.findIndex((item) => item.id === task.column_id); if (index > 0) void moveTask(task, sortedColumns[index - 1].id); }}>←</button><button class="icon-button card-move" type="button" aria-label={`Move ${task.key} to next column`} disabled={sortedColumns.findIndex((item) => item.id === task.column_id) === sortedColumns.length - 1 || taskActionLoading === task.id} on:click={() => { const index = sortedColumns.findIndex((item) => item.id === task.column_id); if (index < sortedColumns.length - 1) void moveTask(task, sortedColumns[index + 1].id); }}>→</button></div>
+                            <div class="task-card-footer"><span class={`due-date ${taskDueClass(task)}`}>{#if task.due_at}<span aria-hidden="true">◷</span>{formatDate(task.due_at)}{/if}</span><span class="card-footer-spacer"></span>{#if task.assignee}<span class="mini-avatar" title={`Assigned to ${actorName(task.assignee) || actorId(task.assignee)}`}>{(actorName(task.assignee) || actorId(task.assignee)).slice(0, 1).toUpperCase()}</span>{/if}{#if task.comment_count}<span class="comment-count" title={`${task.comment_count} comments`}>◌ {task.comment_count}</span>{/if}<button class="icon-button card-move" type="button" aria-label={cardMoveLabel(task, -1)} title={cardMoveReason(task, -1) || undefined} disabled={!adjacentTaskColumn(task, -1) || Boolean(cardMoveReason(task, -1)) || taskActionLoading === task.id} on:click={() => moveTaskBy(task, -1)}>←</button><button class="icon-button card-move" type="button" aria-label={cardMoveLabel(task, 1)} title={cardMoveReason(task, 1) || undefined} disabled={!adjacentTaskColumn(task, 1) || Boolean(cardMoveReason(task, 1)) || taskActionLoading === task.id} on:click={() => moveTaskBy(task, 1)}>→</button></div>
                           </article>
                         {/each}
                       {/if}
@@ -3281,11 +3352,11 @@
         {#if drawerTask.kind === 'bug'}
           <div class="drawer-bug-controls">
             <section class="drawer-section bug-details-section" aria-labelledby="bug-details-heading"><div class="section-heading-inline"><h2 id="bug-details-heading">Bug report</h2><span class="optional">Reporter: {drawerTask.bug?.reporter_id || 'Unknown'}</span></div><label>Actual behavior<textarea rows="3" bind:value={draftBugActual} placeholder="What happened?"></textarea></label><label>Expected behavior<textarea rows="3" bind:value={draftBugExpected} placeholder="What should have happened?"></textarea></label><label>Reproduction steps<textarea rows="3" bind:value={draftBugReproduction} placeholder="1. Open…&#10;2. Click…"></textarea></label><div class="drawer-field-grid"><label>Environment<input bind:value={draftBugEnvironment} placeholder="Browser, OS, device" /></label><label>Affected version<input bind:value={draftBugVersion} placeholder="e.g. 1.4.0" /></label></div></section>
-            <section class="drawer-section bug-triage-section" aria-labelledby="bug-triage-heading"><div class="section-heading-inline"><h2 id="bug-triage-heading">Triage</h2><span class="optional">Set severity and ownership</span></div><div class="drawer-field-grid"><label>Severity<select aria-label="Bug severity" bind:value={triageSeverityDraft}><option value="s1">{severityLabels.s1}</option><option value="s2">{severityLabels.s2}</option><option value="s3">{severityLabels.s3}</option><option value="s4">{severityLabels.s4}</option></select></label><label>Priority<select aria-label="Triage priority" bind:value={draftPriority}><option value="urgent">Urgent</option><option value="high">High</option><option value="normal">Normal</option><option value="low">Low</option></select></label></div><label>Assignee<input aria-label="Triage assignee" bind:value={draftAssignee} placeholder="Actor ID (optional)" /></label><button class="button primary" type="button" disabled={taskActionLoading === drawerTask.id} on:click={triageBug}>{#if taskActionLoading === drawerTask.id}<span class="button-spinner"></span>{/if}{drawerTask.bug?.severity ? 'Update triage' : 'Triage issue'}</button></section>
+            <section class="drawer-section bug-triage-section" aria-labelledby="bug-triage-heading"><div class="section-heading-inline"><h2 id="bug-triage-heading">Triage</h2><span class="optional">Set severity and ownership</span></div><div class="drawer-field-grid"><label>Severity<select aria-label="Bug severity" bind:value={triageSeverityDraft}><option value="s1">{severityLabels.s1}</option><option value="s2">{severityLabels.s2}</option><option value="s3">{severityLabels.s3}</option><option value="s4">{severityLabels.s4}</option></select></label><label>Priority<select aria-label="Triage priority" bind:value={draftPriority}><option value="urgent">Urgent</option><option value="high">High</option><option value="normal">Normal</option><option value="low">Low</option></select></label></div><label>Assignee<input aria-label="Triage assignee" bind:value={draftAssignee} placeholder="Actor ID (optional)" /></label><button class="button primary" type="button" title={dependencyBlocked(drawerTask) ? dependencyActionExplanation(drawerTask, 'start triage') : undefined} disabled={dependencyBlocked(drawerTask) || taskActionLoading === drawerTask.id} on:click={triageBug}>{#if taskActionLoading === drawerTask.id}<span class="button-spinner"></span>{/if}{drawerTask.bug?.severity ? 'Update triage' : 'Triage issue'}</button></section>
             {#if drawerTask.bug?.resolution}
               <section class="drawer-section bug-resolution-section" aria-labelledby="bug-resolution-heading"><div class="section-heading-inline"><h2 id="bug-resolution-heading">Resolved as {resolutionLabels[drawerTask.bug.resolution] || drawerTask.bug.resolution}</h2><span class="optional">Reopen if the issue persists</span></div><label>Reopen reason<textarea rows="2" bind:value={reopenReasonDraft} placeholder="Why does this need another look?"></textarea></label><button class="button quiet-button" type="button" disabled={taskActionLoading === drawerTask.id || !reopenReasonDraft.trim()} on:click={reopenBug}>Reopen issue</button></section>
             {:else}
-              <section class="drawer-section bug-resolution-section" aria-labelledby="bug-resolution-heading"><div class="section-heading-inline"><h2 id="bug-resolution-heading">Resolve</h2><span class="optional">Close the loop for reporters</span></div><label>Resolution<select aria-label="Bug resolution" bind:value={resolutionDraft}>{#each resolutionOptions as resolution}<option value={resolution}>{resolutionLabels[resolution]}</option>{/each}</select></label>{#if resolutionDraft === 'duplicate'}<label>Duplicate of<input aria-label="Duplicate issue" bind:value={duplicateOfDraft} placeholder="Task key or ID" /></label>{/if}<label>Resolution note <span class="optional">Optional</span><textarea rows="2" bind:value={resolutionNoteDraft} placeholder="What changed or why was this closed?"></textarea></label><button class="button complete-button" type="button" disabled={taskActionLoading === drawerTask.id} on:click={resolveBug}>Resolve issue</button></section>
+              <section class="drawer-section bug-resolution-section" aria-labelledby="bug-resolution-heading"><div class="section-heading-inline"><h2 id="bug-resolution-heading">Resolve</h2><span class="optional">Close the loop for reporters</span></div><label>Resolution<select aria-label="Bug resolution" bind:value={resolutionDraft}>{#each resolutionOptions as resolution}<option value={resolution}>{resolutionLabels[resolution]}</option>{/each}</select></label>{#if resolutionDraft === 'duplicate'}<label>Duplicate of<input aria-label="Duplicate issue" bind:value={duplicateOfDraft} placeholder="Task key or ID" /></label>{/if}<label>Resolution note <span class="optional">Optional</span><textarea rows="2" bind:value={resolutionNoteDraft} placeholder="What changed or why was this closed?"></textarea></label><button class="button complete-button" type="button" title={dependencyBlocked(drawerTask) ? dependencyActionExplanation(drawerTask, 'resolve this issue') : undefined} disabled={dependencyBlocked(drawerTask) || taskActionLoading === drawerTask.id} on:click={resolveBug}>Resolve issue</button></section>
             {/if}
           </div>
         {/if}
@@ -3299,7 +3370,8 @@
         {#if blockReasonOpen}
           <section class="block-reason-form" aria-labelledby="block-reason-heading"><label id="block-reason-heading">Why is this task blocked?<textarea rows="3" bind:value={blockReasonDraft} placeholder="Describe the dependency or decision needed." required></textarea></label><div class="form-actions"><button class="text-button" type="button" on:click={() => { blockReasonOpen = false; blockReasonDraft = ''; }}>Cancel</button><button class="button danger-button" type="button" disabled={!blockReasonDraft.trim() || taskActionLoading === drawerTask.id} on:click={() => runTaskAction('block', blockReasonDraft)}>Block task</button></div></section>
         {/if}
-              <div class="drawer-scroll"><label class="drawer-title-label"><span class="sr-only">Task title</span><input id="drawer-title" class="drawer-title-input" data-dialog-initial-focus bind:value={draftTitle} /></label><div class="drawer-meta"><span class="task-project-marker" style={`--project-color: ${projectForTask(drawerTask)?.color || '#6d5efc'}`}></span><span>{projectForTask(drawerTask)?.name || 'Project'}</span><span>·</span><span>Updated {formatRelative(drawerTask?.updated_at)}</span></div><div class="drawer-actions"><button class="button quiet-button" type="button" disabled={taskActionLoading === drawerTask?.id} on:click={() => runTaskAction(claimAction(drawerTask))}>{drawerTask.claimed_by && actorId(drawerTask.claimed_by) === user?.id && claimIsActive(drawerTask, pulseClock) ? '↻ Renew claim' : drawerTask.claimed_by && claimConflict(drawerTask, pulseClock) ? `Claimed by ${actorName(drawerTask.claimed_by) || 'agent'}` : '⚑ Claim task'}</button>{#if drawerTask.claimed_by && actorId(drawerTask.claimed_by) === user?.id && claimIsActive(drawerTask, pulseClock)}<button class="button quiet-button" type="button" disabled={taskActionLoading === drawerTask?.id} on:click={() => runTaskAction('release')}>Release</button>{/if}<button class="button complete-button" type="button" disabled={Boolean(drawerTask.completed_at) || taskActionLoading === drawerTask.id} on:click={() => runTaskAction('complete')}>{drawerTask.completed_at ? '✓ Completed' : '✓ Complete'}</button></div>{#if showAgentPulse(drawerTask)}<AgentWorkPanel task={drawerTask} now={pulseClock} actorLabel={agentLabelForTask(drawerTask)} />{/if}<section class="drawer-section"><div class="drawer-field-grid"><label>Priority<select bind:value={draftPriority}><option value="urgent">Urgent</option><option value="high">High</option><option value="normal">Normal</option><option value="low">Low</option></select></label><label>Due date<input type="date" bind:value={draftDueDate} /></label></div><label>Assignee<input bind:value={draftAssignee} placeholder="Actor ID (optional)" /></label><label>Labels <span class="optional">Comma separated</span><input bind:value={draftLabels} placeholder="frontend, design" /></label>{#if labels.filter((label) => label.project_id === drawerTask?.project_id).length}<div class="drawer-label-picker"><span class="optional">Project labels</span><div class="drawer-label-options">{#each labels.filter((label) => label.project_id === drawerTask?.project_id) as label (label.id)}<span class="drawer-label-option" style={`--label-color: ${label.color || '#8b7cf6'}`}><span>{label.name}</span><button class="icon-button tiny danger-button" type="button" aria-label={`Delete label ${label.name}`} disabled={labelDeleting === label.id} on:click|stopPropagation={() => deleteProjectLabel(label)}>×</button></span>{/each}</div></div>{/if}</section>
+        <TaskDependencyStatus task={drawerTask} mode="notice" />
+              <div class="drawer-scroll"><label class="drawer-title-label"><span class="sr-only">Task title</span><input id="drawer-title" class="drawer-title-input" data-dialog-initial-focus bind:value={draftTitle} /></label><div class="drawer-meta"><span class="task-project-marker" style={`--project-color: ${projectForTask(drawerTask)?.color || '#6d5efc'}`}></span><span>{projectForTask(drawerTask)?.name || 'Project'}</span><span>·</span><span>Updated {formatRelative(drawerTask?.updated_at)}</span></div><div class="drawer-actions"><button class="button quiet-button" type="button" title={dependencyBlocked(drawerTask) ? dependencyActionExplanation(drawerTask, claimAction(drawerTask) === 'renew' ? 'renew this claim' : 'claim this task') : undefined} disabled={taskActionLoading === drawerTask?.id || dependencyBlocked(drawerTask)} on:click={() => runTaskAction(claimAction(drawerTask))}>{drawerTask.claimed_by && actorId(drawerTask.claimed_by) === user?.id && claimIsActive(drawerTask, pulseClock) ? '↻ Renew claim' : drawerTask.claimed_by && claimConflict(drawerTask, pulseClock) ? `Claimed by ${actorName(drawerTask.claimed_by) || 'agent'}` : '⚑ Claim task'}</button>{#if drawerTask.claimed_by && actorId(drawerTask.claimed_by) === user?.id && claimIsActive(drawerTask, pulseClock)}<button class="button quiet-button" type="button" disabled={taskActionLoading === drawerTask?.id} on:click={() => runTaskAction('release')}>Release</button>{/if}<button class="button complete-button" type="button" title={dependencyBlocked(drawerTask) ? dependencyActionExplanation(drawerTask, 'complete this task') : undefined} disabled={Boolean(drawerTask.completed_at) || dependencyBlocked(drawerTask) || taskActionLoading === drawerTask.id} on:click={() => runTaskAction('complete')}>{drawerTask.completed_at ? '✓ Completed' : '✓ Complete'}</button></div>{#if showAgentPulse(drawerTask)}<AgentWorkPanel task={drawerTask} now={pulseClock} actorLabel={agentLabelForTask(drawerTask)} />{/if}<section class="drawer-section"><div class="drawer-field-grid"><label>Priority<select bind:value={draftPriority}><option value="urgent">Urgent</option><option value="high">High</option><option value="normal">Normal</option><option value="low">Low</option></select></label><label>Due date<input type="date" bind:value={draftDueDate} /></label></div><label>Assignee<input bind:value={draftAssignee} placeholder="Actor ID (optional)" /></label><label>Labels <span class="optional">Comma separated</span><input bind:value={draftLabels} placeholder="frontend, design" /></label>{#if labels.filter((label) => label.project_id === drawerTask?.project_id).length}<div class="drawer-label-picker"><span class="optional">Project labels</span><div class="drawer-label-options">{#each labels.filter((label) => label.project_id === drawerTask?.project_id) as label (label.id)}<span class="drawer-label-option" style={`--label-color: ${label.color || '#8b7cf6'}`}><span>{label.name}</span><button class="icon-button tiny danger-button" type="button" aria-label={`Delete label ${label.name}`} disabled={labelDeleting === label.id} on:click|stopPropagation={() => deleteProjectLabel(label)}>×</button></span>{/each}</div></div>{/if}</section>
                 <TaskDependencies
                   bind:this={drawerDependencyPanel}
                   task={drawerTask}

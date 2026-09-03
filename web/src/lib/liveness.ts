@@ -19,11 +19,20 @@ export function mergeAuthoritativeTask(local: Task | undefined, fetched: Task): 
   if (!local || local.version < fetched.version) return fetched;
   if (local.version > fetched.version) return local;
 
+  // Dependency readiness is a derived read model and can change without a
+  // task version bump. Preserve it only when a retained server omits it;
+  // otherwise the latest authoritative read owns the summary.
+  const authoritative = fetched.dependency_summary === undefined && local.dependency_summary !== undefined
+    ? { ...fetched, dependency_summary: local.dependency_summary }
+    : fetched;
   const localPulse = Date.parse(local.agent_work?.updated_at || '');
   const fetchedPulse = Date.parse(fetched.agent_work?.updated_at || '');
-  return Number.isFinite(localPulse) && (!Number.isFinite(fetchedPulse) || localPulse > fetchedPulse)
-    ? local
-    : fetched;
+  if (Number.isFinite(localPulse) && (!Number.isFinite(fetchedPulse) || localPulse > fetchedPulse)) {
+    return fetched.dependency_summary === undefined
+      ? local
+      : { ...local, dependency_summary: fetched.dependency_summary };
+  }
+  return authoritative;
 }
 
 /**
@@ -67,7 +76,14 @@ export function mergeAuthoritativeTaskList(
       // A successful local mutation is newer than a response that started
       // before it, even when the endpoint leaves task.version unchanged
       // (label/task-work metadata can follow that path).
-      if (mutation === 'upsert' && localTask && task.version <= localTask.version) return localTask;
+      if (mutation === 'upsert' && localTask && task.version <= localTask.version) {
+        // Equal-version dependency invalidations are authoritative even while
+        // an unrelated local metadata/heartbeat mutation is protected.
+        if (task.version === localTask.version && task.dependency_summary !== undefined) {
+          return { ...localTask, dependency_summary: task.dependency_summary };
+        }
+        return localTask;
+      }
       return mergeAuthoritativeTask(localTask, task);
     });
 

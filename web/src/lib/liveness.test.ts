@@ -74,6 +74,33 @@ describe('liveness task merges', () => {
     expect(mergeAuthoritativeTask(local, fetched)).toBe(local);
   });
 
+  it('accepts equal-version dependency readiness while preserving a newer local pulse', () => {
+    const local = {
+      ...task('1', 2, '2026-08-28T12:03:00Z'),
+      dependency_summary: { prerequisite_count: 1, unmet_prerequisite_count: 1, dependent_count: 0, blocked: true },
+      agent_work: {
+        operation_id: 'op-1',
+        actor_id: 'agent-1',
+        state: 'working' as const,
+        summary: 'Fresh local pulse',
+        checkpoint_refs: [],
+        started_at: '2026-08-28T12:00:00Z',
+        updated_at: '2026-08-28T12:03:00Z',
+        stale: false,
+        action_needed: false
+      }
+    };
+    const fetched = {
+      ...local,
+      dependency_summary: { prerequisite_count: 1, unmet_prerequisite_count: 0, dependent_count: 0, blocked: false },
+      agent_work: { ...local.agent_work, summary: 'Older response pulse', updated_at: '2026-08-28T12:02:00Z' }
+    };
+
+    const merged = mergeAuthoritativeTask(local, fetched);
+    expect(merged.agent_work).toBe(local.agent_work);
+    expect(merged.dependency_summary).toEqual(fetched.dependency_summary);
+  });
+
   it('preserves fetched collection removals', () => {
     const local = [task('1', 2, '2026-08-28T12:02:00Z'), task('2', 1, '2026-08-28T12:02:00Z')];
     const fetched = [task('1', 1, '2026-08-28T12:03:00Z')];
@@ -104,6 +131,23 @@ describe('liveness task merges', () => {
     const fetched = [{ ...task('1', 2, '2026-08-28T12:04:00Z'), title: 'Stale response' }];
 
     expect(mergeAuthoritativeTaskList(local, fetched, new Map([['1', 'upsert']]))[0]).toBe(local[0]);
+  });
+
+  it('merges equal-version dependency readiness into a protected local mutation', () => {
+    const local = [{
+      ...task('1', 2, '2026-08-28T12:03:00Z'),
+      title: 'Saved locally',
+      dependency_summary: { prerequisite_count: 1, unmet_prerequisite_count: 1, dependent_count: 0, blocked: true }
+    }];
+    const fetched = [{
+      ...task('1', 2, '2026-08-28T12:04:00Z'),
+      title: 'Stale response',
+      dependency_summary: { prerequisite_count: 1, unmet_prerequisite_count: 0, dependent_count: 0, blocked: false }
+    }];
+
+    const merged = mergeAuthoritativeTaskList(local, fetched, new Map([['1', 'upsert']]))[0];
+    expect(merged.title).toBe('Saved locally');
+    expect(merged.dependency_summary).toEqual(fetched[0].dependency_summary);
   });
 
   it('suppresses a stale deleted task without retaining other omissions', () => {

@@ -91,6 +91,22 @@ describe('board state helpers', () => {
     expect(filterTasks(tasks, columns, { query: '', priority: 'all', label: 'all', assignee: 'all', state: 'active' }).map((task) => task.id)).toEqual(['2']);
   });
 
+  it('filters dependency-blocked and dependency-ready tasks with server-equivalent semantics', () => {
+    const blocked = {
+      ...tasks[0],
+      dependency_summary: { prerequisite_count: 2, unmet_prerequisite_count: 1, dependent_count: 0, blocked: true }
+    };
+    const ready = {
+      ...tasks[1],
+      dependency_summary: { prerequisite_count: 1, unmet_prerequisite_count: 0, dependent_count: 2, blocked: false }
+    };
+    const noDependencies = { ...tasks[0], id: '3', key: 'TC-3' };
+    const base = { query: '', priority: 'all', label: 'all', assignee: 'all', state: 'all' } as const;
+
+    expect(filterTasks([blocked, ready, noDependencies], columns, { ...base, dependency: 'blocked' }).map((task) => task.id)).toEqual([blocked.id]);
+    expect(filterTasks([blocked, ready, noDependencies], columns, { ...base, dependency: 'ready' }).map((task) => task.id)).toEqual([ready.id]);
+  });
+
   it('calculates an append position and moves a task without mutating input', () => {
     expect(nextPosition(tasks, 'active')).toBe(1);
     const moved = moveTaskLocal(tasks, '1', 'active');
