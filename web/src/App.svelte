@@ -109,6 +109,8 @@
   type MyWorkView = 'live' | 'assigned';
   type DrawerView = 'details' | 'activity';
   type MyWorkRow = { task: Task; project?: Project; column?: Column };
+  type TaskModalSuggestionField = 'title' | 'description' | 'priority';
+  type TaskModalAppliedFields = Record<TaskModalSuggestionField, boolean>;
 
   const priorityLabels: Record<Priority, string> = {
     low: 'Low',
@@ -336,6 +338,14 @@
   let taskModalAssistStage = '';
   let taskModalNeedsCodex = false;
   let taskModalAssistController: AbortController | null = null;
+  let taskModalAppliedFields: TaskModalAppliedFields = { title: false, description: false, priority: false };
+  let taskModalApplyNotice = '';
+  let taskModalHasAppliedAll = false;
+  let taskModalSuggestionCollapsed = false;
+  let taskModalTitleApplied = false;
+  let taskModalDescriptionApplied = false;
+  let taskModalPriorityApplied = false;
+  let taskModalAllFieldsApplied = false;
 
   let showBugModal = false;
   let bugModalLoading = false;
@@ -437,6 +447,10 @@
         completion_percentage: project.task_count ? ((project.completed_task_count ?? project.completed_count ?? 0) / project.task_count) * 100 : 0
       }));
   $: taskModalProject = projects.find((project) => project.id === taskModalProjectId);
+  $: taskModalTitleApplied = Boolean(taskModalSuggestion && taskModalAppliedFields.title && taskModalTitle === taskModalSuggestion.title);
+  $: taskModalDescriptionApplied = Boolean(taskModalSuggestion && taskModalAppliedFields.description && taskModalDescription === suggestionDescription(taskModalSuggestion));
+  $: taskModalPriorityApplied = Boolean(taskModalSuggestion && taskModalAppliedFields.priority && taskModalPriority === taskModalSuggestion.priority);
+  $: taskModalAllFieldsApplied = taskModalTitleApplied && taskModalDescriptionApplied && taskModalPriorityApplied;
 
   const focusableSelector = [
     'a[href]',
@@ -2003,6 +2017,7 @@
     taskModalAssistStage = '';
     taskModalNeedsCodex = false;
     taskModalError = '';
+    resetTaskModalSuggestionState();
     rememberDialogFocus('[data-task-modal-trigger]');
     showTaskModal = true;
     projectSwitcherOpen = false;
@@ -2033,7 +2048,15 @@
   function changeTaskModalProject() {
     taskModalSuggestion = null;
     taskModalNeedsCodex = false;
+    resetTaskModalSuggestionState();
     void loadTaskModalColumns(taskModalProjectId);
+  }
+
+  function resetTaskModalSuggestionState() {
+    taskModalAppliedFields = { title: false, description: false, priority: false };
+    taskModalApplyNotice = '';
+    taskModalHasAppliedAll = false;
+    taskModalSuggestionCollapsed = false;
   }
 
   function suggestionDescription(suggestion: TaskDraftSuggestion): string {
@@ -2041,18 +2064,34 @@
     return [suggestion.description.trim(), `## Acceptance criteria\n${criteria}`].filter(Boolean).join('\n\n');
   }
 
-  function applyLunaField(field: 'title' | 'description' | 'priority') {
+  function lunaFieldLabel(field: TaskModalSuggestionField): string {
+    return field === 'description' ? 'Description' : field === 'priority' ? 'Priority' : 'Title';
+  }
+
+  function lunaSuggestionFieldValue(field: TaskModalSuggestionField): string {
+    if (!taskModalSuggestion) return '';
+    if (field === 'description') return suggestionDescription(taskModalSuggestion);
+    if (field === 'priority') return taskModalSuggestion.priority;
+    return taskModalSuggestion.title;
+  }
+
+  function applyLunaField(field: TaskModalSuggestionField) {
     if (!taskModalSuggestion) return;
-    if (field === 'title') taskModalTitle = taskModalSuggestion.title;
-    if (field === 'description') taskModalDescription = suggestionDescription(taskModalSuggestion);
-    if (field === 'priority') taskModalPriority = taskModalSuggestion.priority;
+    const value = lunaSuggestionFieldValue(field);
+    if (field === 'title') taskModalTitle = value;
+    if (field === 'description') taskModalDescription = value;
+    if (field === 'priority') taskModalPriority = value as Priority;
+    taskModalAppliedFields = { ...taskModalAppliedFields, [field]: true };
+    taskModalApplyNotice = `${lunaFieldLabel(field)} suggestion applied to the task form.`;
   }
 
   function applyAllLunaFields() {
     applyLunaField('title');
     applyLunaField('description');
     applyLunaField('priority');
-    toast('success', 'Luna’s suggestion was applied. You can edit every field before creating the task.');
+    taskModalHasAppliedAll = true;
+    taskModalSuggestionCollapsed = true;
+    taskModalApplyNotice = 'Luna applied all suggested fields. Review the populated task details before creating.';
   }
 
   async function assistTaskWithLuna() {
@@ -2068,12 +2107,14 @@
     taskModalAssistStage = 'Reviewing relevant project history…';
     taskModalError = '';
     taskModalNeedsCodex = false;
+    resetTaskModalSuggestionState();
     try {
       const suggestion = await api.draftTask(taskModalProjectId, query, controller.signal);
       if (controller.signal.aborted || taskModalAssistController !== controller) return;
       taskModalAssistStage = 'Checking the draft and priority…';
       await tick();
       taskModalSuggestion = suggestion;
+      resetTaskModalSuggestionState();
     } catch (error) {
       if (controller.signal.aborted) return;
       if (error instanceof ApiError && error.code === 'codex_not_connected') {
@@ -3627,8 +3668,8 @@
         {#if taskModalError}<div class="inline-alert error" role="alert"><span>!</span>{taskModalError}</div>{/if}
         <form on:submit|preventDefault={createGlobalTask}>
           <div class="form-row task-destination-row"><label>Project<select bind:value={taskModalProjectId} on:change={changeTaskModalProject}>{#each projects as project}<option value={project.id}>{project.key} · {project.name}</option>{/each}</select></label><label>Column<select bind:value={taskModalColumnId} disabled={taskModalLoading || !taskModalColumns.length}>{#each taskModalColumns as column}<option value={column.id}>{column.name}</option>{/each}</select></label></div>
-          <section class="luna-assist-panel" aria-labelledby="luna-assist-heading">
-            <div class="luna-assist-heading"><div><span class="eyebrow">Optional</span><h3 id="luna-assist-heading">Plan it with Luna</h3><p>Describe the outcome. Luna will use relevant project history to suggest the task and priority.</p></div><span class="luna-mark" aria-hidden="true">✦</span></div>
+          <section class="luna-assist-panel" aria-labelledby="luna-assist-heading" aria-describedby="luna-assist-description">
+            <div class="luna-assist-heading"><div><span class="eyebrow">Optional assist</span><h3 id="luna-assist-heading">Plan it with Luna</h3><p id="luna-assist-description">Describe the outcome and Luna will suggest the task details.</p></div><span class="luna-mark" aria-hidden="true">✦</span></div>
             <label>Rough idea<textarea data-dialog-initial-focus rows="2" bind:value={taskModalIdea} placeholder="e.g. Let self-hosted users connect their own Codex subscription"></textarea></label>
             {#if taskModalAssisting}<div class="luna-progress" aria-live="polite"><span class="button-spinner"></span><span>{taskModalAssistStage}</span><button class="text-button" type="button" on:click={cancelTaskAssist}>Cancel</button></div>
             {:else}<button class="button luna-button" type="button" disabled={!taskModalIdea.trim() && !taskModalTitle.trim()} on:click={assistTaskWithLuna}>✦ {taskModalSuggestion ? 'Try again with Luna' : 'Assist with Luna'}</button>{/if}
@@ -3636,18 +3677,24 @@
               <div class="luna-connect" role="status"><div><strong>Connect your Codex subscription</strong><p>This draft stays here while you finish device-code login.</p></div>{#if codexLogin}<div class="codex-code-row"><code>{codexLogin.user_code}</code><button class="button quiet-button compact-button" type="button" on:click={copyCodexCode}>Copy</button></div><div class="form-actions"><button class="text-button" type="button" on:click={cancelCodexLogin}>Cancel login</button><a class="button primary" href={codexLogin.verification_url} target="_blank" rel="noreferrer">Open ChatGPT ↗</a></div>{:else}<button class="button primary" type="button" disabled={codexLoading} on:click={connectCodex}>{#if codexLoading}<span class="button-spinner"></span>{/if}Connect Codex</button>{/if}</div>
             {/if}
             {#if taskModalSuggestion}
-              <div class="luna-preview" aria-live="polite"><div class="luna-preview-header"><div><span class="eyebrow">Suggestion ready</span><h4>Review before applying</h4></div><button class="button primary compact-button" type="button" on:click={applyAllLunaFields}>Apply all</button></div>
-                <div class="luna-preview-field"><span><strong>Title</strong>{taskModalSuggestion.title}</span><button class="text-button" type="button" on:click={() => applyLunaField('title')}>Apply</button></div>
-                <div class="luna-preview-field"><span><strong>Description &amp; acceptance criteria</strong>{taskModalSuggestion.description}<small>{taskModalSuggestion.acceptance_criteria.length} measurable criteria</small></span><button class="text-button" type="button" on:click={() => applyLunaField('description')}>Apply</button></div>
-                <div class="luna-preview-field"><span><strong>Priority</strong><span class={`priority-pill priority-${taskModalSuggestion.priority}`}>{priorityLabels[taskModalSuggestion.priority]}</span><small>{taskModalSuggestion.rationale}</small></span><button class="text-button" type="button" on:click={() => applyLunaField('priority')}>Apply</button></div>
+              <div class="luna-preview" class:collapsed={taskModalSuggestionCollapsed}>
+                <div class="luna-preview-header"><div><span class="eyebrow">Suggestion ready</span><h4>{taskModalSuggestionCollapsed && taskModalAllFieldsApplied ? 'Suggestion applied' : 'Review before applying'}</h4></div><div class="luna-preview-actions"><button class="button primary compact-button" type="button" disabled={taskModalAllFieldsApplied} on:click={applyAllLunaFields}>{taskModalAllFieldsApplied ? '✓ All applied' : taskModalHasAppliedAll ? 'Reapply all' : 'Apply all'}</button><button class="text-button luna-review-toggle" type="button" aria-expanded={!taskModalSuggestionCollapsed} aria-controls="luna-suggestion-details" on:click={() => taskModalSuggestionCollapsed = !taskModalSuggestionCollapsed}>{taskModalSuggestionCollapsed ? 'Review suggestion' : 'Hide suggestion'}</button></div></div>
+                {#if taskModalApplyNotice}<div class="luna-feedback" class:luna-apply-success={taskModalAllFieldsApplied} role="status" aria-live="polite"><span class="luna-feedback-icon" aria-hidden="true">{taskModalAllFieldsApplied ? '✓' : 'i'}</span><span>{taskModalHasAppliedAll && !taskModalAllFieldsApplied ? 'Task details changed after applying. Review the suggestion or reapply all.' : taskModalApplyNotice}</span></div>{/if}
+                <div id="luna-suggestion-details" class="luna-suggestion-details" hidden={taskModalSuggestionCollapsed}>
+                  <div class="luna-preview-field" data-luna-field="title"><span><strong>Title</strong>{taskModalSuggestion.title}</span><button class="text-button luna-apply-button" class:applied={taskModalTitleApplied} type="button" disabled={taskModalTitleApplied} aria-label={taskModalTitleApplied ? 'Title suggestion applied' : 'Apply title suggestion'} on:click={() => applyLunaField('title')}>{taskModalTitleApplied ? '✓ Applied' : 'Apply'}</button></div>
+                  <div class="luna-preview-field" data-luna-field="description"><span><strong>Description &amp; acceptance criteria</strong>{taskModalSuggestion.description}<small>{taskModalSuggestion.acceptance_criteria.length} measurable criteria</small></span><button class="text-button luna-apply-button" class:applied={taskModalDescriptionApplied} type="button" disabled={taskModalDescriptionApplied} aria-label={taskModalDescriptionApplied ? 'Description suggestion applied' : 'Apply description suggestion'} on:click={() => applyLunaField('description')}>{taskModalDescriptionApplied ? '✓ Applied' : 'Apply'}</button></div>
+                  <div class="luna-preview-field" data-luna-field="priority"><span><strong>Priority</strong><span class={`priority-pill priority-${taskModalSuggestion.priority}`}>{priorityLabels[taskModalSuggestion.priority]}</span><small>{taskModalSuggestion.rationale}</small></span><button class="text-button luna-apply-button" class:applied={taskModalPriorityApplied} type="button" disabled={taskModalPriorityApplied} aria-label={taskModalPriorityApplied ? 'Priority suggestion applied' : 'Apply priority suggestion'} on:click={() => applyLunaField('priority')}>{taskModalPriorityApplied ? '✓ Applied' : 'Apply'}</button></div>
                 {#if taskModalSuggestion.supporting_task_keys.length}<div class="luna-sources"><strong>Related tasks</strong>{#each taskModalSuggestion.supporting_task_keys as key}<a href={taskDeepLink(taskModalProject?.slug || activeProjectSlug, key)} on:click={closeTaskModal}>{key}</a>{/each}</div>{/if}
+                </div>
               </div>
             {/if}
           </section>
-          <label>Task title<input bind:value={taskModalTitle} placeholder="What should move forward?" /></label>
-          <label>Description <span class="optional">Optional · Markdown supported</span><textarea rows="3" bind:value={taskModalDescription} placeholder="Add the context your future self will need."></textarea></label>
-          <div class="form-row"><label>Priority<select bind:value={taskModalPriority}><option value="urgent">Urgent</option><option value="high">High</option><option value="normal">Normal</option><option value="low">Low</option></select></label><label>Due date <span class="optional">Optional</span><input type="date" bind:value={taskModalDueDate} /></label></div>
-          <label>Assignee <span class="optional">Optional</span><input bind:value={taskModalAssignee} placeholder="Actor ID" /></label>
+          <section class="task-details-fields" aria-labelledby="task-details-heading"><div class="task-details-heading"><div><span class="eyebrow">Task details</span><h3 id="task-details-heading">Shape the work</h3></div><span>Review before creating</span></div>
+            <label>Task title<input bind:value={taskModalTitle} placeholder="What should move forward?" /></label>
+            <label>Description <span class="optional">Optional · Markdown supported</span><textarea rows="3" bind:value={taskModalDescription} placeholder="Add the context your future self will need."></textarea></label>
+            <div class="form-row"><label>Priority<select bind:value={taskModalPriority}><option value="urgent">Urgent</option><option value="high">High</option><option value="normal">Normal</option><option value="low">Low</option></select></label><label>Due date <span class="optional">Optional</span><input type="date" bind:value={taskModalDueDate} /></label></div>
+            <label>Assignee <span class="optional">Optional</span><input bind:value={taskModalAssignee} placeholder="Actor ID" /></label>
+          </section>
           <div class="modal-actions"><button class="text-button" type="button" on:click={closeTaskModal}>Cancel</button><button class="button primary" type="submit" disabled={taskModalCreating || taskModalLoading || !taskModalTitle.trim()}>{#if taskModalCreating}<span class="button-spinner"></span>{/if}Create task</button></div>
         </form>
       </div>
