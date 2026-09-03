@@ -165,6 +165,45 @@ not_contains 'systemctl stop helm.service 2>/dev/null || true' "$INSTALL"
 contains 'Keep guest installer stdout/stderr attached' "$GATEWAY"
 contains 'pre_upgrade_backup=...' "$GATEWAY"
 
+# Exercise the first-upgrade compatibility aliases under the installer's
+# nounset contract. Keep filesystem commands mocked so this regression test
+# executes the production helper bodies without touching the host.
+source <(awk '/^install_compat_symlink\(\)/,/^}/' "$INSTALL")
+source <(awk '/^install_unit_alias\(\)/,/^}/' "$INSTALL")
+(
+	ln() { return 0; }
+	mv() { return 0; }
+	rm() { return 0; }
+	install_compat_symlink helm-backup roadmap-backup
+	install_unit_alias helm.service roadmap.service
+)
+printf 'first_upgrade_alias_runtime_test=ok\n'
+
+# If a first Helm install fails after stopping Roadmap but before installing
+# helm.service, recovery must restart the retained unit instead of leaving the
+# guest offline.
+source <(awk '/^restore_previous\(\)/,/^}/' "$INSTALL")
+(
+	previous_target=/var/lib/roadmap/releases/0000000000000000000000000000000000000000
+	previous_sha=0000000000000000000000000000000000000000
+	recovery_calls="$fixture/first-upgrade-recovery.calls"
+	: > "$recovery_calls"
+	stop_unit() { return 0; }
+	install_release_env() { return 0; }
+	atomic_switch() { return 0; }
+	healthy_revision() { return 0; }
+	systemctl() {
+		printf '%s\n' "$*" >> "$recovery_calls"
+		[[ "${1:-} ${2:-}" != 'start helm.service' ]]
+	}
+	restore_previous
+	contains 'start helm.service' "$recovery_calls"
+	contains 'start roadmap.service' "$recovery_calls"
+	contains 'is-active --quiet roadmap.service' "$recovery_calls"
+	contains 'start cloudflared.service' "$recovery_calls"
+)
+printf 'first_upgrade_recovery_runtime_test=ok\n'
+
 # A retained binary may predate migration-info. The installer must ask the
 # candidate binary for metadata rather than selecting the retained executable
 # and failing before the first metadata-bearing backup is published.

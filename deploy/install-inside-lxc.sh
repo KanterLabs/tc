@@ -333,7 +333,8 @@ RUNNER
 }
 
 install_compat_symlink() {
-	local canonical=$1 legacy=$2 temporary="/usr/local/sbin/.${legacy}.new.$$"
+	local canonical=$1 legacy=$2 temporary
+	temporary="/usr/local/sbin/.${legacy}.new.$$"
 	[[ "$canonical" =~ ^helm-[a-z-]+$ && "$legacy" =~ ^roadmap-[a-z-]+$ ]] || return 1
 	[[ ! -e "$temporary" && ! -L "$temporary" ]] || return 1
 	ln -s -- "$canonical" "$temporary" || return 1
@@ -344,7 +345,8 @@ install_compat_symlink() {
 }
 
 install_unit_alias() {
-	local canonical=$1 legacy=$2 temporary="/etc/systemd/system/.${legacy}.new.$$"
+	local canonical=$1 legacy=$2 temporary
+	temporary="/etc/systemd/system/.${legacy}.new.$$"
 	[[ "$canonical" =~ ^helm[-a-z]*\.(service|timer)$ && "$legacy" =~ ^roadmap[-a-z]*\.(service|timer)$ ]] || return 1
 	[[ ! -e "$temporary" && ! -L "$temporary" ]] || return 1
 	ln -s -- "$canonical" "$temporary" || return 1
@@ -434,16 +436,21 @@ disable_unused_postfix() {
 }
 
 restore_previous() {
+	local app_unit=helm.service
 	[[ -n "$previous_target" ]] || return 1
 	stop_unit cloudflared.service || return 1
 	stop_unit roadmap.service || return 1
 	stop_unit helm.service || return 1
 	install_release_env "$previous_target" "$previous_sha" || return 1
 	atomic_switch "$previous_target" || return 1
-	systemctl start helm.service || return 1
+	if ! systemctl start "$app_unit"; then
+		# On the first Helm upgrade the canonical unit may not have been
+		# installed yet. The retained Roadmap unit is still the recovery path.
+		app_unit=roadmap.service
+		systemctl start "$app_unit" || return 1
+	fi
 	healthy_revision "$previous_sha" || return 1
-	systemctl is-active --quiet helm.service || return 1
-	systemctl is-active --quiet roadmap.service || return 1
+	systemctl is-active --quiet "$app_unit" || return 1
 	systemctl start cloudflared.service || return 1
 	systemctl is-active --quiet cloudflared.service
 }
