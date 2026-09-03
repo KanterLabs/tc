@@ -55,9 +55,12 @@ export HELM_MIGRATION_DIGEST=000000000000000000000000000000000000000000000000000
 # gateway sees SSH_ORIGINAL_COMMAND, while local argv is an explicit root-only
 # test escape hatch. No deploy-key holder can request a shell or arbitrary sudo.
 contains 'command=\"sudo -n /usr/local/sbin/helm-deploy-gateway\"' "$BOOTSTRAP"
+contains 'command=\"sudo -n /usr/local/sbin/helm-beta-deploy-gateway\"' "$BOOTSTRAP"
 contains 'env_keep += "SSH_ORIGINAL_COMMAND SSH_CONNECTION"' "$BOOTSTRAP"
 contains 'ALL=(root) NOPASSWD: /usr/local/sbin/helm-deploy-gateway' "$BOOTSTRAP"
+contains 'ALL=(root) NOPASSWD: /usr/local/sbin/helm-beta-deploy-gateway' "$BOOTSTRAP"
 contains '/var/lib/roadmap-deploy/staging' "$BOOTSTRAP"
+contains '/var/lib/helm-beta-deploy/staging' "$BOOTSTRAP"
 contains 'mktemp -d "$base/bootstrap.XXXXXX"' "$BOOTSTRAP"
 contains 'release-signing-public.pem' "$BOOTSTRAP"
 contains '[[ ${SSH_ORIGINAL_COMMAND+x} ]]' "$GATEWAY"
@@ -69,6 +72,13 @@ contains 'timeout --foreground "$ARCHIVE_INGEST_TIMEOUT"' "$GATEWAY"
 contains 'head -c "$((ARCHIVE_MAX_BYTES + 1))" > "$ARCHIVE"' "$GATEWAY"
 contains 'release provenance verification failed' "$GATEWAY"
 contains '"$VERIFY_SCRIPT" "$ARCHIVE" "$SHA" "$SIGNING_PUBLIC_KEY"' "$GATEWAY"
+contains 'GATEWAY_BASENAME=${BASH_SOURCE[0]##*/}' "$GATEWAY"
+contains '[[ "$GATEWAY_BASENAME" = helm-beta-deploy-gateway ]]' "$GATEWAY"
+contains 'CTID=106' "$GATEWAY"
+contains 'CT_NAME=helm-beta' "$GATEWAY"
+contains 'CT_IP=10.0.0.39' "$GATEWAY"
+contains 'SIGNING_PUBLIC_KEY=/etc/helm-beta-deploy/release-signing-public.pem' "$GATEWAY"
+contains "CT_TAGS='beta;service;lan'" "$GATEWAY"
 
 # The verifier must run before any deploy-branch pct state change. Status and
 # rollback are intentionally payload-free actions and do not need a release
@@ -86,6 +96,8 @@ contains 'ssh -o BatchMode=yes -T "$PVE_DEPLOY_USER@$PVE_HOST" status < /dev/nul
 contains 'ssh -o BatchMode=yes -T "$PVE_DEPLOY_USER@$PVE_HOST" "rollback $SHA" < /dev/null' "$DEPLOY_CI"
 not_contains 'scp -q' "$DEPLOY_CI"
 not_contains '/usr/local/sbin/helm-deploy-gateway' "$DEPLOY_CI"
+contains 'HELM_DEPLOY_ENVIRONMENT must be production or beta' "$DEPLOY_CI"
+contains 'PVE_DEPLOY_USER must be helm-beta-deploy for beta deployments' "$DEPLOY_CI"
 
 # Only the intended command alphabet can reach gateway action dispatch.
 for meta in "*';'*" "*'&'*" "*'|'*" "*'\$'*" "*'\`'*" "*'<'*" "*'>'*" "*'('*" "*')'*" "*'\\\\'*"; do
@@ -505,6 +517,40 @@ contains 'VMID 103 is assigned to a QEMU VM' "$gateway_status_output"
 not_contains 'current_sha=none' "$gateway_status_output"
 [[ ! -s "$gateway_status_calls" ]] || fail 'gateway status touched pct during a QEMU VMID collision'
 printf 'gateway_qemu_vmid_collision_test=ok\n'
+
+# Installing the same gateway under the exact beta basename must select only
+# CT 106 and the beta host staging root. The selection is not controllable by
+# SSH_ORIGINAL_COMMAND or an environment variable supplied by the key holder.
+gateway_beta_script="$fixture/helm-beta-deploy-gateway"
+sed -e '/must run as root/d' -e '/root deployment directory owner is invalid/d' \
+	-e "s|/var/lib/helm-beta-deploy|$fixture/gateway-beta-deploy|g" \
+	"$GATEWAY" > "$gateway_beta_script"
+chmod 0755 "$gateway_beta_script"
+gateway_beta_calls="$fixture/gateway-beta.calls"
+gateway_beta_output="$fixture/gateway-beta.out"
+: > "$gateway_beta_calls"
+mkdir -m 0700 "$fixture/gateway-beta-deploy"
+gateway_beta_qm() {
+	printf "Configuration file 'nodes/pve/qemu-server/%s.conf' does not exist\n" "$1" >&2
+	return 1
+}
+gateway_beta_pct() {
+	printf '%s\n' "$*" >> "$GATEWAY_BETA_CALLS"
+	return 1
+}
+if ! (
+	export GATEWAY_BETA_CALLS="$gateway_beta_calls"
+	qm() { gateway_beta_qm "$@"; }
+	pct() { gateway_beta_pct "$@"; }
+	export -f qm pct gateway_beta_qm gateway_beta_pct
+	HELM_GATEWAY_LOCAL_TEST=1 "$gateway_beta_script" status
+) >"$gateway_beta_output" 2>&1; then
+	fail 'beta gateway status fixture failed'
+fi
+contains 'current_sha=none' "$gateway_beta_output"
+contains 'config 106' "$gateway_beta_calls"
+not_contains 'config 103' "$gateway_beta_calls"
+printf 'gateway_beta_profile_test=ok\n'
 
 gateway_drift_config=${gateway_canonical_config/hostname: roadmap/hostname: unrelated}
 gateway_extra_option_config="$gateway_canonical_config"$'\nfeatures: nesting=1'
@@ -1259,14 +1305,26 @@ cloudflare_prepare_failure_case tunnel-token \
 cloudflare_prepare_failure_case invalid-output '' directory
 printf 'cloudflare_prepare_recovery_runtime_tests=ok\n'
 
-# Production mutation jobs alone share the fixed non-canceling lock; PR/check
-# traffic remains ref-scoped. Manual deployment/rollback is main-only and its
-# scripts are checked out at the selected main SHA.
+# Production and beta mutation jobs each use their own fixed non-canceling
+# lock; PR/check traffic remains ref-scoped. Deployment and rollback stay
+# branch-scoped and their scripts are checked out at the selected SHA.
 contains 'group: helm-${{ github.workflow }}-${{ github.ref }}' "$WORKFLOW"
-contains "cancel-in-progress: \${{ github.ref != 'refs/heads/main' }}" "$WORKFLOW"
+contains "cancel-in-progress: \${{ github.ref != 'refs/heads/main' && github.ref != 'refs/heads/beta' }}" "$WORKFLOW"
 count_contains 2 'group: helm-production' "$WORKFLOW"
-count_contains 2 'cancel-in-progress: false' "$WORKFLOW"
+count_contains 2 'group: helm-beta' "$WORKFLOW"
+count_contains 4 'cancel-in-progress: false' "$WORKFLOW"
 contains "github.ref == 'refs/heads/main'" "$WORKFLOW"
+contains "github.ref == 'refs/heads/beta'" "$WORKFLOW"
+contains 'branches: [main, beta]' "$WORKFLOW"
+contains 'name: beta' "$WORKFLOW"
+contains 'url: https://beta.tc.shanekanterman.dev' "$WORKFLOW"
+contains 'HELM_DEPLOY_ENVIRONMENT: beta' "$WORKFLOW"
+contains 'BETA_CLOUDFLARE_API_TOKEN' "$WORKFLOW"
+contains 'BETA_DEPLOY_SSH_KEY' "$WORKFLOW"
+contains 'BETA_DEPLOY_KNOWN_HOSTS' "$WORKFLOW"
+contains 'BETA_RELEASE_SIGNING_KEY' "$WORKFLOW"
+contains 'BETA_CF_ACCESS_CLIENT_ID' "$WORKFLOW"
+contains 'BETA_CF_ACCESS_CLIENT_SECRET' "$WORKFLOW"
 contains 'ref: ${{ github.sha }}' "$WORKFLOW"
 contains 'actions/upload-artifact@' "$WORKFLOW"
 contains '# v7.0.1' "$WORKFLOW"
@@ -1284,8 +1342,8 @@ contains 'HELM_REQUIRE_DURABLE_SERVICE_TOKEN_CAPTURE: "1"' "$WORKFLOW"
 contains 'cloudflare_dir="$RUNNER_TEMP/helm-cloudflare"' "$WORKFLOW"
 contains 'HELM_CLOUDFLARED_TOKEN_FILE=%s' "$WORKFLOW"
 contains 'HELM_OWNER_ENV_FILE=%s' "$WORKFLOW"
-count_contains 2 'rm -rf -- "$RUNNER_TEMP/helm-ssh" "$RUNNER_TEMP/helm-cloudflare"' "$WORKFLOW"
-count_contains 2 'rm -f -- dist/cloudflared.token dist/owner.env dist/helm-access-token.env' "$WORKFLOW"
+count_contains 4 'rm -rf -- "$RUNNER_TEMP/helm-ssh" "$RUNNER_TEMP/helm-cloudflare"' "$WORKFLOW"
+count_contains 4 'rm -f -- dist/cloudflared.token dist/owner.env dist/helm-access-token.env' "$WORKFLOW"
 contains 'HELM_CLOUDFLARED_TOKEN_FILE' "$ROOT_DIR/deploy/build-bundle.sh"
 contains 'HELM_OWNER_ENV_FILE' "$ROOT_DIR/deploy/build-bundle.sh"
 contains 'Capture previous release for recovery' "$WORKFLOW"

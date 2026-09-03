@@ -19,6 +19,15 @@ TOKEN_OUTPUT=${2:-}
 OWNER_ENV_OUTPUT=${3:-}
 SERVICE_TOKEN_OUTPUT=${4:-$(compat_env HELM_ACCESS_TOKEN_OUTPUT ROADMAP_ACCESS_TOKEN_OUTPUT "$ROOT_DIR/dist/helm-access-token.env")}
 REQUIRE_DURABLE_SERVICE_TOKEN_CAPTURE=$(compat_env HELM_REQUIRE_DURABLE_SERVICE_TOKEN_CAPTURE ROADMAP_REQUIRE_DURABLE_SERVICE_TOKEN_CAPTURE 0)
+DEPLOY_ENVIRONMENT=${HELM_DEPLOY_ENVIRONMENT:-production}
+
+case "$DEPLOY_ENVIRONMENT" in
+	production|beta) ;;
+	*)
+		printf 'HELM_DEPLOY_ENVIRONMENT must be exactly production or beta\n' >&2
+		exit 1
+		;;
+esac
 
 [[ "$REQUIRE_DURABLE_SERVICE_TOKEN_CAPTURE" = 0 || "$REQUIRE_DURABLE_SERVICE_TOKEN_CAPTURE" = 1 ]] || {
 	printf 'HELM_REQUIRE_DURABLE_SERVICE_TOKEN_CAPTURE must be 0 or 1\n' >&2
@@ -72,23 +81,43 @@ chmod 0600 "$CF_HEADER_FILE"
 printf 'Authorization: Bearer %s\n' "$CLOUDFLARE_API_TOKEN" > "$CF_HEADER_FILE"
 ACCOUNT_ID=090ae73dce25f4eca9a53ee396fdc916
 ZONE_ID=1206ce4daa0fe3c4791f9df9069764f6
-PUBLIC_HOST=tc.shanekanterman.dev
-PUBLIC_URL=https://tc.shanekanterman.dev
+case "$DEPLOY_ENVIRONMENT" in
+	production)
+		PUBLIC_HOST=tc.shanekanterman.dev
+		PUBLIC_URL=https://tc.shanekanterman.dev
+		API_PATH="$PUBLIC_HOST/api/v1/*"
+		TUNNEL_NAME=roadmap-homelab
+		UI_APP_NAME='Helm owner UI'
+		API_APP_NAME='Helm agents API'
+		OWNER_POLICY_NAME='Helm owner only'
+		SERVICE_TOKEN_NAME='Helm agents'
+		SERVICE_POLICY_NAME='Helm agents Service Auth'
+		LEGACY_OWNER_POLICY_NAME='Roadmap owner only'
+		LEGACY_SERVICE_TOKEN_NAME='Roadmap agents'
+		LEGACY_SERVICE_POLICY_NAME='Roadmap agents Service Auth'
+		;;
+	beta)
+		PUBLIC_HOST=beta.tc.shanekanterman.dev
+		PUBLIC_URL=https://beta.tc.shanekanterman.dev
+		API_PATH="$PUBLIC_HOST/api/v1/*"
+		TUNNEL_NAME=helm-beta-homelab
+		UI_APP_NAME='Helm beta owner UI'
+		API_APP_NAME='Helm beta agents API'
+		OWNER_POLICY_NAME='Helm beta owner only'
+		SERVICE_TOKEN_NAME='Helm beta agents'
+		SERVICE_POLICY_NAME='Helm beta agents Service Auth'
+		# Beta is a separate trust boundary. It must never discover, rename, or
+		# reuse a production-era Roadmap/Helm object by legacy name.
+		LEGACY_OWNER_POLICY_NAME=
+		LEGACY_SERVICE_TOKEN_NAME=
+		LEGACY_SERVICE_POLICY_NAME=
+		;;
+esac
 CONFIGURED_PUBLIC_ORIGIN=$(compat_env HELM_PUBLIC_ORIGIN ROADMAP_PUBLIC_ORIGIN)
 if [[ -n "$CONFIGURED_PUBLIC_ORIGIN" && "$CONFIGURED_PUBLIC_ORIGIN" != "$PUBLIC_URL" ]]; then
 	printf 'HELM_PUBLIC_ORIGIN must be exactly %s\n' "$PUBLIC_URL" >&2
 	exit 1
 fi
-API_PATH="$PUBLIC_HOST/api/v1/*"
-TUNNEL_NAME=roadmap-homelab
-UI_APP_NAME='Helm owner UI'
-API_APP_NAME='Helm agents API'
-OWNER_POLICY_NAME='Helm owner only'
-SERVICE_TOKEN_NAME='Helm agents'
-SERVICE_POLICY_NAME='Helm agents Service Auth'
-LEGACY_OWNER_POLICY_NAME='Roadmap owner only'
-LEGACY_SERVICE_TOKEN_NAME='Roadmap agents'
-LEGACY_SERVICE_POLICY_NAME='Roadmap agents Service Auth'
 
 cf_request() {
 	local method=$1 path=$2 body=${3:-} response success
@@ -309,9 +338,16 @@ upsert_owner_policy() {
 	if ! policies=$(cf_request GET "/accounts/$ACCOUNT_ID/access/apps/$app_id/policies"); then
 		return 1
 	fi
-	if ! policy_id=$(jq -r --arg name "$OWNER_POLICY_NAME" --arg legacy "$LEGACY_OWNER_POLICY_NAME" '[.result[] | select(.name == $name or .name == $legacy)] | if length == 1 then .[0].id elif length == 0 then empty else error("duplicate owner policies") end' <<<"$policies"); then
-		printf 'Cloudflare owner-policy response was invalid\n' >&2
-		return 1
+	if [[ -n "${LEGACY_OWNER_POLICY_NAME:-}" ]]; then
+		if ! policy_id=$(jq -r --arg name "$OWNER_POLICY_NAME" --arg legacy "$LEGACY_OWNER_POLICY_NAME" '[.result[] | select(.name == $name or .name == $legacy)] | if length == 1 then .[0].id elif length == 0 then empty else error("duplicate owner policies") end' <<<"$policies"); then
+			printf 'Cloudflare owner-policy response was invalid\n' >&2
+			return 1
+		fi
+	else
+		if ! policy_id=$(jq -r --arg name "$OWNER_POLICY_NAME" '[.result[] | select(.name == $name)] | if length == 1 then .[0].id elif length == 0 then empty else error("duplicate owner policies") end' <<<"$policies"); then
+			printf 'Cloudflare owner-policy response was invalid\n' >&2
+			return 1
+		fi
 	fi
 	if ! body=$(jq -cn --arg name "$OWNER_POLICY_NAME" --arg email "$email" --argjson precedence "$precedence" \
 		'{name:$name,decision:"allow",precedence:$precedence,include:[{email:{email:$email}}]}'); then
@@ -334,9 +370,16 @@ upsert_service_policy() {
 	if ! policies=$(cf_request GET "/accounts/$ACCOUNT_ID/access/apps/$app_id/policies"); then
 		return 1
 	fi
-	if ! policy_id=$(jq -r --arg name "$SERVICE_POLICY_NAME" --arg legacy "$LEGACY_SERVICE_POLICY_NAME" '[.result[] | select(.name == $name or .name == $legacy)] | if length == 1 then .[0].id elif length == 0 then empty else error("duplicate service policies") end' <<<"$policies"); then
-		printf 'Cloudflare service-policy response was invalid\n' >&2
-		return 1
+	if [[ -n "${LEGACY_SERVICE_POLICY_NAME:-}" ]]; then
+		if ! policy_id=$(jq -r --arg name "$SERVICE_POLICY_NAME" --arg legacy "$LEGACY_SERVICE_POLICY_NAME" '[.result[] | select(.name == $name or .name == $legacy)] | if length == 1 then .[0].id elif length == 0 then empty else error("duplicate service policies") end' <<<"$policies"); then
+			printf 'Cloudflare service-policy response was invalid\n' >&2
+			return 1
+		fi
+	else
+		if ! policy_id=$(jq -r --arg name "$SERVICE_POLICY_NAME" '[.result[] | select(.name == $name)] | if length == 1 then .[0].id elif length == 0 then empty else error("duplicate service policies") end' <<<"$policies"); then
+			printf 'Cloudflare service-policy response was invalid\n' >&2
+			return 1
+		fi
 	fi
 	if ! body=$(jq -cn --arg name "$SERVICE_POLICY_NAME" --arg token "$token_id" \
 		'{name:$name,decision:"non_identity",precedence:1,include:[{service_token:{token_id:$token}}]}'); then
@@ -372,10 +415,22 @@ read_service_token_output() {
 
 ensure_service_token() {
 	local tokens count token_id client_id client_secret response body created=0 created_expires_at= existing_name
+	local legacy_service_token_name=${LEGACY_SERVICE_TOKEN_NAME:-}
 	if ! tokens=$(cf_request GET "/accounts/$ACCOUNT_ID/access/service_tokens?per_page=100"); then
 		return 1
 	fi
-	if ! count=$(jq -r --arg name "$SERVICE_TOKEN_NAME" --arg legacy "$LEGACY_SERVICE_TOKEN_NAME" '[.result[] | select(.name == $name or .name == $legacy)] | length' <<<"$tokens"); then
+	if [[ -n "$legacy_service_token_name" ]]; then
+		if ! count=$(jq -r --arg name "$SERVICE_TOKEN_NAME" --arg legacy "$legacy_service_token_name" '[.result[] | select(.name == $name or .name == $legacy)] | length' <<<"$tokens"); then
+			printf 'Cloudflare service-token response was invalid\n' >&2
+			return 1
+		fi
+	else
+		if ! count=$(jq -r --arg name "$SERVICE_TOKEN_NAME" '[.result[] | select(.name == $name)] | length' <<<"$tokens"); then
+			printf 'Cloudflare service-token response was invalid\n' >&2
+			return 1
+		fi
+	fi
+	if [[ "$count" != 0 && "$count" != 1 ]]; then
 		printf 'Cloudflare service-token response was invalid\n' >&2
 		return 1
 	fi
@@ -422,13 +477,22 @@ ensure_service_token() {
 		fi
 	else
 		[[ "$count" = 1 ]] || { printf 'Cloudflare service token name is ambiguous\n' >&2; return 1; }
-		if ! token_id=$(jq -r --arg name "$SERVICE_TOKEN_NAME" --arg legacy "$LEGACY_SERVICE_TOKEN_NAME" '.result[] | select(.name == $name or .name == $legacy) | .id' <<<"$tokens") || \
-			! client_id=$(jq -r --arg name "$SERVICE_TOKEN_NAME" --arg legacy "$LEGACY_SERVICE_TOKEN_NAME" '.result[] | select(.name == $name or .name == $legacy) | (.client_id // empty)' <<<"$tokens") || \
-			! existing_name=$(jq -r --arg name "$SERVICE_TOKEN_NAME" --arg legacy "$LEGACY_SERVICE_TOKEN_NAME" '.result[] | select(.name == $name or .name == $legacy) | .name' <<<"$tokens"); then
-			printf 'Cloudflare service-token response was invalid\n' >&2
-			return 1
+		if [[ -n "$legacy_service_token_name" ]]; then
+			if ! token_id=$(jq -r --arg name "$SERVICE_TOKEN_NAME" --arg legacy "$legacy_service_token_name" '.result[] | select(.name == $name or .name == $legacy) | .id' <<<"$tokens") || \
+				! client_id=$(jq -r --arg name "$SERVICE_TOKEN_NAME" --arg legacy "$legacy_service_token_name" '.result[] | select(.name == $name or .name == $legacy) | (.client_id // empty)' <<<"$tokens") || \
+				! existing_name=$(jq -r --arg name "$SERVICE_TOKEN_NAME" --arg legacy "$legacy_service_token_name" '.result[] | select(.name == $name or .name == $legacy) | .name' <<<"$tokens"); then
+				printf 'Cloudflare service-token response was invalid\n' >&2
+				return 1
+			fi
+		else
+			if ! token_id=$(jq -r --arg name "$SERVICE_TOKEN_NAME" '.result[] | select(.name == $name) | .id' <<<"$tokens") || \
+				! client_id=$(jq -r --arg name "$SERVICE_TOKEN_NAME" '.result[] | select(.name == $name) | (.client_id // empty)' <<<"$tokens") || \
+				! existing_name=$(jq -r --arg name "$SERVICE_TOKEN_NAME" '.result[] | select(.name == $name) | .name' <<<"$tokens"); then
+				printf 'Cloudflare service-token response was invalid\n' >&2
+				return 1
+			fi
 		fi
-		if [[ "$existing_name" = "$LEGACY_SERVICE_TOKEN_NAME" ]]; then
+		if [[ -n "$legacy_service_token_name" && "$existing_name" = "$legacy_service_token_name" ]]; then
 			body=$(jq -cn --arg name "$SERVICE_TOKEN_NAME" '{name:$name}') || return 1
 			cf_request PUT "/accounts/$ACCOUNT_ID/access/service_tokens/$token_id" "$body" >/dev/null || return 1
 			tokens=$(cf_request GET "/accounts/$ACCOUNT_ID/access/service_tokens?per_page=100") || return 1
@@ -542,7 +606,13 @@ validate_policy_set() {
 }
 
 validate_owner_env() {
-	local path=$1 email=$2 issuer=$3 ui_aud=$4 api_aud=$5 line key count expected_line
+	local path=$1 email=$2 issuer=$3 ui_aud=$4 api_aud=$5
+	local expected_public_url=${PUBLIC_URL:-https://tc.shanekanterman.dev}
+	local public_url=${6:-$expected_public_url} line key count expected_line
+	[[ -n "$public_url" && "$public_url" = "$expected_public_url" ]] || {
+		printf 'generated owner environment public origin does not match the selected deployment environment\n' >&2
+		return 1
+	}
 	[[ -s "$path" && ! -L "$path" ]] || {
 		printf 'generated owner environment is empty or not regular: %s\n' "$path" >&2
 		return 1
@@ -579,7 +649,7 @@ validate_owner_env() {
 		'HELM_LUNA_MODEL=gpt-5.6-luna'
 		'HELM_LUNA_EFFORT=medium'
 		'HELM_AUTH_MODE=cloudflare'
-		'HELM_PUBLIC_ORIGIN=https://tc.shanekanterman.dev'
+		"HELM_PUBLIC_ORIGIN=$public_url"
 		"HELM_ADMIN_EMAIL=$email"
 		"HELM_CLOUDFLARE_ISSUER=$issuer"
 		"HELM_CF_ACCESS_AUDIENCES=$ui_aud,$api_aud"
@@ -588,7 +658,7 @@ validate_owner_env() {
 		'ROADMAP_ADDR=127.0.0.1:8080'
 		'ROADMAP_DB=/var/lib/roadmap/data/roadmap.db'
 		'ROADMAP_AUTH_MODE=cloudflare'
-		'ROADMAP_PUBLIC_ORIGIN=https://tc.shanekanterman.dev'
+		"ROADMAP_PUBLIC_ORIGIN=$public_url"
 		"ROADMAP_ADMIN_EMAIL=$email"
 		"ROADMAP_CLOUDFLARE_ISSUER=$issuer"
 		"ROADMAP_CF_ACCESS_AUDIENCES=$ui_aud,$api_aud"
@@ -624,13 +694,19 @@ restore_prepare_output() {
 }
 
 write_prepare_outputs() {
-	local tunnel_id=$1 email=$2 issuer=$3 ui_aud=$4 api_aud=$5 output_path
+	local tunnel_id=$1 email=$2 issuer=$3 ui_aud=$4 api_aud=$5
+	local expected_public_url=${PUBLIC_URL:-https://tc.shanekanterman.dev}
+	local public_url=${6:-$expected_public_url} output_path
 	[[ -n "$TOKEN_OUTPUT" && -n "$OWNER_ENV_OUTPUT" ]] || {
 		printf 'prepare requires token and owner-environment output paths\n' >&2
 		return 1
 	}
 	[[ "$TOKEN_OUTPUT" != "$OWNER_ENV_OUTPUT" ]] || {
 		printf 'prepare token and owner-environment outputs must differ\n' >&2
+		return 1
+	}
+	[[ -n "$public_url" && "$public_url" = "$expected_public_url" ]] || {
+		printf 'owner-environment public origin does not match the selected deployment environment\n' >&2
 		return 1
 	}
 	valid_email "$email" || {
@@ -695,11 +771,12 @@ write_prepare_outputs() {
 	fi
 	# Bash/awk replacement values are already restricted above. Unlike sed's
 	# slash-delimited expression, awk treats the HTTPS issuer literally.
-	if ! awk -v owner_email="$email" -v issuer="$issuer" -v ui_aud="$ui_aud" -v api_aud="$api_aud" '
+	if ! awk -v owner_email="$email" -v issuer="$issuer" -v public_origin="$public_url" -v ui_aud="$ui_aud" -v api_aud="$api_aud" '
 		{
 			line = $0
 			gsub(/@OWNER_EMAIL@/, owner_email, line)
 			gsub(/@CLOUDFLARE_ISSUER@/, issuer, line)
+			gsub(/@PUBLIC_ORIGIN@/, public_origin, line)
 			gsub(/@UI_AUDIENCE@/, ui_aud, line)
 			gsub(/@API_AUDIENCE@/, api_aud, line)
 			print line
@@ -709,7 +786,7 @@ write_prepare_outputs() {
 		printf 'could not render owner environment\n' >&2
 		return 1
 	fi
-	if ! validate_owner_env "$owner_tmp" "$email" "$issuer" "$ui_aud" "$api_aud"; then
+	if ! validate_owner_env "$owner_tmp" "$email" "$issuer" "$ui_aud" "$api_aud" "$public_url"; then
 		rm -f -- "$token_tmp" "$owner_tmp"
 		printf 'generated owner environment failed validation\n' >&2
 		return 1
@@ -925,7 +1002,7 @@ prepare() {
 	if ! configure_tunnel "$team" "$ui_aud" "$api_aud" "$tunnel_id"; then
 		return 1
 	fi
-	if ! write_prepare_outputs "$tunnel_id" "$email" "https://$team_domain" "$ui_aud" "$api_aud"; then
+	if ! write_prepare_outputs "$tunnel_id" "$email" "https://$team_domain" "$ui_aud" "$api_aud" "$PUBLIC_URL"; then
 		return 1
 	fi
 	printf 'cloudflare_prepare=ok\n'

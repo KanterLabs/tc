@@ -3,7 +3,7 @@ name: Helm CI and deploy
 on:
   pull_request:
   push:
-    branches: [main]
+    branches: [main, beta]
   workflow_dispatch:
     inputs:
       rollback_sha:
@@ -19,9 +19,9 @@ permissions:
 # non-canceling lock.
 concurrency:
   group: helm-${{ github.workflow }}-${{ github.ref }}
-  # Pull-request checks may be superseded, but no main workflow may be
-  # canceled while it is carrying a production deployment.
-  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+  # Pull-request checks may be superseded, but no main or beta workflow may be
+  # canceled while it is carrying an environment deployment.
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' && github.ref != 'refs/heads/beta' }}
 
 jobs:
   checks:
@@ -238,6 +238,199 @@ jobs:
             ${{ runner.temp }}/helm-container/codex.sha256
           if-no-files-found: error
           retention-days: 14
+
+  beta_deploy:
+    if: ${{ github.ref == 'refs/heads/beta' && ((github.event_name == 'push') || (github.event_name == 'workflow_dispatch' && inputs.rollback_sha == '')) }}
+    needs: [checks, browser, race, container]
+    runs-on: homelab
+    environment:
+      name: beta
+      url: https://beta.tc.shanekanterman.dev
+    concurrency:
+      group: helm-beta
+      cancel-in-progress: false
+    env:
+      HELM_DEPLOY_ENVIRONMENT: beta
+      HELM_PUBLIC_ORIGIN: https://beta.tc.shanekanterman.dev
+    steps:
+      # github.sha is the selected beta commit; pinning the checkout prevents
+      # a mutable branch ref from supplying deployment scripts.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Download immutable binary
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: helm-binary-${{ github.sha }}
+          path: dist
+      - name: Restore binary executable mode
+        run: |
+          test -f dist/helm
+          chmod 0755 dist/helm
+          test -x dist/helm
+      - name: Download tested Codex runtime
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: helm-image-${{ github.sha }}
+          path: dist/container
+      - name: Verify Codex runtime artifact
+        run: |
+          test -f dist/container/codex
+          test -f dist/container/codex.sha256
+          (cd dist/container && sha256sum --check --strict codex.sha256)
+          install -m 0755 dist/container/codex dist/codex
+      - name: Configure deploy identity
+        env:
+          DEPLOY_KEY: ${{ secrets.BETA_DEPLOY_SSH_KEY }}
+          DEPLOY_KNOWN_HOSTS: ${{ secrets.BETA_DEPLOY_KNOWN_HOSTS }}
+        run: |
+          test -n "$DEPLOY_KEY"
+          test -n "$DEPLOY_KNOWN_HOSTS"
+          [[ "$RUNNER_TEMP" = /* ]]
+          ssh_dir="$RUNNER_TEMP/helm-ssh"
+          install -d -m 0700 "$ssh_dir"
+          printf '%s\n' "$DEPLOY_KEY" > "$ssh_dir/helm-deploy"
+          chmod 0600 "$ssh_dir/helm-deploy"
+          printf '%s\n' "$DEPLOY_KNOWN_HOSTS" > "$ssh_dir/known_hosts"
+          chmod 0600 "$ssh_dir/known_hosts"
+          printf '%s\n' \
+            'Host 10.0.0.20' \
+            "  IdentityFile $ssh_dir/helm-deploy" \
+            "  UserKnownHostsFile $ssh_dir/known_hosts" \
+            '  IdentitiesOnly yes' \
+            '  BatchMode yes' \
+            '  StrictHostKeyChecking yes' \
+            > "$ssh_dir/config"
+          chmod 0600 "$ssh_dir/config"
+          printf 'HELM_SSH_CONFIG=%s\n' "$ssh_dir/config" >> "$GITHUB_ENV"
+      - name: Capture previous beta release for recovery
+        id: previous_release
+        run: |
+          status_output=$(./deploy/deploy-ci.sh status)
+          previous_sha=$(sed -n 's/^current_sha=//p' <<<"$status_output")
+          [[ "$previous_sha" = none || "$previous_sha" =~ ^[0-9a-f]{40}$ ]]
+          printf 'sha=%s\n' "$previous_sha" >> "$GITHUB_OUTPUT"
+      - name: Prepare beta Cloudflare Access and tunnel
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.BETA_CLOUDFLARE_API_TOKEN }}
+          HELM_REQUIRE_DURABLE_SERVICE_TOKEN_CAPTURE: "1"
+        run: |
+          test -n "$CLOUDFLARE_API_TOKEN"
+          chmod 0755 deploy/*.sh deploy/helm-deploy-gateway
+          cloudflare_dir="$RUNNER_TEMP/helm-cloudflare"
+          install -d -m 0700 "$cloudflare_dir"
+          printf 'HELM_CLOUDFLARED_TOKEN_FILE=%s\n' "$cloudflare_dir/cloudflared.token" >> "$GITHUB_ENV"
+          printf 'HELM_OWNER_ENV_FILE=%s\n' "$cloudflare_dir/owner.env" >> "$GITHUB_ENV"
+          ./deploy/cloudflare.sh prepare \
+            "$cloudflare_dir/cloudflared.token" \
+            "$cloudflare_dir/owner.env" \
+            "$cloudflare_dir/helm-access-token.env"
+      - name: Materialize beta release signing key
+        env:
+          RELEASE_SIGNING_KEY: ${{ secrets.BETA_RELEASE_SIGNING_KEY }}
+        run: |
+          test -n "$RELEASE_SIGNING_KEY"
+          install -d -m 0700 "$RUNNER_TEMP/helm-signing"
+          printf '%s\n' "$RELEASE_SIGNING_KEY" > "$RUNNER_TEMP/helm-signing/private.pem"
+          chmod 0600 "$RUNNER_TEMP/helm-signing/private.pem"
+      - name: Deploy to beta Proxmox guest
+        env:
+          HELM_RELEASE_SIGNING_KEY_FILE: ${{ runner.temp }}/helm-signing/private.pem
+        run: ./deploy/deploy-ci.sh deploy "${GITHUB_SHA}"
+      - name: Publish beta DNS and validate live Access
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.BETA_CLOUDFLARE_API_TOKEN }}
+          CF_ACCESS_CLIENT_ID: ${{ secrets.BETA_CF_ACCESS_CLIENT_ID }}
+          CF_ACCESS_CLIENT_SECRET: ${{ secrets.BETA_CF_ACCESS_CLIENT_SECRET }}
+          HELM_REQUIRE_SERVICE_AUTH_PROBE: "1"
+          PREVIOUS_RELEASE_SHA: ${{ steps.previous_release.outputs.sha }}
+        run: |
+          if ./deploy/cloudflare.sh publish && ./deploy/validate-live.sh; then
+            exit 0
+          fi
+          printf 'post-deploy beta live validation failed; attempting automatic rollback\n' >&2
+          if [[ "$PREVIOUS_RELEASE_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            if ! ./deploy/deploy-ci.sh rollback "$PREVIOUS_RELEASE_SHA"; then
+              printf 'automatic beta rollback to %s failed\n' "$PREVIOUS_RELEASE_SHA" >&2
+            else
+              printf 'automatic beta rollback to %s completed; validation remains failed\n' "$PREVIOUS_RELEASE_SHA" >&2
+            fi
+          else
+            printf 'no previous retained beta release is available; automatic rollback skipped\n' >&2
+          fi
+          exit 1
+      - name: Remove beta deployment credentials
+        if: ${{ always() }}
+        run: |
+          rm -f -- "$RUNNER_TEMP/helm-signing/private.pem"
+          rm -rf -- "$RUNNER_TEMP/helm-ssh" "$RUNNER_TEMP/helm-cloudflare"
+          rm -f -- dist/cloudflared.token dist/owner.env dist/helm-access-token.env
+
+  beta_rollback:
+    if: ${{ github.ref == 'refs/heads/beta' && github.event_name == 'workflow_dispatch' && inputs.rollback_sha != '' }}
+    runs-on: homelab
+    environment:
+      name: beta
+      url: https://beta.tc.shanekanterman.dev
+    concurrency:
+      group: helm-beta
+      cancel-in-progress: false
+    env:
+      HELM_DEPLOY_ENVIRONMENT: beta
+      HELM_PUBLIC_ORIGIN: https://beta.tc.shanekanterman.dev
+    steps:
+      # A manual rollback is beta-authorized only when dispatched from beta,
+      # and its scripts are pinned to the selected beta commit.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Configure beta deploy identity
+        env:
+          DEPLOY_KEY: ${{ secrets.BETA_DEPLOY_SSH_KEY }}
+          DEPLOY_KNOWN_HOSTS: ${{ secrets.BETA_DEPLOY_KNOWN_HOSTS }}
+        run: |
+          test -n "$DEPLOY_KEY"
+          test -n "$DEPLOY_KNOWN_HOSTS"
+          [[ "$RUNNER_TEMP" = /* ]]
+          ssh_dir="$RUNNER_TEMP/helm-ssh"
+          install -d -m 0700 "$ssh_dir"
+          printf '%s\n' "$DEPLOY_KEY" > "$ssh_dir/helm-deploy"
+          chmod 0600 "$ssh_dir/helm-deploy"
+          printf '%s\n' "$DEPLOY_KNOWN_HOSTS" > "$ssh_dir/known_hosts"
+          chmod 0600 "$ssh_dir/known_hosts"
+          printf '%s\n' \
+            'Host 10.0.0.20' \
+            "  IdentityFile $ssh_dir/helm-deploy" \
+            "  UserKnownHostsFile $ssh_dir/known_hosts" \
+            '  IdentitiesOnly yes' \
+            '  BatchMode yes' \
+            '  StrictHostKeyChecking yes' \
+            > "$ssh_dir/config"
+          chmod 0600 "$ssh_dir/config"
+          printf 'HELM_SSH_CONFIG=%s\n' "$ssh_dir/config" >> "$GITHUB_ENV"
+      - name: Roll back retained beta release
+        env:
+          ROLLBACK_SHA: ${{ inputs.rollback_sha }}
+        run: |
+          [[ "$ROLLBACK_SHA" =~ ^[0-9a-f]{40}$ ]]
+          ./deploy/deploy-ci.sh rollback "$ROLLBACK_SHA"
+      - name: Validate beta live Access after rollback
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.BETA_CLOUDFLARE_API_TOKEN }}
+          CF_ACCESS_CLIENT_ID: ${{ secrets.BETA_CF_ACCESS_CLIENT_ID }}
+          CF_ACCESS_CLIENT_SECRET: ${{ secrets.BETA_CF_ACCESS_CLIENT_SECRET }}
+          HELM_REQUIRE_SERVICE_AUTH_PROBE: "1"
+        run: ./deploy/validate-live.sh
+      - name: Remove beta deployment credentials
+        if: ${{ always() }}
+        run: |
+          rm -f -- "$RUNNER_TEMP/helm-signing/private.pem"
+          rm -rf -- "$RUNNER_TEMP/helm-ssh" "$RUNNER_TEMP/helm-cloudflare"
+          rm -f -- dist/cloudflared.token dist/owner.env dist/helm-access-token.env
 
   deploy:
     if: ${{ github.ref == 'refs/heads/main' && ((github.event_name == 'push') || (github.event_name == 'workflow_dispatch' && inputs.rollback_sha == '')) }}

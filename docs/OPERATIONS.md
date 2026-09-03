@@ -18,6 +18,17 @@ The target is the unprivileged Debian 12 LXC `roadmap` (CTID 103) on
 nftables input policy is default-drop; both the application and cloudflared
 connector use loopback while cloudflared makes the outbound tunnel connection.
 
+The beta target is a second unprivileged Debian 12 LXC, `helm-beta` (CTID 106)
+at `10.0.0.39/24`. It uses `beta.tc.shanekanterman.dev`, the
+`helm-beta-homelab` tunnel, the `helm-beta-deploy` forced SSH account,
+`/var/lib/helm-beta-deploy` host staging, and a distinct Ed25519 signing trust
+under `/etc/helm-beta-deploy`. The separate guest gives beta its own database,
+backups, releases, services, connector token, and runtime credentials while
+allowing the stable in-guest `/var/lib/roadmap` compatibility layout.
+
+The complete design and promotion gates are in
+[`BETA_DEPLOYMENT_PLAN.md`](BETA_DEPLOYMENT_PLAN.md).
+
 ## Local development and image checks
 
 The Compose file runs exactly one unprivileged Helm container. It publishes
@@ -78,6 +89,21 @@ Before the first run, inspect the existing guest and template on the PVE host:
 pct config 103
 pveam list local
 ```
+
+Provision beta with a separately generated deploy key and release-signing key:
+
+```sh
+ssh-keygen -t ed25519 -C helm-beta-deploy -f ./helm-beta-deploy-key
+openssl genpkey -algorithm ED25519 -out ./helm-beta-release-signing-private.pem
+openssl pkey -in ./helm-beta-release-signing-private.pem -pubout \
+  -out ./helm-beta-release-signing-public.pem
+chmod 0600 ./helm-beta-release-signing-private.pem
+HELM_DEPLOY_ENVIRONMENT=beta ./deploy/bootstrap-proxmox.sh \
+  ./helm-beta-deploy-key.pub ./helm-beta-release-signing-public.pem
+```
+
+Store the beta private keys only in the approved secret manager and the GitHub
+`beta` environment. Never reuse the production deploy or signing key.
 
 The gateway checks the QEMU VMID namespace before every status, deploy, or
 rollback request. A QEMU guest at VMID 103 is a hard collision: the request
@@ -213,6 +239,22 @@ container build on `homelab-heavy`, and deployment orchestration on
 waits for the first deployment. CI builds the frontend and Go binary, creates
 an immutable SHA-tagged bundle, prepares Access/tunnel resources, deploys via
 the constrained PVE identity, publishes DNS, and performs live validation.
+
+The same checks run for `beta`, but its deployment job uses only the GitHub
+`beta` environment, `BETA_*` secrets, the `helm-beta` concurrency lock, and
+`HELM_DEPLOY_ENVIRONMENT=beta`. A beta push cannot invoke the production
+gateway because its SSH key is forced to
+`/usr/local/sbin/helm-beta-deploy-gateway`. Promotion is an explicit pull
+request or merge from `beta` to `main`; the resulting `main` push remains the
+only automatic production trigger.
+
+Read beta status or roll back a retained beta release with:
+
+```sh
+HELM_DEPLOY_ENVIRONMENT=beta ./deploy/deploy-ci.sh status
+HELM_DEPLOY_ENVIRONMENT=beta ./deploy/deploy-ci.sh rollback \
+  <40-character-beta-release-sha>
+```
 
 Normal deployment requires these secrets:
 
