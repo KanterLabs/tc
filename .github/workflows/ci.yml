@@ -245,13 +245,13 @@ jobs:
     runs-on: homelab
     environment:
       name: beta
-      url: https://beta.tc.shanekanterman.dev
+      url: https://beta.shanekanterman.dev
     concurrency:
       group: helm-beta
       cancel-in-progress: false
     env:
       HELM_DEPLOY_ENVIRONMENT: beta
-      HELM_PUBLIC_ORIGIN: https://beta.tc.shanekanterman.dev
+      HELM_PUBLIC_ORIGIN: https://beta.shanekanterman.dev
     steps:
       # github.sha is the selected beta commit; pinning the checkout prevents
       # a mutable branch ref from supplying deployment scripts.
@@ -376,13 +376,13 @@ jobs:
     runs-on: homelab
     environment:
       name: beta
-      url: https://beta.tc.shanekanterman.dev
+      url: https://beta.shanekanterman.dev
     concurrency:
       group: helm-beta
       cancel-in-progress: false
     env:
       HELM_DEPLOY_ENVIRONMENT: beta
-      HELM_PUBLIC_ORIGIN: https://beta.tc.shanekanterman.dev
+      HELM_PUBLIC_ORIGIN: https://beta.shanekanterman.dev
     steps:
       # A manual rollback is beta-authorized only when dispatched from beta,
       # and its scripts are pinned to the selected beta commit.

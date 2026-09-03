@@ -19,7 +19,7 @@ nftables input policy is default-drop; both the application and cloudflared
 connector use loopback while cloudflared makes the outbound tunnel connection.
 
 The beta target is a second unprivileged Debian 12 LXC, `helm-beta` (CTID 106)
-at `10.0.0.39/24`. It uses `beta.tc.shanekanterman.dev`, the
+at `10.0.0.39/24`. It uses `beta.shanekanterman.dev`, the
 `helm-beta-homelab` tunnel, the `helm-beta-deploy` forced SSH account,
 `/var/lib/helm-beta-deploy` host staging, and a distinct Ed25519 signing trust
 under `/etc/helm-beta-deploy`. The separate guest gives beta its own database,

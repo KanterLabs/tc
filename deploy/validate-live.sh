@@ -99,8 +99,8 @@ case "$DEPLOY_ENVIRONMENT" in
 		SERVICE_POLICY_NAME='Helm agents Service Auth'
 		;;
 	beta)
-		PUBLIC_HOST=beta.tc.shanekanterman.dev
-		PUBLIC_URL=https://beta.tc.shanekanterman.dev
+		PUBLIC_HOST=beta.shanekanterman.dev
+		PUBLIC_URL=https://beta.shanekanterman.dev
 		API_PATH="$PUBLIC_HOST/api/v1/*"
 		TUNNEL_NAME=helm-beta-homelab
 		UI_APP_NAME='Helm beta owner UI'
