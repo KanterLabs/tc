@@ -131,6 +131,19 @@ contains 'HELM_RELEASE_SHA=%s' "$BUILD_BUNDLE"
 contains 'owner environment already contains a release SHA' "$BUILD_BUNDLE"
 contains 'CLOUDFLARED_VERSION=2026.8.2' "$BUILD_BUNDLE"
 contains 'CLOUDFLARED_SHA256=fcfb02b575a52ca1af2e3267af4e1517bcdeb30ac48c834c69abaed3c0576ad2' "$BUILD_BUNDLE"
+contains 'safe_file "$DIST_DIR/codex" codex-binary' "$BUILD_BUNDLE"
+contains '(cd "$BUNDLE_DIR" && sha256sum codex > codex.sha256)' "$BUILD_BUNDLE"
+contains 'verify_codex_binary()' "$INSTALL"
+contains 'codex codex.sha256 roadmap.env' "$INSTALL"
+contains 'sha256sum --check --strict codex.sha256' "$INSTALL"
+contains 'install -m 0755 -o root -g root "$RELEASE_DIR/codex" "$new_target/codex"' "$INSTALL"
+contains 'validate_optional_codex()' "$ROLLBACK"
+contains 'validate_optional_codex "$TARGET"' "$ROLLBACK"
+contains 'validate_optional_codex "$previous_target"' "$ROLLBACK"
+contains 'Environment=HELM_CODEX_BINARY=/var/lib/roadmap/current/codex' "$SERVICE"
+contains 'docker cp "$container_id:/usr/local/bin/codex" "$image_dir/codex"' "$WORKFLOW"
+contains 'name: helm-image-${{ github.sha }}' "$WORKFLOW"
+contains 'install -m 0755 dist/container/codex dist/codex' "$WORKFLOW"
 
 # Guest state ownership and lifecycle safeguards.
 contains 'DATA_DIR="$STATE_DIR/data"' "$INSTALL"
@@ -591,6 +604,25 @@ contains 'systemctl is-active --quiet helm.service || return 1' "$ROLLBACK"
 contains 'systemctl is-active --quiet roadmap.service || return 1' "$ROLLBACK"
 contains 'systemctl is-active --quiet cloudflared.service || return 1' "$ROLLBACK"
 contains 'exit 1' "$ROLLBACK"
+
+# Legacy rollback targets may omit Codex entirely, while new targets must
+# carry a complete executable/checksum pair and pass verification.
+source <(awk '/^validate_optional_codex\(\)/,/^}/' "$ROLLBACK")
+codex_rollback_fixture="$fixture/codex-rollback"
+install -d -m 0755 "$codex_rollback_fixture"
+validate_optional_codex "$codex_rollback_fixture" || fail 'legacy rollback target without Codex was rejected'
+printf 'codex fixture\n' > "$codex_rollback_fixture/codex"
+chmod 0755 "$codex_rollback_fixture/codex"
+if validate_optional_codex "$codex_rollback_fixture"; then
+	fail 'partial rollback target with Codex but no checksum was accepted'
+fi
+printf '%064d  codex\n' 0 > "$codex_rollback_fixture/codex.sha256"
+if validate_optional_codex "$codex_rollback_fixture" 2>/dev/null; then
+	fail 'rollback target with a bad Codex checksum was accepted'
+fi
+(cd "$codex_rollback_fixture" && sha256sum codex > codex.sha256)
+validate_optional_codex "$codex_rollback_fixture" || fail 'valid rollback Codex runtime was rejected'
+printf 'rollback_codex_validation_test=ok\n'
 
 # Run the real rollback transaction against a fixture state root. The service,
 # health, install, and rename boundaries are mocked, while release checks,
@@ -1443,6 +1475,8 @@ PAYLOAD_MEMBERS=(
 	cloudflared
 	cloudflared.service
 	cloudflared.token
+	codex
+	codex.sha256
 	compose.yaml
 	install-inside-lxc.sh
 	nftables.conf
@@ -1458,7 +1492,7 @@ PAYLOAD_MEMBERS=(
 	release.sha
 )
 BUNDLE_MEMBERS=(
-	cloudflared cloudflared.service cloudflared.token compose.yaml
+	cloudflared cloudflared.service cloudflared.token codex codex.sha256 compose.yaml
 	install-inside-lxc.sh nftables.conf roadmap roadmap-backup.service
 	roadmap-backup.sh roadmap-backup.timer roadmap.env roadmap-restore.sh
 	roadmap-rollback.sh roadmap.service roadmap.sha256 release.manifest
@@ -1523,7 +1557,7 @@ fi
 # count before extraction.
 GZIP=-n tar --sort=name --owner=0 --group=0 --numeric-owner --mtime='@0' \
 	-czf "$fixture/unsigned.tar.gz" -C "$source_dir" \
-		cloudflared cloudflared.service cloudflared.token compose.yaml install-inside-lxc.sh \
+		cloudflared cloudflared.service cloudflared.token codex codex.sha256 compose.yaml install-inside-lxc.sh \
 		nftables.conf roadmap roadmap-backup.service roadmap-backup.sh roadmap-backup.timer \
 		roadmap.env roadmap-restore.sh roadmap-rollback.sh roadmap.service roadmap.sha256 \
 		release.manifest release.sha

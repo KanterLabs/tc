@@ -26,6 +26,8 @@ PAYLOAD_MEMBERS=(
 	cloudflared
 	cloudflared.service
 	cloudflared.token
+	codex
+	codex.sha256
 	compose.yaml
 	install-inside-lxc.sh
 	nftables.conf
@@ -45,6 +47,8 @@ ALL_MEMBERS=(
 	cloudflared
 	cloudflared.service
 	cloudflared.token
+	codex
+	codex.sha256
 	compose.yaml
 	install-inside-lxc.sh
 	nftables.conf
@@ -198,6 +202,8 @@ for member in "${tar_members[@]}"; do
 		cloudflared) member_key=cloudflared ;;
 		cloudflared.service) member_key=cloudflared.service ;;
 		cloudflared.token) member_key=cloudflared.token ;;
+		codex) member_key=codex ;;
+		codex.sha256) member_key=codex.sha256 ;;
 		compose.yaml) member_key=compose.yaml ;;
 		install-inside-lxc.sh) member_key=install-inside-lxc.sh ;;
 		nftables.conf) member_key=nftables.conf ;;
@@ -231,7 +237,7 @@ for listing in "${tar_verbose[@]}"; do
 	[[ -z "$extra" && "$mode" = -* && -n "$member" ]] \
 		|| fail 'release archive members must all be regular files'
 	case "$member" in
-		cloudflared|cloudflared.service|cloudflared.token|compose.yaml|install-inside-lxc.sh|nftables.conf|roadmap|roadmap-backup.service|roadmap-backup.sh|roadmap-backup.timer|roadmap.env|roadmap-restore.sh|roadmap-rollback.sh|roadmap.service|roadmap.sha256|release.manifest|release.manifest.sig|release.sha) ;;
+		cloudflared|cloudflared.service|cloudflared.token|codex|codex.sha256|compose.yaml|install-inside-lxc.sh|nftables.conf|roadmap|roadmap-backup.service|roadmap-backup.sh|roadmap-backup.timer|roadmap.env|roadmap-restore.sh|roadmap-rollback.sh|roadmap.service|roadmap.sha256|release.manifest|release.manifest.sig|release.sha) ;;
 		*) fail "release archive metadata names a disallowed member: $member" ;;
 	esac
 	[[ "$member_size" =~ ^[0-9]+$ ]] || fail "release member size is invalid: $member"
@@ -280,7 +286,7 @@ while IFS=$'\t' read -r name size digest extra; do
 	[[ "$name" = "${PAYLOAD_MEMBERS[$payload_count]}" ]] \
 		|| fail 'release manifest is not in canonical member order'
 	case "$name" in
-		cloudflared|cloudflared.service|cloudflared.token|compose.yaml|install-inside-lxc.sh|nftables.conf|roadmap|roadmap-backup.service|roadmap-backup.sh|roadmap-backup.timer|roadmap.env|roadmap-restore.sh|roadmap-rollback.sh|roadmap.service|roadmap.sha256|release.sha) ;;
+		cloudflared|cloudflared.service|cloudflared.token|codex|codex.sha256|compose.yaml|install-inside-lxc.sh|nftables.conf|roadmap|roadmap-backup.service|roadmap-backup.sh|roadmap-backup.timer|roadmap.env|roadmap-restore.sh|roadmap-rollback.sh|roadmap.service|roadmap.sha256|release.sha) ;;
 		*) fail "release manifest names a non-payload member: $name" ;;
 	esac
 	[[ -z "${seen_payload[$name]+x}" ]] || fail "release manifest contains duplicate member: $name"

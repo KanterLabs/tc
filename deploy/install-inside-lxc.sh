@@ -86,6 +86,13 @@ verify_release_binary() {
 	(cd "$target" && sha256sum --check --strict "$binary.sha256" >/dev/null)
 }
 
+verify_codex_binary() {
+	local target=$1
+	[[ -x "$target/codex" && ! -L "$target/codex" ]] || return 1
+	[[ -f "$target/codex.sha256" && ! -L "$target/codex.sha256" ]] || return 1
+	(cd "$target" && sha256sum --check --strict codex.sha256 >/dev/null)
+}
+
 validate_release_env() {
 	local path=$1 expected=$2 revision
 	revision=$(release_revision "$path") || return 1
@@ -134,14 +141,15 @@ source /etc/os-release
 [[ "$ID" = debian && "${VERSION_ID%%.*}" = 12 ]] \
 	|| fail 'Helm production requires Debian 12'
 
-for file in roadmap cloudflared cloudflared.token roadmap.env roadmap.service cloudflared.service roadmap-backup.service roadmap-backup.timer nftables.conf compose.yaml roadmap-backup.sh roadmap-restore.sh roadmap-rollback.sh release.sha roadmap.sha256 release.manifest release.manifest.sig; do
+for file in roadmap cloudflared cloudflared.token codex codex.sha256 roadmap.env roadmap.service cloudflared.service roadmap-backup.service roadmap-backup.timer nftables.conf compose.yaml roadmap-backup.sh roadmap-restore.sh roadmap-rollback.sh release.sha roadmap.sha256 release.manifest release.manifest.sig; do
 	[[ -f "$RELEASE_DIR/$file" && ! -L "$RELEASE_DIR/$file" ]] || fail "release member is missing: $file"
 done
 
 SHA=$(tr -d '[:space:]' < "$RELEASE_DIR/release.sha")
 [[ "$SHA" =~ ^[0-9a-f]{40}$ ]] || fail 'release SHA is invalid'
-[[ -x "$RELEASE_DIR/roadmap" && -x "$RELEASE_DIR/cloudflared" ]] || fail 'release binaries must be executable'
+[[ -x "$RELEASE_DIR/roadmap" && -x "$RELEASE_DIR/cloudflared" && -x "$RELEASE_DIR/codex" ]] || fail 'release binaries must be executable'
 sha256sum "$RELEASE_DIR/roadmap" >/dev/null || fail 'could not hash release binary'
+(cd "$RELEASE_DIR" && sha256sum --check --strict codex.sha256 >/dev/null) || fail 'release Codex checksum failed'
 validate_release_env "$RELEASE_DIR/roadmap.env" "$SHA"
 
 export DEBIAN_FRONTEND=noninteractive
@@ -250,8 +258,12 @@ if [[ -e "$RELEASES_DIR/$SHA" || -L "$RELEASES_DIR/$SHA" ]]; then
 	[[ -f "$RELEASES_DIR/$SHA/release.manifest" && ! -L "$RELEASES_DIR/$SHA/release.manifest" ]] || fail 'retained release has no signed manifest'
 	[[ -f "$RELEASES_DIR/$SHA/release.manifest.sig" && ! -L "$RELEASES_DIR/$SHA/release.manifest.sig" ]] || fail 'retained release has no manifest signature'
 	verify_release_binary "$RELEASES_DIR/$SHA" || fail 'retained release checksum failed'
+	verify_codex_binary "$RELEASES_DIR/$SHA" || fail 'retained release Codex checksum failed'
 	if [[ "$(sha256sum "$RELEASES_DIR/$SHA/$retained_binary" | awk '{print $1}')" != "$(sha256sum "$RELEASE_DIR/roadmap" | awk '{print $1}')" ]]; then
 		fail 'same SHA was previously retained with different bytes'
+	fi
+	if [[ "$(sha256sum "$RELEASES_DIR/$SHA/codex" | awk '{print $1}')" != "$(sha256sum "$RELEASE_DIR/codex" | awk '{print $1}')" ]]; then
+		fail 'same SHA was previously retained with different Codex bytes'
 	fi
 	if [[ -e "$RELEASES_DIR/$SHA/roadmap.env" || -L "$RELEASES_DIR/$SHA/roadmap.env" ]]; then
 		[[ -f "$RELEASES_DIR/$SHA/roadmap.env" && ! -L "$RELEASES_DIR/$SHA/roadmap.env" ]] ||
@@ -266,6 +278,8 @@ if [[ -e "$RELEASES_DIR/$SHA" || -L "$RELEASES_DIR/$SHA" ]]; then
 else
 	install -d -m 0755 -o root -g root "$new_target"
 	install -m 0755 -o root -g root "$RELEASE_DIR/roadmap" "$new_target/helm"
+	install -m 0755 -o root -g root "$RELEASE_DIR/codex" "$new_target/codex"
+	install -m 0644 -o root -g root "$RELEASE_DIR/codex.sha256" "$new_target/codex.sha256"
 	install -m 0644 -o root -g root "$RELEASE_DIR/release.sha" "$new_target/release.sha"
 	(cd "$new_target" && sha256sum helm > helm.sha256)
 	chmod 0644 "$new_target/helm.sha256"
@@ -273,6 +287,7 @@ else
 	install -m 0644 -o root -g root "$RELEASE_DIR/release.manifest.sig" "$new_target/release.manifest.sig"
 	install -m 0640 -o root -g root "$RELEASE_DIR/roadmap.env" "$new_target/roadmap.env"
 	verify_release_binary "$new_target" || fail 'new release binary checksum failed'
+	verify_codex_binary "$new_target" || fail 'new release Codex checksum failed'
 	mv -T -- "$new_target" "$RELEASES_DIR/$SHA"
 	release_target="$RELEASES_DIR/$SHA"
 fi

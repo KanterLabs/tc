@@ -8,6 +8,7 @@ Type=simple
 User=roadmap
 Group=roadmap
 EnvironmentFile=/etc/roadmap/roadmap.env
+Environment=HELM_CODEX_BINARY=/var/lib/roadmap/current/codex
 ExecStart=/usr/local/sbin/helm-run-current
 WorkingDirectory=/var/lib/roadmap/data
 Restart=on-failure

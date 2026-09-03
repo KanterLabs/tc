@@ -83,6 +83,18 @@ release_binary_name() {
 	return 1
 }
 
+# Releases created before the Luna integration do not contain Codex. Preserve
+# those rollback targets, but reject a partial or corrupt Codex runtime.
+validate_optional_codex() {
+	local target=$1
+	if [[ ! -e "$target/codex" && ! -L "$target/codex" && ! -e "$target/codex.sha256" && ! -L "$target/codex.sha256" ]]; then
+		return 0
+	fi
+	[[ -x "$target/codex" && ! -L "$target/codex" ]] || return 1
+	[[ -f "$target/codex.sha256" && ! -L "$target/codex.sha256" ]] || return 1
+	(cd "$target" && sha256sum --check --strict codex.sha256 >/dev/null)
+}
+
 validate_release_env() {
 	local path=$1 expected=$2 revision
 	revision=$(release_revision "$path") || return 1
@@ -112,6 +124,7 @@ validate_release_env "$TARGET/roadmap.env" "$SHA" ||
 	fail 'requested release environment revision is invalid'
 (cd "$TARGET" && sha256sum --check --strict "$TARGET_BINARY.sha256" >/dev/null) \
 	|| fail 'requested release binary checksum failed'
+validate_optional_codex "$TARGET" || fail 'requested release Codex checksum failed'
 
 if [[ -e "$LOCK_PATH" || -L "$LOCK_PATH" ]]; then
 	[[ -f "$LOCK_PATH" && ! -L "$LOCK_PATH" ]] || fail 'deployment lock is not a regular file'
@@ -136,6 +149,7 @@ if [[ -n "$previous_target" ]]; then
 	previous_binary=$(release_binary_name "$previous_target") || fail 'current release binary layout is invalid'
 	(cd "$previous_target" && sha256sum --check --strict "$previous_binary.sha256" >/dev/null) ||
 		fail 'current release binary checksum failed'
+	validate_optional_codex "$previous_target" || fail 'current release Codex checksum failed'
 	[[ -f "$previous_target/roadmap.env" && ! -L "$previous_target/roadmap.env" ]] ||
 		fail 'current release has no release environment'
 	validate_release_env "$previous_target/roadmap.env" "$previous_sha" ||

@@ -93,6 +93,9 @@ allowlist and the detached Ed25519 signature covers a canonical manifest of
 each payload member's exact name, byte size, and SHA-256. The deployment
 account has no usable scp, SFTP, or shell subsystem. An incomplete deploy
 stream is bounded by the gateway's ingest timeout as well as its 512 MiB cap.
+The signed payload includes the pinned Codex executable and checksum; the
+guest retains them with each release so application and Codex runtime roll
+forward together. Pre-Luna retained releases remain valid rollback targets.
 
 ## Cloudflare Access and tunnel bootstrap
 

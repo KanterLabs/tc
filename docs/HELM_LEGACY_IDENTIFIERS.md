@@ -42,6 +42,8 @@ the exact `roadmap-release-manifest-v1` header and exact member names:
 cloudflared
 cloudflared.service
 cloudflared.token
+codex
+codex.sha256
 compose.yaml
 install-inside-lxc.sh
 nftables.conf
@@ -59,10 +61,11 @@ release.manifest.sig
 release.sha
 ```
 
-The `roadmap` member contains the Helm binary. The guest installer converts
-the legacy envelope into canonical Helm runtime names. Adding, removing, or
-renaming an envelope member would make the existing root gateway reject the
-release before touching the guest.
+The `roadmap` member contains the Helm binary. `codex` contains the pinned
+Codex App Server runtime used for per-user ChatGPT authorization and Luna.
+The guest installer converts the legacy envelope into canonical Helm runtime
+names. Adding, removing, or renaming an envelope member requires the separately
+managed root gateway verifier to be updated before the release is deployed.
 
 ## Infrastructure and hosted configuration
 

@@ -24,6 +24,8 @@ PAYLOAD_MEMBERS=(
 	cloudflared
 	cloudflared.service
 	cloudflared.token
+	codex
+	codex.sha256
 	compose.yaml
 	install-inside-lxc.sh
 	nftables.conf
@@ -43,6 +45,8 @@ BUNDLE_MEMBERS=(
 	cloudflared
 	cloudflared.service
 	cloudflared.token
+	codex
+	codex.sha256
 	compose.yaml
 	install-inside-lxc.sh
 	nftables.conf
@@ -81,6 +85,11 @@ safe_file() {
 safe_file "$DIST_DIR/helm" helm-binary
 [[ -x "$DIST_DIR/helm" ]] || {
 	printf 'helm binary must be executable\n' >&2
+	exit 1
+}
+safe_file "$DIST_DIR/codex" codex-binary
+[[ -x "$DIST_DIR/codex" ]] || {
+	printf 'codex binary must be executable\n' >&2
 	exit 1
 }
 [[ -n "$SIGNING_KEY_FILE" ]] || {
@@ -145,6 +154,7 @@ chmod 0700 "$BUNDLE_DIR"
 # transitions to Helm. The guest installer converts these envelope members to
 # canonical Helm runtime names and retains compatibility aliases for rollback.
 install -m 0755 "$DIST_DIR/helm" "$BUNDLE_DIR/roadmap"
+install -m 0755 "$DIST_DIR/codex" "$BUNDLE_DIR/codex"
 install -m 0755 "$CLOUDFLARED_PATH" "$BUNDLE_DIR/cloudflared"
 install -m 0600 "$CLOUDFLARED_TOKEN_FILE" "$BUNDLE_DIR/cloudflared.token"
 install -m 0640 "$OWNER_ENV_FILE" "$BUNDLE_DIR/roadmap.env"
@@ -168,6 +178,8 @@ printf '%s\n' "$SHA" > "$BUNDLE_DIR/release.sha"
 chmod 0644 "$BUNDLE_DIR/release.sha"
 (cd "$BUNDLE_DIR" && sha256sum roadmap > roadmap.sha256)
 chmod 0644 "$BUNDLE_DIR/roadmap.sha256"
+(cd "$BUNDLE_DIR" && sha256sum codex > codex.sha256)
+chmod 0644 "$BUNDLE_DIR/codex.sha256"
 
 # The manifest is the canonical signed description of every payload member.
 # The two envelope members are intentionally excluded to avoid a circular
