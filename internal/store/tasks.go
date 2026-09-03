@@ -307,6 +307,9 @@ func (s *Store) GetTask(ctx context.Context, id string) (Task, error) {
 	if err := s.enrichTask(ctx, &task); err != nil {
 		return Task{}, err
 	}
+	if err := s.populateDependencySummary(ctx, &task); err != nil {
+		return Task{}, err
+	}
 	return task, nil
 }
 
@@ -325,6 +328,9 @@ func (s *Store) ResolveTaskReference(ctx context.Context, reference string) (Tas
 		return Task{}, err
 	}
 	if err := s.enrichTask(ctx, &task); err != nil {
+		return Task{}, err
+	}
+	if err := s.populateDependencySummary(ctx, &task); err != nil {
 		return Task{}, err
 	}
 	return task, nil
@@ -444,6 +450,38 @@ func (s *Store) listTasks(ctx context.Context, projectID string, filter TaskFilt
 			args = append(args, filter.Resolution)
 		}
 	}
+	if filter.Dependency != "" {
+		switch strings.ToLower(strings.TrimSpace(filter.Dependency)) {
+		case "blocked":
+			query += ` AND EXISTS (
+				SELECT 1
+				FROM task_dependencies td
+				JOIN tasks prerequisite ON prerequisite.id=td.prerequisite_task_id
+				JOIN columns prerequisite_column ON prerequisite_column.id=prerequisite.column_id
+				WHERE td.task_id=t.id
+				  AND prerequisite.project_id=t.project_id
+				  AND prerequisite.deleted_at IS NULL
+				  AND (prerequisite.completed_at IS NULL OR prerequisite_column.semantic_state <> 'completed'))`
+		case "ready":
+			query += ` AND EXISTS (
+				SELECT 1 FROM task_dependencies td
+				JOIN tasks prerequisite ON prerequisite.id=td.prerequisite_task_id
+				WHERE td.task_id=t.id
+				  AND prerequisite.project_id=t.project_id
+				  AND prerequisite.deleted_at IS NULL)
+			AND NOT EXISTS (
+				SELECT 1
+				FROM task_dependencies td
+				JOIN tasks prerequisite ON prerequisite.id=td.prerequisite_task_id
+				JOIN columns prerequisite_column ON prerequisite_column.id=prerequisite.column_id
+				WHERE td.task_id=t.id
+				  AND prerequisite.project_id=t.project_id
+				  AND prerequisite.deleted_at IS NULL
+				  AND (prerequisite.completed_at IS NULL OR prerequisite_column.semantic_state <> 'completed'))`
+		default:
+			return nil, false, invalid("dependency must be blocked or ready", map[string]any{"dependency": filter.Dependency})
+		}
+	}
 	// Completion suppresses the liveness classification of a retained
 	// snapshot. Keep completed tasks visible in ordinary board listings, but
 	// never let them satisfy an agent-state/action-needed filter.
@@ -510,6 +548,9 @@ func (s *Store) listTasks(ctx context.Context, projectID string, filter TaskFilt
 		if err := s.enrichTaskAt(ctx, &result[i], readAt); err != nil {
 			return nil, false, err
 		}
+	}
+	if err := s.populateTaskDependencySummaries(ctx, result); err != nil {
+		return nil, false, err
 	}
 	return result, hasMore, nil
 }

@@ -19,6 +19,19 @@ var (
 	ErrAlreadyExists    = errors.New("already exists")
 	ErrInvalid          = errors.New("invalid input")
 	ErrClaimUnavailable = errors.New("claim unavailable")
+
+	// Dependency mutations use distinct sentinels so the HTTP layer can map
+	// each graph validation failure to a stable response code without parsing
+	// human-readable error text. They intentionally unwrap through Error just
+	// like the existing store errors.
+	ErrDependencySelfReference = errors.New("dependency_self_reference")
+	ErrDependencyCrossProject  = errors.New("dependency_cross_project")
+	ErrDependencyAlreadyExists = errors.New("dependency_already_exists")
+	ErrDependencyLimitExceeded = errors.New("dependency_limit_exceeded")
+	ErrDependencyCycle         = errors.New("dependency_cycle")
+	ErrDependencyNotFound      = errors.New("dependency_not_found")
+	ErrUnmetDependencies       = errors.New("unmet_dependencies")
+	ErrDependencyInUse         = errors.New("dependency_in_use")
 )
 
 type Error struct {
@@ -109,28 +122,60 @@ type Label struct {
 }
 
 type Task struct {
-	ID             string     `json:"id"`
-	Number         int        `json:"number"`
-	Key            string     `json:"key"`
-	ProjectID      string     `json:"project_id"`
-	Kind           string     `json:"kind"`
-	ColumnID       string     `json:"column_id"`
-	Title          string     `json:"title"`
-	Description    string     `json:"description"`
-	Priority       string     `json:"priority"`
-	Position       float64    `json:"position"`
-	Assignee       *string    `json:"assignee,omitempty"`
-	ClaimedBy      *string    `json:"claimed_by,omitempty"`
-	ClaimExpiresAt *string    `json:"claim_expires_at,omitempty"`
-	DueAt          *string    `json:"due_at,omitempty"`
-	Version        int64      `json:"version"`
-	CompletedAt    *string    `json:"completed_at,omitempty"`
-	CreatedAt      string     `json:"created_at"`
-	UpdatedAt      string     `json:"updated_at"`
-	Labels         []Label    `json:"labels"`
-	CommentCount   int        `json:"comment_count"`
-	Bug            *Bug       `json:"bug,omitempty"`
-	AgentWork      *AgentWork `json:"agent_work,omitempty"`
+	ID                string            `json:"id"`
+	Number            int               `json:"number"`
+	Key               string            `json:"key"`
+	ProjectID         string            `json:"project_id"`
+	Kind              string            `json:"kind"`
+	ColumnID          string            `json:"column_id"`
+	Title             string            `json:"title"`
+	Description       string            `json:"description"`
+	Priority          string            `json:"priority"`
+	Position          float64           `json:"position"`
+	Assignee          *string           `json:"assignee,omitempty"`
+	ClaimedBy         *string           `json:"claimed_by,omitempty"`
+	ClaimExpiresAt    *string           `json:"claim_expires_at,omitempty"`
+	DueAt             *string           `json:"due_at,omitempty"`
+	Version           int64             `json:"version"`
+	CompletedAt       *string           `json:"completed_at,omitempty"`
+	CreatedAt         string            `json:"created_at"`
+	UpdatedAt         string            `json:"updated_at"`
+	Labels            []Label           `json:"labels"`
+	CommentCount      int               `json:"comment_count"`
+	Bug               *Bug              `json:"bug,omitempty"`
+	AgentWork         *AgentWork        `json:"agent_work,omitempty"`
+	DependencySummary DependencySummary `json:"dependency_summary"`
+}
+
+// DependencySummary is the bounded, derived graph state embedded in every
+// task response.  Counts include only direct relationships to live,
+// same-project tasks; unmet prerequisites are those not currently in a
+// completed semantic column with a completion timestamp.
+type DependencySummary struct {
+	PrerequisiteCount      int  `json:"prerequisite_count"`
+	UnmetPrerequisiteCount int  `json:"unmet_prerequisite_count"`
+	DependentCount         int  `json:"dependent_count"`
+	Blocked                bool `json:"blocked"`
+}
+
+// TaskReference is the compact relation shape used by expanded dependency
+// reads. Satisfied describes the referenced task itself: for a
+// prerequisite it means the prerequisite is complete; for a dependent it
+// means that dependent is complete.
+type TaskReference struct {
+	ID          string  `json:"id"`
+	Key         string  `json:"key"`
+	Title       string  `json:"title"`
+	CompletedAt *string `json:"completed_at"`
+	Satisfied   bool    `json:"satisfied"`
+}
+
+// TaskDependencies contains the direct graph edges in both directions.
+// Relations are bounded by the mutation limit and are returned in a stable
+// deterministic order.
+type TaskDependencies struct {
+	Prerequisites []TaskReference `json:"prerequisites"`
+	Dependents    []TaskReference `json:"dependents"`
 }
 
 // AgentWork is the latest progress pulse published for a task. Stale and
@@ -310,15 +355,19 @@ type Event struct {
 }
 
 type TaskFilter struct {
-	State        string
-	Column       string
-	Priority     string
-	Label        string
-	Assignee     string
-	Kind         string
-	Severity     string
-	Reporter     string
-	Resolution   string
+	State      string
+	Column     string
+	Priority   string
+	Label      string
+	Assignee   string
+	Kind       string
+	Severity   string
+	Reporter   string
+	Resolution string
+	// Dependency selects derived graph readiness. "blocked" matches tasks
+	// with an unmet prerequisite; "ready" matches tasks with at least one
+	// prerequisite and none unmet. Empty leaves the graph state unfiltered.
+	Dependency   string
 	AgentState   string
 	ActionNeeded bool
 	LiveWork     bool

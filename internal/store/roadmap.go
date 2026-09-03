@@ -199,6 +199,9 @@ func (s *Store) Roadmap(ctx context.Context, projectID string) (Roadmap, error) 
 			return roadmap, err
 		}
 	}
+	if err := s.populateTaskDependencySummaries(ctx, roadmap.Upcoming); err != nil {
+		return roadmap, err
+	}
 	events, err := s.ListRecentEvents(ctx, projectID, 10)
 	if err != nil {
 		return roadmap, err
@@ -296,6 +299,39 @@ func (s *Store) listMyWorkFiltered(ctx context.Context, actorID string, projectI
 		query += ` AND c.semantic_state=?`
 		args = append(args, filter.State)
 	}
+	if filter.Dependency != "" {
+		switch strings.ToLower(strings.TrimSpace(filter.Dependency)) {
+		case "blocked":
+			query += ` AND EXISTS (
+				SELECT 1
+				FROM task_dependencies td
+				JOIN tasks prerequisite ON prerequisite.id=td.prerequisite_task_id
+				JOIN columns prerequisite_column ON prerequisite_column.id=prerequisite.column_id
+				WHERE td.task_id=t.id
+				  AND prerequisite.project_id=t.project_id
+				  AND prerequisite.deleted_at IS NULL
+				  AND (prerequisite.completed_at IS NULL OR prerequisite_column.semantic_state <> 'completed'))`
+		case "ready":
+			query += ` AND EXISTS (
+				SELECT 1
+				FROM task_dependencies td
+				JOIN tasks prerequisite ON prerequisite.id=td.prerequisite_task_id
+				WHERE td.task_id=t.id
+				  AND prerequisite.project_id=t.project_id
+				  AND prerequisite.deleted_at IS NULL)
+			AND NOT EXISTS (
+				SELECT 1
+				FROM task_dependencies td
+				JOIN tasks prerequisite ON prerequisite.id=td.prerequisite_task_id
+				JOIN columns prerequisite_column ON prerequisite_column.id=prerequisite.column_id
+				WHERE td.task_id=t.id
+				  AND prerequisite.project_id=t.project_id
+				  AND prerequisite.deleted_at IS NULL
+				  AND (prerequisite.completed_at IS NULL OR prerequisite_column.semantic_state <> 'completed'))`
+		default:
+			return nil, false, invalid("dependency must be blocked or ready", map[string]any{"dependency": filter.Dependency})
+		}
+	}
 	// Assigned work may still show a completed task when unfiltered, preserving
 	// the legacy assignment view. Liveness filters only classify unfinished
 	// tasks, so a completed task with a retained snapshot must be excluded.
@@ -385,6 +421,9 @@ func (s *Store) listMyWorkFiltered(ctx context.Context, actorID string, projectI
 		if err := s.enrichTaskAt(ctx, &result[i], readAt); err != nil {
 			return nil, false, err
 		}
+	}
+	if err := s.populateTaskDependencySummaries(ctx, result); err != nil {
+		return nil, false, err
 	}
 	return result, hasMore, nil
 }
