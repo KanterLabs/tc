@@ -307,6 +307,7 @@
   let showTokenForm = false;
   let codexAccount: CodexAccountStatus | null = null;
   let codexLogin: CodexDeviceLogin | null = null;
+  let codexStatusLoading = false;
   let codexLoading = false;
   let codexError = '';
 
@@ -801,6 +802,8 @@
     eventsCursor = undefined;
     codexAccount = null;
     codexLogin = null;
+    codexStatusLoading = false;
+    codexLoading = false;
     codexError = '';
     if (pollTimer) window.clearInterval(pollTimer);
     if (pulseTimer) window.clearInterval(pulseTimer);
@@ -1318,7 +1321,7 @@
   }
 
   async function loadCodexAccount(refresh = false) {
-    codexLoading = true;
+    codexStatusLoading = true;
     codexError = '';
     try {
       codexAccount = await api.codexAccount(refresh);
@@ -1326,7 +1329,7 @@
     } catch (error) {
       codexError = friendlyError(error, 'Codex connection status could not be loaded.');
     } finally {
-      codexLoading = false;
+      codexStatusLoading = false;
     }
   }
 
@@ -3526,9 +3529,9 @@
           <section class="settings-section codex-section">
             <div class="settings-section-heading"><div><span class="eyebrow">Luna assistant</span><h2>Your Codex subscription</h2><p>Connect your own Codex-enabled ChatGPT account. Helm stores it only in your private user runtime and never shares it with another user.</p></div>{#if codexAccount?.connected}<span class="codex-connected">✓ Connected</span>{/if}</div>
             {#if codexError}<div class="inline-alert error" role="alert"><span>!</span>{codexError}</div>{/if}
-            {#if codexLoading && !codexAccount && !codexLogin}<div class="list-skeleton"><div></div></div>
+            {#if codexStatusLoading && !codexAccount && !codexLogin}<div class="list-skeleton"><div></div></div>
             {:else if codexLogin}<div class="codex-device-panel"><div><strong>Finish connecting in ChatGPT</strong><p>Open the secure sign-in page and enter this one-time code.</p></div><div class="codex-code-row"><code>{codexLogin.user_code}</code><button class="button quiet-button compact-button" type="button" on:click={copyCodexCode}>Copy</button></div><div class="form-actions"><button class="text-button" type="button" disabled={codexLoading} on:click={cancelCodexLogin}>Cancel login</button><a class="button primary" href={codexLogin.verification_url} target="_blank" rel="noreferrer">Open ChatGPT ↗</a></div></div>
-            {:else if codexAccount?.connected}<div class="codex-account-row"><span class="agent-avatar">✦</span><span><strong>{codexAccount.email || 'ChatGPT account'}</strong><small>{codexAccount.plan_type ? `${codexAccount.plan_type} plan` : 'Codex enabled'}</small></span><div class="form-actions"><button class="button quiet-button compact-button" type="button" disabled={codexLoading} on:click={() => loadCodexAccount(true)}>Check access</button><button class="text-button danger-button" type="button" disabled={codexLoading} on:click={disconnectCodex}>Disconnect</button></div></div>
+            {:else if codexAccount?.connected}<div class="codex-account-row"><span class="agent-avatar">✦</span><span><strong>{codexAccount.email || 'ChatGPT account'}</strong><small>{codexAccount.plan_type ? `${codexAccount.plan_type} plan` : 'Codex enabled'}</small></span><div class="form-actions"><button class="button quiet-button compact-button" type="button" disabled={codexLoading || codexStatusLoading} on:click={() => loadCodexAccount(true)}>Check access</button><button class="text-button danger-button" type="button" disabled={codexLoading} on:click={disconnectCodex}>Disconnect</button></div></div>
             {:else}<div class="codex-empty"><p>Luna needs your personal ChatGPT subscription before it can draft tasks. Device-code login works on remote and headless self-hosted Helm installations.</p><button class="button primary" type="button" disabled={codexLoading} on:click={connectCodex}>{#if codexLoading}<span class="button-spinner"></span>{/if}Connect Codex</button></div>{/if}
           </section>
           {#if agentsError}<div class="inline-alert error content-alert" role="alert"><span>!</span>{agentsError}<button class="text-button" type="button" on:click={loadAgents}>Retry</button></div>{/if}
