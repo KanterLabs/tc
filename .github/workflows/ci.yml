@@ -344,6 +344,7 @@ jobs:
       - name: Publish beta DNS and validate live Access
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.BETA_CLOUDFLARE_API_TOKEN }}
+          HELM_ADMIN_EMAIL: ${{ secrets.BETA_ADMIN_EMAIL }}
           CF_ACCESS_CLIENT_ID: ${{ secrets.BETA_CF_ACCESS_CLIENT_ID }}
           CF_ACCESS_CLIENT_SECRET: ${{ secrets.BETA_CF_ACCESS_CLIENT_SECRET }}
           HELM_REQUIRE_SERVICE_AUTH_PROBE: "1"
