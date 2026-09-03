@@ -61,7 +61,12 @@ command -v curl >/dev/null 2>&1 || { printf 'curl is required\n' >&2; exit 1; }
 command -v jq >/dev/null 2>&1 || { printf 'jq is required\n' >&2; exit 1; }
 
 CF_API=https://api.cloudflare.com/client/v4
-CF_HEADER_FILE=$(mktemp /tmp/helm-cloudflare-header.XXXXXX)
+SECURE_TMP_ROOT=${TMPDIR:-${RUNNER_TEMP:-/tmp}}
+[[ -d "$SECURE_TMP_ROOT" && -w "$SECURE_TMP_ROOT" ]] || {
+	printf 'secure temporary directory is unavailable\n' >&2
+	exit 1
+}
+CF_HEADER_FILE=$(mktemp "$SECURE_TMP_ROOT/helm-cloudflare-header.XXXXXX")
 CF_SERVICE_HEADER_FILE=
 CF_SERVICE_RESPONSE_HEADERS=
 CF_SERVICE_RESPONSE_BODY=
@@ -252,9 +257,10 @@ service_auth_probe() {
 		printf 'service_auth_probe=skipped\n'
 		return 0
 	}
-	CF_SERVICE_HEADER_FILE=$(mktemp /tmp/helm-cloudflare-service-header.XXXXXX)
-	CF_SERVICE_RESPONSE_HEADERS=$(mktemp /tmp/helm-cloudflare-service-response-headers.XXXXXX)
-	CF_SERVICE_RESPONSE_BODY=$(mktemp /tmp/helm-cloudflare-service-response-body.XXXXXX)
+	local secure_tmp_root=${SECURE_TMP_ROOT:-${TMPDIR:-${RUNNER_TEMP:-/tmp}}}
+	CF_SERVICE_HEADER_FILE=$(mktemp "$secure_tmp_root/helm-cloudflare-service-header.XXXXXX")
+	CF_SERVICE_RESPONSE_HEADERS=$(mktemp "$secure_tmp_root/helm-cloudflare-service-response-headers.XXXXXX")
+	CF_SERVICE_RESPONSE_BODY=$(mktemp "$secure_tmp_root/helm-cloudflare-service-response-body.XXXXXX")
 	chmod 0600 "$CF_SERVICE_HEADER_FILE" "$CF_SERVICE_RESPONSE_HEADERS" "$CF_SERVICE_RESPONSE_BODY"
 	# Keep the one-time service credentials in a mode-0600 curl config file. The
 	# values never appear in argv, logs, or the response diagnostics below.

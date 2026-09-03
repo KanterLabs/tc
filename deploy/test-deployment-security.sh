@@ -1152,7 +1152,10 @@ cloudflare_prepare_provider_case() {
 	status=$?
 	set -e
 	if [[ "$expected_status" = success ]]; then
-		[[ "$status" = 0 ]] || fail "Cloudflare provider $name unexpectedly failed"
+		if [[ "$status" != 0 ]]; then
+			sed -n '1,80p' "$output" >&2
+			fail "Cloudflare provider $name unexpectedly failed"
+		fi
 		contains 'cloudflare_prepare=ok' "$output"
 	else
 		[[ "$status" -ne 0 ]] || fail "Cloudflare provider $name unexpectedly succeeded"

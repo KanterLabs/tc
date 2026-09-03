@@ -34,7 +34,12 @@ command -v curl >/dev/null 2>&1 || { printf 'curl is required\n' >&2; exit 1; }
 command -v jq >/dev/null 2>&1 || { printf 'jq is required\n' >&2; exit 1; }
 
 CF_API=https://api.cloudflare.com/client/v4
-CF_HEADER_FILE=$(mktemp /tmp/helm-cloudflare-header.XXXXXX)
+SECURE_TMP_ROOT=${TMPDIR:-${RUNNER_TEMP:-/tmp}}
+[[ -d "$SECURE_TMP_ROOT" && -w "$SECURE_TMP_ROOT" ]] || {
+	printf 'secure temporary directory is unavailable\n' >&2
+	exit 1
+}
+CF_HEADER_FILE=$(mktemp "$SECURE_TMP_ROOT/helm-cloudflare-header.XXXXXX")
 CREATED_SERVICE_TOKEN_ID=
 CREATED_SERVICE_TOKEN_OUTPUT=
 
@@ -553,7 +558,8 @@ validate_owner_env() {
 		}
 		case "$line" in
 			''|'#'*) ;;
-			HELM_ADDR=*|HELM_DB=*|HELM_AUTH_MODE=*|HELM_PUBLIC_ORIGIN=*|\
+			HELM_ADDR=*|HELM_DB=*|HELM_LUNA_ENABLED=*|HELM_LUNA_MODEL=*|HELM_LUNA_EFFORT=*|\
+			HELM_AUTH_MODE=*|HELM_PUBLIC_ORIGIN=*|\
 			HELM_ADMIN_EMAIL=*|HELM_CLOUDFLARE_ISSUER=*|HELM_CF_ACCESS_AUDIENCES=*|\
 			HELM_SECURE_COOKIES=*|HELM_DEMO_SEED=*|\
 			ROADMAP_ADDR=*|ROADMAP_DB=*|ROADMAP_AUTH_MODE=*|ROADMAP_PUBLIC_ORIGIN=*|\
@@ -569,6 +575,9 @@ validate_owner_env() {
 	local expected_lines=(
 		'HELM_ADDR=127.0.0.1:8080'
 		'HELM_DB=/var/lib/roadmap/data/roadmap.db'
+		'HELM_LUNA_ENABLED=true'
+		'HELM_LUNA_MODEL=gpt-5.6-luna'
+		'HELM_LUNA_EFFORT=medium'
 		'HELM_AUTH_MODE=cloudflare'
 		'HELM_PUBLIC_ORIGIN=https://tc.shanekanterman.dev'
 		"HELM_ADMIN_EMAIL=$email"
