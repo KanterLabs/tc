@@ -13,8 +13,11 @@ import {
   filterTasks,
   formatDate,
   groupLiveWork,
+  helmStorageKeys,
   isAgentWorkStale,
   isMissingAgentWorkCandidate,
+  legacyRoadmapStorageKeys,
+  loadRecentProjects,
   liveWorkGroup,
   matchesAgentWorkFilter,
   moveTaskLocal,
@@ -25,6 +28,8 @@ import {
   roadmapLiveWorkCounts,
   matchesRoadmapActivity,
   parseTaskRoute,
+  readMigratedStorage,
+  rememberProject,
   sortRoadmapLiveWork,
   sortLiveWork,
   shouldShowAgentPulse,
@@ -83,6 +88,18 @@ function liveTask(id: string, work: Partial<AgentWork> | null, updatedAt?: strin
   };
 }
 
+function memoryStorage(entries: Record<string, string> = {}): Storage {
+  const values = new Map(Object.entries(entries));
+  return {
+    get length() { return values.size; },
+    clear: () => values.clear(),
+    getItem: (key) => values.get(key) ?? null,
+    key: (index) => [...values.keys()][index] ?? null,
+    removeItem: (key) => { values.delete(key); },
+    setItem: (key, value) => { values.set(key, value); }
+  };
+}
+
 describe('board state helpers', () => {
   it('filters by text, priority, label, and column semantic state', () => {
     expect(filterTasks(tasks, columns, { query: 'launch', priority: 'all', label: 'all', assignee: 'all', state: 'all' }).map((task) => task.id)).toEqual(['1']);
@@ -127,6 +144,20 @@ describe('board state helpers', () => {
   it('creates readable project initials', () => {
     expect(projectInitials({ name: 'Product Operations', key: 'OPS' })).toBe('PO');
     expect(projectInitials({ name: 'Roadmap', key: 'RM' })).toBe('RM');
+  });
+
+  it('migrates retained Roadmap browser preferences without deleting them', () => {
+    const storage = memoryStorage({
+      [legacyRoadmapStorageKeys.theme]: 'dark',
+      [legacyRoadmapStorageKeys.recentProjects]: JSON.stringify(['legacy-project'])
+    });
+
+    expect(readMigratedStorage(storage, helmStorageKeys.theme, legacyRoadmapStorageKeys.theme)).toBe('dark');
+    expect(storage.getItem(helmStorageKeys.theme)).toBe('dark');
+    expect(storage.getItem(legacyRoadmapStorageKeys.theme)).toBe('dark');
+    expect(loadRecentProjects(storage)).toEqual(['legacy-project']);
+    expect(rememberProject('new-project', storage)).toEqual(['new-project', 'legacy-project']);
+    expect(storage.getItem(helmStorageKeys.recentProjects)).toBe(JSON.stringify(['new-project', 'legacy-project']));
   });
 
   it('keeps due dates stable as calendar days across conversions and formatting', () => {

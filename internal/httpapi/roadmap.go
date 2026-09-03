@@ -5,8 +5,8 @@ import (
 	"net/http"
 	"strconv"
 
-	"roadmap/internal/auth"
-	"roadmap/internal/store"
+	"github.com/KanterLabs/helm/internal/auth"
+	"github.com/KanterLabs/helm/internal/store"
 )
 
 func (s *Server) roadmap(w http.ResponseWriter, r *http.Request, identity auth.Identity, reference string, projectRoute bool) {

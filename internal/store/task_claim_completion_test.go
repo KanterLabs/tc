@@ -7,7 +7,7 @@ import (
 	"testing"
 	"time"
 
-	"roadmap/internal/db"
+	"github.com/KanterLabs/helm/internal/db"
 )
 
 type taskClaimCompletionFixture struct {

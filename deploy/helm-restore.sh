@@ -6,20 +6,33 @@
 set -Eeuo pipefail
 umask 077
 
-STATE_DIR=${ROADMAP_STATE_DIR:-/var/lib/roadmap}
-DATA_DIR=${ROADMAP_DATA_DIR:-$STATE_DIR/data}
-DB_PATH=${ROADMAP_DB_PATH:-$DATA_DIR/roadmap.db}
-BACKUP_DIR=${ROADMAP_BACKUP_DIR:-$STATE_DIR/backups}
-RETENTION=${ROADMAP_BACKUP_RETENTION:-14}
+compat_env() {
+	local canonical=$1 legacy=$2 default_value=${3:-} canonical_value legacy_value
+	canonical_value=${!canonical:-}
+	legacy_value=${!legacy:-}
+	[[ -z "$canonical_value" || -z "$legacy_value" || "$canonical_value" = "$legacy_value" ]] || {
+		printf '[helm-restore] %s and %s must match when both are set\n' "$canonical" "$legacy" >&2
+		exit 1
+	}
+	printf '%s' "${canonical_value:-${legacy_value:-$default_value}}"
+}
+
+STATE_DIR=$(compat_env HELM_STATE_DIR ROADMAP_STATE_DIR /var/lib/roadmap)
+DATA_DIR=$(compat_env HELM_DATA_DIR ROADMAP_DATA_DIR "$STATE_DIR/data")
+DB_PATH=$(compat_env HELM_DB_PATH ROADMAP_DB_PATH "$DATA_DIR/roadmap.db")
+BACKUP_DIR=$(compat_env HELM_BACKUP_DIR ROADMAP_BACKUP_DIR "$STATE_DIR/backups")
+RETENTION=$(compat_env HELM_BACKUP_RETENTION ROADMAP_BACKUP_RETENTION 14)
 BACKUP_PATH=${1:-}
 LOCK_PATH="$STATE_DIR/deploy.lock"
 SERVICE_STOP_TIMEOUT=30
-MIGRATION_DIGEST=${ROADMAP_MIGRATION_DIGEST:-}
-MIGRATION_INFO_BINARY=${ROADMAP_MIGRATION_INFO_BINARY:-$STATE_DIR/current/roadmap}
-MIGRATION_BINARY=${ROADMAP_MIGRATION_BINARY:-$STATE_DIR/current/roadmap}
+MIGRATION_DIGEST=$(compat_env HELM_MIGRATION_DIGEST ROADMAP_MIGRATION_DIGEST)
+default_migration_binary="$STATE_DIR/current/helm"
+[[ -x "$default_migration_binary" && ! -L "$default_migration_binary" ]] || default_migration_binary="$STATE_DIR/current/roadmap"
+MIGRATION_INFO_BINARY=$(compat_env HELM_MIGRATION_INFO_BINARY ROADMAP_MIGRATION_INFO_BINARY "$default_migration_binary")
+MIGRATION_BINARY=$(compat_env HELM_MIGRATION_BINARY ROADMAP_MIGRATION_BINARY "$default_migration_binary")
 
 fail() {
-	printf '[roadmap-restore] %s\n' "$*" >&2
+	printf '[helm-restore] %s\n' "$*" >&2
 	exit 1
 }
 
@@ -298,12 +311,12 @@ elif [[ -e "$DB_PATH" || -L "$DB_PATH" ]]; then
 	fail 'active database path is not a regular file'
 fi
 
-roadmap_state_before=$(unit_state roadmap.service)
+helm_state_before=$(unit_state helm.service)
 cloudflared_state_before=$(unit_state cloudflared.service)
-case "$roadmap_state_before" in
-	active|activating|deactivating) roadmap_was_active=1 ;;
-	inactive|failed|dead) roadmap_was_active=0 ;;
-	*) fail 'could not determine roadmap.service state' ;;
+case "$helm_state_before" in
+	active|activating|deactivating) helm_was_active=1 ;;
+	inactive|failed|dead) helm_was_active=0 ;;
+	*) fail 'could not determine helm.service state' ;;
 esac
 case "$cloudflared_state_before" in
 	active|activating|deactivating) cloudflared_was_active=1 ;;
@@ -387,12 +400,12 @@ migrate_staged_candidate() {
 
 restore_prior_services() {
 	local status=0
-	if (( roadmap_was_active == 1 )); then
-		if ! systemctl start roadmap.service || ! systemctl is-active --quiet roadmap.service || ! healthy; then
+	if (( helm_was_active == 1 )); then
+		if ! systemctl start helm.service || ! systemctl is-active --quiet helm.service || ! healthy; then
 			status=1
 		fi
 	else
-		stop_unit roadmap.service || status=1
+		stop_unit helm.service || status=1
 	fi
 	if (( cloudflared_was_active == 1 )); then
 		if ! systemctl start cloudflared.service || ! systemctl is-active --quiet cloudflared.service; then
@@ -408,7 +421,7 @@ recover_current() {
 	(( current_snapshot_ready == 1 )) || return 1
 	backup_set_is_complete "$current_snapshot" || return 1
 	stop_unit cloudflared.service || return 1
-	stop_unit roadmap.service || return 1
+	stop_unit helm.service || return 1
 	restore_database_file "$current_snapshot" || return 1
 	restore_prior_services
 }
@@ -587,7 +600,7 @@ trap cleanup EXIT
 
 services_stopped=1
 stop_unit cloudflared.service || fail 'could not stop cloudflared.service and verify it is inactive'
-stop_unit roadmap.service || fail 'could not stop roadmap.service and verify it is inactive'
+stop_unit helm.service || fail 'could not stop helm.service and verify it is inactive'
 
 # Preserve the active database through SQLite's online backup API before any
 # replacement. Stage all three files first, validate them as a complete set,
@@ -697,13 +710,14 @@ if [[ -n "${selected_fd:-}" ]]; then
 	selected_fd=
 fi
 
-systemctl start roadmap.service
+systemctl start helm.service
 if ! healthy; then
 	fail 'restored database failed the application health check; active snapshot retained for recovery'
 fi
 
 systemctl start cloudflared.service
-systemctl is-active --quiet roadmap.service || fail 'roadmap service is not active after restore'
+systemctl is-active --quiet helm.service || fail 'Helm service is not active after restore'
+systemctl is-active --quiet roadmap.service || fail 'Roadmap service compatibility alias is not active after restore'
 systemctl is-active --quiet cloudflared.service || fail 'cloudflared service is not active after restore'
 
 printf 'restored_backup=%s\n' "$BACKUP_PATH"

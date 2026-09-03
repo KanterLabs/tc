@@ -88,7 +88,12 @@ def _truthy(value: Any) -> bool:
 
 def _interval_seconds(environ: Mapping[str, str] | None = None) -> float:
     environ = os.environ if environ is None else environ
-    for key in ("TC_ROADMAP_HEARTBEAT_INTERVAL_SECONDS", "TC_ROADMAP_HEARTBEAT_INTERVAL"):
+    for key in (
+        "TC_ROADMAP_HEARTBEAT_INTERVAL_SECONDS",
+        "TC_ROADMAP_HEARTBEAT_INTERVAL",
+        "HELM_HEARTBEAT_INTERVAL_SECONDS",
+        "HELM_HEARTBEAT_INTERVAL",
+    ):
         raw = str(environ.get(key, "")).strip()
         if not raw:
             continue

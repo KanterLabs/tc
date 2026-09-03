@@ -1,11 +1,16 @@
 import { defineConfig, devices } from '@playwright/test';
 
 /**
- * The browser suite intentionally talks to an already-running Roadmap
+ * The browser suite intentionally talks to an already-running Helm
  * server. This keeps the suite useful against a container, a local binary,
  * or a deployed preview without coupling it to a particular server command.
  */
-const baseURL = process.env.ROADMAP_E2E_BASE_URL || 'http://127.0.0.1:18080';
+const helmBaseURL = process.env.HELM_E2E_BASE_URL;
+const legacyBaseURL = process.env.ROADMAP_E2E_BASE_URL;
+if (helmBaseURL && legacyBaseURL && helmBaseURL !== legacyBaseURL) {
+  throw new Error('HELM_E2E_BASE_URL and ROADMAP_E2E_BASE_URL must match when both are set');
+}
+const baseURL = helmBaseURL || legacyBaseURL || 'http://127.0.0.1:18080';
 
 export default defineConfig({
   testDir: './e2e',

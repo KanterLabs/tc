@@ -10,7 +10,7 @@ import (
 	"testing"
 	"time"
 
-	"roadmap/internal/store"
+	"github.com/KanterLabs/helm/internal/store"
 )
 
 func errorCode(t *testing.T, response interface{ Result() *http.Response }) string {

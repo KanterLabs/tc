@@ -18,15 +18,18 @@
     filterTasks,
     formatDate,
     formatRelative,
+    helmStorageKeys,
     isDueSoon,
     isAgentWorkStale as isWorkStale,
     isMissingAgentWorkCandidate,
     isOverdue,
+    legacyRoadmapStorageKeys,
     loadRecentProjects,
     matchesAgentWorkFilter,
     moveTaskLocal,
     nextPosition,
     projectInitials,
+    readMigratedStorage,
     parseTaskRoute,
     rememberProject,
     taskDeepLink,
@@ -67,6 +70,7 @@
   import AgentWorkPanel from './lib/components/AgentWorkPanel.svelte';
   import AuditReview from './lib/components/AuditReview.svelte';
   import BoardTimeline from './lib/components/BoardTimeline.svelte';
+  import HelmMark from './lib/components/HelmMark.svelte';
   import LiveWorkRow from './lib/components/LiveWorkRow.svelte';
   import RoadmapActivity from './lib/components/RoadmapActivity.svelte';
   import RoadmapLiveWork from './lib/components/RoadmapLiveWork.svelte';
@@ -142,7 +146,8 @@
   let setupEmail = '';
   let setupPassword = '';
 
-  const accessBootstrapKey = 'roadmap.cloudflare-access-bootstrap';
+  const accessBootstrapKey = 'helm.cloudflare-access-bootstrap';
+  const legacyAccessBootstrapKey = 'roadmap.cloudflare-access-bootstrap';
 
   let theme: 'light' | 'dark' = 'light';
   let view: View = 'board';
@@ -606,7 +611,7 @@
   }
 
   onMount(() => {
-    theme = (localStorage.getItem('roadmap.theme') as 'light' | 'dark' | null) || 'light';
+    theme = (readMigratedStorage(localStorage, helmStorageKeys.theme, legacyRoadmapStorageKeys.theme) as 'light' | 'dark' | null) || 'light';
     applyTheme();
     recentProjectIds = loadRecentProjects(localStorage);
     const cleanup = () => {
@@ -636,7 +641,7 @@
 
   function toggleTheme() {
     theme = theme === 'dark' ? 'light' : 'dark';
-    localStorage.setItem('roadmap.theme', theme);
+    localStorage.setItem(helmStorageKeys.theme, theme);
     applyTheme();
   }
 
@@ -648,6 +653,7 @@
       authStatus = await api.authStatus();
       authStatusLoaded = true;
       sessionStorage.removeItem(accessBootstrapKey);
+      sessionStorage.removeItem(legacyAccessBootstrapKey);
       if (authStatus.setup_required || authStatus.needs_setup) {
         authView = 'setup';
         booting = false;
@@ -684,13 +690,13 @@
         !authStatusLoaded &&
         error instanceof TypeError &&
         window.location.protocol === 'https:' &&
-        sessionStorage.getItem(accessBootstrapKey) !== window.location.origin
+        readMigratedStorage(sessionStorage, accessBootstrapKey, legacyAccessBootstrapKey) !== window.location.origin
       ) {
         sessionStorage.setItem(accessBootstrapKey, window.location.origin);
         window.location.assign(`${API_PREFIX}/auth/status`);
         return;
       }
-      authError = friendlyError(error, 'Roadmap could not connect to the server.');
+      authError = friendlyError(error, 'Helm could not connect to the server.');
     } finally {
       booting = false;
     }
@@ -817,7 +823,7 @@
       if (selectionVersion !== projectSwitchVersion) return;
       const routeSlug = getProjectSlugFromLocation();
       const taskRoute = getTaskRouteFromLocation();
-      const remembered = localStorage.getItem('roadmap.last-project');
+      const remembered = readMigratedStorage(localStorage, helmStorageKeys.lastProject, legacyRoadmapStorageKeys.lastProject);
       const target = nextProjects.find((project) => project.slug === routeSlug) || nextProjects.find((project) => project.slug === remembered) || nextProjects[0];
       if (target) {
         activeProjectSlug = target.slug;
@@ -1560,7 +1566,7 @@
     boardTimelineError = '';
     boardTimelineProjectId = '';
     recentProjectIds = rememberProject(project.id, localStorage);
-    localStorage.setItem('roadmap.last-project', project.slug);
+    localStorage.setItem(helmStorageKeys.lastProject, project.slug);
     projectSwitcherOpen = false;
     closeCommandPalette();
     view = 'board';
@@ -2861,7 +2867,7 @@
     roadmapProjectId = undefined;
     view = 'board';
     recentProjectIds = rememberProject(project.id, localStorage);
-    localStorage.setItem('roadmap.last-project', project.slug);
+    localStorage.setItem(helmStorageKeys.lastProject, project.slug);
     navigate(taskDeepLink(project.slug, task.key, 'activity'));
     await loadBoard();
     await openTask(task, 'activity');
@@ -3004,9 +3010,9 @@
 
 {#if booting}
   <div class="splash" aria-live="polite">
-    <div class="brand-mark brand-mark-large">R</div>
+    <HelmMark size={46} decorative className="brand-mark brand-mark-large" />
     <div class="splash-copy">
-      <strong>Roadmap</strong>
+      <strong>Helm</strong>
       <span>Getting your workspace ready…</span>
     </div>
     <span class="spinner" aria-label="Loading"></span>
@@ -3015,10 +3021,10 @@
   <main class="auth-page">
     <section class="auth-panel" aria-labelledby="auth-heading">
       <div class="auth-intro">
-        <div class="brand-mark">R</div>
+        <HelmMark size={30} className="brand-mark" />
         <span class="eyebrow">Agent-first planning</span>
         <h1 id="auth-heading">Make progress visible.</h1>
-        <p>Roadmap keeps projects focused, tasks accountable, and every handoff easy to follow.</p>
+        <p>Helm keeps projects focused, tasks accountable, and every handoff easy to follow.</p>
         <div class="auth-proof">
           <span class="proof-icon">✦</span>
           <span>One calm place for humans and agents to move work forward.</span>
@@ -3057,8 +3063,8 @@
     <nav class="sidebar" aria-label="Primary navigation">
       <div class="sidebar-top">
         <button class="brand-lockup" type="button" aria-label="Go to current project" on:click={() => activeProject && setView('board')}>
-          <span class="brand-mark">R</span>
-          <span><strong>Roadmap</strong><small>Stay in motion</small></span>
+          <HelmMark size={30} decorative className="brand-mark" />
+          <span><strong>Helm</strong><small>Stay in motion</small></span>
         </button>
         <button class="button new-project-button" type="button" data-project-modal-trigger on:click={openProjectModal}><span aria-hidden="true">＋</span> New project</button>
       </div>
@@ -3114,7 +3120,7 @@
 
     <div class="main-shell">
       <header class="topbar">
-        <div class="mobile-brand"><span class="brand-mark">R</span><strong>Roadmap</strong></div>
+        <div class="mobile-brand"><HelmMark size={30} decorative className="brand-mark" /><strong>Helm</strong></div>
         <div class="topbar-project">
           {#if activeProject}
             <button class="project-picker" type="button" data-project-picker-trigger aria-label={`Switch project, current ${activeProject.name}`} aria-expanded={projectSwitcherOpen} on:click={() => { projectSwitcherOpen = !projectSwitcherOpen; closeCommandPalette(); }}>
@@ -3332,7 +3338,7 @@
         {:else}
           <section class="page-heading"><div><div class="breadcrumbs"><span>Workspace</span><span>/</span><span>Preferences</span></div><h1>Settings</h1><p>Manage the agents and tokens that help your workspace move.</p></div></section>
           {#if agentsError}<div class="inline-alert error content-alert" role="alert"><span>!</span>{agentsError}<button class="text-button" type="button" on:click={loadAgents}>Retry</button></div>{/if}
-          <section class="settings-layout"><div class="settings-main"><div class="settings-section"><div class="settings-section-heading"><div><span class="eyebrow">Coordination</span><h2>Agents &amp; tokens</h2><p>Give software agents scoped access without sharing a human login.</p></div><button class="button primary" type="button" on:click={() => showAgentForm = !showAgentForm}>＋ Add agent</button></div>{#if showAgentForm}<div class="settings-form"><label>Agent name<input bind:value={agentNameDraft} placeholder="Release assistant" /></label><label>Description <span class="optional">Optional</span><textarea rows="2" bind:value={agentDescriptionDraft} placeholder="What is this agent responsible for?"></textarea></label><div class="form-actions"><button class="text-button" type="button" on:click={() => showAgentForm = false}>Cancel</button><button class="button primary" type="button" disabled={!agentNameDraft.trim()} on:click={createAgent}>Create agent</button></div></div>{/if}{#if agentsLoading}<div class="list-skeleton">{#each [1, 2] as item}<div></div>{/each}</div>{:else if !agents.length}<div class="empty-state compact-empty"><div class="empty-icon">✦</div><h3>No agents yet</h3><p>Create a scoped identity for the tools that collaborate with you.</p><button class="button quiet-button" type="button" on:click={() => showAgentForm = true}>Create your first agent</button></div>{:else}<div class="agent-list">{#each agents as agent}<article class="agent-card"><div class="agent-card-header"><span class="agent-avatar">✦</span><div><h3>{agent.name}</h3><p>{agent.description || 'No description'}</p></div><button class="button quiet-button compact-button" type="button" data-token-trigger on:click={() => { selectedAgentId = agent.id; showTokenForm = selectedAgentId === agent.id && !showTokenForm; }}>＋ Token</button></div>{#if agent.tokens?.length}<div class="token-list">{#each agent.tokens as token}<div class="token-row"><span class="token-icon">⌘</span><span class="token-info"><strong>{token.name}</strong><small>{token.scopes.join(' · ')}</small></span><span class="token-date">{token.expires_at ? `Expires ${formatDate(token.expires_at)}` : 'No expiry'}</span><button class="icon-button tiny danger-button" type="button" aria-label={`Revoke ${token.name}`} on:click={() => deleteToken(token)}>×</button></div>{/each}</div>{:else}<div class="agent-no-tokens">No active tokens</div>{/if}{#if showTokenForm && selectedAgentId === agent.id}<div class="token-form"><div class="settings-form"><label>Token name<input bind:value={tokenNameDraft} placeholder="CI deployment token" /></label><fieldset><legend>Scopes</legend><div class="scope-grid">{#each scopeOptions as scope}<label class="check-label"><input type="checkbox" checked={tokenScopes.includes(scope)} on:change={() => toggleScope(scope)} /><span>{scope}</span></label>{/each}</div></fieldset><fieldset><legend>Limit to projects <span class="optional">Optional</span></legend><div class="scope-grid project-checks">{#each projects as project}<label class="check-label"><input type="checkbox" checked={tokenProjectIds.includes(project.id)} on:change={() => toggleTokenProject(project.id)} /><span>{project.name}</span></label>{/each}</div></fieldset><div class="form-actions"><button class="text-button" type="button" on:click={() => showTokenForm = false}>Cancel</button><button class="button primary" type="button" disabled={!tokenNameDraft.trim() || !tokenScopes.length || tokenCreating} on:click={createToken}>{#if tokenCreating}<span class="button-spinner"></span>{/if}Create token</button></div></div></div>{/if}</article>{/each}</div>{/if}</div><div class="settings-section appearance-section"><div class="settings-section-heading"><div><span class="eyebrow">Workspace</span><h2>Appearance</h2><p>Choose how Roadmap feels on this device.</p></div></div><div class="theme-options"><button class:chosen={theme === 'light'} type="button" on:click={() => { theme = 'light'; localStorage.setItem('roadmap.theme', theme); applyTheme(); }}><span class="theme-preview light-preview">☼</span><span><strong>Light</strong><small>Clear and airy</small></span>{#if theme === 'light'}<span class="theme-check">✓</span>{/if}</button><button class:chosen={theme === 'dark'} type="button" on:click={() => { theme = 'dark'; localStorage.setItem('roadmap.theme', theme); applyTheme(); }}><span class="theme-preview dark-preview">☾</span><span><strong>Dark</strong><small>Focused and low-glare</small></span>{#if theme === 'dark'}<span class="theme-check">✓</span>{/if}</button></div></div></div><aside class="settings-aside"><div class="settings-aside-card"><span class="aside-icon">◎</span><h3>Built for safe handoffs</h3><p>Every mutation records its actor. Scoped agent tokens and optimistic versions keep collaboration predictable.</p><span class="aside-rule"></span><span class="aside-caption">Roadmap v1 · API-connected</span></div></aside></section>
+          <section class="settings-layout"><div class="settings-main"><div class="settings-section"><div class="settings-section-heading"><div><span class="eyebrow">Coordination</span><h2>Agents &amp; tokens</h2><p>Give software agents scoped access without sharing a human login.</p></div><button class="button primary" type="button" on:click={() => showAgentForm = !showAgentForm}>＋ Add agent</button></div>{#if showAgentForm}<div class="settings-form"><label>Agent name<input bind:value={agentNameDraft} placeholder="Release assistant" /></label><label>Description <span class="optional">Optional</span><textarea rows="2" bind:value={agentDescriptionDraft} placeholder="What is this agent responsible for?"></textarea></label><div class="form-actions"><button class="text-button" type="button" on:click={() => showAgentForm = false}>Cancel</button><button class="button primary" type="button" disabled={!agentNameDraft.trim()} on:click={createAgent}>Create agent</button></div></div>{/if}{#if agentsLoading}<div class="list-skeleton">{#each [1, 2] as item}<div></div>{/each}</div>{:else if !agents.length}<div class="empty-state compact-empty"><div class="empty-icon">✦</div><h3>No agents yet</h3><p>Create a scoped identity for the tools that collaborate with you.</p><button class="button quiet-button" type="button" on:click={() => showAgentForm = true}>Create your first agent</button></div>{:else}<div class="agent-list">{#each agents as agent}<article class="agent-card"><div class="agent-card-header"><span class="agent-avatar">✦</span><div><h3>{agent.name}</h3><p>{agent.description || 'No description'}</p></div><button class="button quiet-button compact-button" type="button" data-token-trigger on:click={() => { selectedAgentId = agent.id; showTokenForm = selectedAgentId === agent.id && !showTokenForm; }}>＋ Token</button></div>{#if agent.tokens?.length}<div class="token-list">{#each agent.tokens as token}<div class="token-row"><span class="token-icon">⌘</span><span class="token-info"><strong>{token.name}</strong><small>{token.scopes.join(' · ')}</small></span><span class="token-date">{token.expires_at ? `Expires ${formatDate(token.expires_at)}` : 'No expiry'}</span><button class="icon-button tiny danger-button" type="button" aria-label={`Revoke ${token.name}`} on:click={() => deleteToken(token)}>×</button></div>{/each}</div>{:else}<div class="agent-no-tokens">No active tokens</div>{/if}{#if showTokenForm && selectedAgentId === agent.id}<div class="token-form"><div class="settings-form"><label>Token name<input bind:value={tokenNameDraft} placeholder="CI deployment token" /></label><fieldset><legend>Scopes</legend><div class="scope-grid">{#each scopeOptions as scope}<label class="check-label"><input type="checkbox" checked={tokenScopes.includes(scope)} on:change={() => toggleScope(scope)} /><span>{scope}</span></label>{/each}</div></fieldset><fieldset><legend>Limit to projects <span class="optional">Optional</span></legend><div class="scope-grid project-checks">{#each projects as project}<label class="check-label"><input type="checkbox" checked={tokenProjectIds.includes(project.id)} on:change={() => toggleTokenProject(project.id)} /><span>{project.name}</span></label>{/each}</div></fieldset><div class="form-actions"><button class="text-button" type="button" on:click={() => showTokenForm = false}>Cancel</button><button class="button primary" type="button" disabled={!tokenNameDraft.trim() || !tokenScopes.length || tokenCreating} on:click={createToken}>{#if tokenCreating}<span class="button-spinner"></span>{/if}Create token</button></div></div></div>{/if}</article>{/each}</div>{/if}</div><div class="settings-section appearance-section"><div class="settings-section-heading"><div><span class="eyebrow">Workspace</span><h2>Appearance</h2><p>Choose how Helm feels on this device.</p></div></div><div class="theme-options"><button class:chosen={theme === 'light'} type="button" on:click={() => { theme = 'light'; localStorage.setItem(helmStorageKeys.theme, theme); applyTheme(); }}><span class="theme-preview light-preview">☼</span><span><strong>Light</strong><small>Clear and airy</small></span>{#if theme === 'light'}<span class="theme-check">✓</span>{/if}</button><button class:chosen={theme === 'dark'} type="button" on:click={() => { theme = 'dark'; localStorage.setItem(helmStorageKeys.theme, theme); applyTheme(); }}><span class="theme-preview dark-preview">☾</span><span><strong>Dark</strong><small>Focused and low-glare</small></span>{#if theme === 'dark'}<span class="theme-check">✓</span>{/if}</button></div></div></div><aside class="settings-aside"><div class="settings-aside-card"><span class="aside-icon">◎</span><h3>Built for safe handoffs</h3><p>Every mutation records its actor. Scoped agent tokens and optimistic versions keep collaboration predictable.</p><span class="aside-rule"></span><span class="aside-caption">Helm v1 · API-connected</span></div></aside></section>
         {/if}
       </main>
     </div>
@@ -3411,7 +3417,7 @@
 
     {#if commandOpen}
       <div class="modal-backdrop command-backdrop" role="presentation" on:click={closeCommandPalette}></div>
-      <div class="command-menu" role="dialog" aria-modal="true" aria-label="Search Roadmap" use:focusTrap>
+      <div class="command-menu" role="dialog" aria-modal="true" aria-label="Search Helm" use:focusTrap>
         <div class="command-input-wrap"><span aria-hidden="true">⌕</span><input bind:this={commandInput} data-dialog-initial-focus bind:value={commandQuery} on:keydown={commandKeydown} placeholder="Jump to a project or view…" aria-label="Search projects and views" /><kbd>ESC</kbd></div>
         <div class="command-results">{#if commandChoices.length}{#each commandChoices as choice, index}<button class:selected={index === commandIndex} class="command-row" type="button" on:mouseenter={() => commandIndex = index} on:click={() => selectCommand(choice)}><span class={`command-icon ${choice.kind}`}>{choice.kind === 'project' ? (choice.project ? projectInitials(choice.project) : 'P') : choice.kind === 'issue' ? '⚠' : choice.view === 'issues' ? '⚠' : choice.view === 'my-work' ? '◌' : choice.view === 'roadmap' ? '◒' : '⚙'}</span><span><strong>{choice.label}</strong><small>{choice.hint}</small></span><span class="command-enter">↵</span></button>{/each}{:else}<div class="command-empty">No projects, issues, or views match “{commandQuery}”</div>{/if}</div><div class="command-footer"><span><kbd>↑</kbd><kbd>↓</kbd> Navigate</span><span><kbd>↵</kbd> Open</span><span><kbd>ESC</kbd> Close</span></div>
       </div>
@@ -3455,7 +3461,7 @@
 
     {#if showProjectModal}
       <div class="modal-backdrop" role="presentation" on:click={closeProjectModal}></div>
-      <div class="modal project-modal" role="dialog" aria-modal="true" aria-labelledby="project-modal-title" use:focusTrap><div class="modal-header"><div><span class="eyebrow">New workspace</span><h2 id="project-modal-title">Create a project</h2></div><button class="icon-button" type="button" aria-label="Close" on:click={closeProjectModal}>×</button></div>{#if projectFormError}<div class="inline-alert error" role="alert"><span>!</span>{projectFormError}</div>{/if}<form on:submit|preventDefault={createProject}><div class="project-form-title"><span class="project-dot huge" style={`--project-color: ${projectColorDraft}`}>{projectInitials({ name: projectNameDraft || 'New project', key: projectKeyDraft || 'NP' })}</span><div><label>Project name<input data-dialog-initial-focus bind:value={projectNameDraft} placeholder="Product launch" /></label></div></div><div class="form-row"><label>Project key<input maxlength="16" bind:value={projectKeyDraft} placeholder="PROD" /></label><label>Accent color<input class="color-input" type="color" bind:value={projectColorDraft} /></label></div><label>Description <span class="optional">Optional</span><textarea rows="3" bind:value={projectDescriptionDraft} placeholder="A short note about what this project is for."></textarea><span class="field-hint">Roadmap will add Backlog, Ready, In progress, Blocked, and Done columns automatically.</span></label><div class="modal-actions"><button class="text-button" type="button" on:click={closeProjectModal}>Cancel</button><button class="button primary" type="submit" disabled={projectCreating || !projectNameDraft.trim() || !projectKeyDraft.trim()}>{#if projectCreating}<span class="button-spinner"></span>{/if}Create project</button></div></form></div>
+      <div class="modal project-modal" role="dialog" aria-modal="true" aria-labelledby="project-modal-title" use:focusTrap><div class="modal-header"><div><span class="eyebrow">New workspace</span><h2 id="project-modal-title">Create a project</h2></div><button class="icon-button" type="button" aria-label="Close" on:click={closeProjectModal}>×</button></div>{#if projectFormError}<div class="inline-alert error" role="alert"><span>!</span>{projectFormError}</div>{/if}<form on:submit|preventDefault={createProject}><div class="project-form-title"><span class="project-dot huge" style={`--project-color: ${projectColorDraft}`}>{projectInitials({ name: projectNameDraft || 'New project', key: projectKeyDraft || 'NP' })}</span><div><label>Project name<input data-dialog-initial-focus bind:value={projectNameDraft} placeholder="Product launch" /></label></div></div><div class="form-row"><label>Project key<input maxlength="16" bind:value={projectKeyDraft} placeholder="PROD" /></label><label>Accent color<input class="color-input" type="color" bind:value={projectColorDraft} /></label></div><label>Description <span class="optional">Optional</span><textarea rows="3" bind:value={projectDescriptionDraft} placeholder="A short note about what this project is for."></textarea><span class="field-hint">Helm will add Backlog, Ready, In progress, Blocked, and Done columns automatically.</span></label><div class="modal-actions"><button class="text-button" type="button" on:click={closeProjectModal}>Cancel</button><button class="button primary" type="submit" disabled={projectCreating || !projectNameDraft.trim() || !projectKeyDraft.trim()}>{#if projectCreating}<span class="button-spinner"></span>{/if}Create project</button></div></form></div>
     {/if}
 
     {#if revealedToken}

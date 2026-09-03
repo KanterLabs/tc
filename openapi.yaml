@@ -1,10 +1,10 @@
 openapi: 3.1.0
 jsonSchemaDialect: https://json-schema.org/draft/2020-12/schema
 info:
-  title: Roadmap API
+  title: Helm API
   version: 1.0.0
   description: |
-    Stable JSON API for the Roadmap project board and its built-in internal bug
+    Stable JSON API for the Helm project board and its built-in internal bug
     tracker. Humans use a session cookie or Cloudflare Access identity; agents
     use scoped bearer tokens.
     Single-resource responses contain the resource directly. Collections use
@@ -21,9 +21,9 @@ info:
     identifier: MIT
 servers:
   - url: /
-    description: Current Roadmap server
+    description: Current Helm server
 externalDocs:
-  description: Roadmap v1 API contract
+  description: Helm v1 API contract
   url: docs/API_CONTRACT.md
 security:
   - cookieAuth: []
@@ -88,7 +88,7 @@ paths:
                 $ref: '#/components/schemas/HealthStatus'
               example:
                 status: ok
-                service: roadmap
+                service: helm
                 revision: 0123456789abcdef0123456789abcdef01234567
         '500':
           $ref: '#/components/responses/InternalServerError'
@@ -114,7 +114,7 @@ paths:
                 $ref: '#/components/schemas/HealthStatus'
               example:
                 status: ok
-                service: roadmap
+                service: helm
                 revision: 0123456789abcdef0123456789abcdef01234567
         '503':
           $ref: '#/components/responses/ServiceUnavailable'
@@ -190,7 +190,7 @@ paths:
   /api/v1:
     get:
       operationId: getApiDiscovery
-      summary: Discover the Roadmap API
+      summary: Discover the Helm API
       description: Returns the API name, version, and optional deployed revision.
       tags:
         - Health
@@ -205,7 +205,7 @@ paths:
               schema:
                 $ref: '#/components/schemas/ApiDiscovery'
               example:
-                name: roadmap
+                name: helm
                 version: v1
                 revision: 0123456789abcdef0123456789abcdef01234567
         '405':
@@ -4034,7 +4034,7 @@ components:
             - ok
         service:
           type: string
-          example: roadmap
+          example: helm
         revision:
           type: string
           pattern: '^[0-9a-f]{40}$'
@@ -4049,7 +4049,7 @@ components:
         - version
       properties:
         name:
-          const: roadmap
+          const: helm
         version:
           const: v1
         revision:
@@ -6701,7 +6701,7 @@ components:
           actual_behavior: The first event after reconnecting is not returned.
           expected_behavior: Every event after the supplied cursor is returned exactly once.
           reproduction_steps: Reconnect while events are being appended, then poll with the last cursor.
-          environment: Roadmap 1.0 on Debian 12
+          environment: Helm 1.0 on Debian 12
           affected_version: 1.0.0
         labels: []
         comment_count: 0
@@ -6907,7 +6907,7 @@ components:
               actual_behavior: The first event after reconnecting is not returned.
               expected_behavior: Every event after the supplied cursor is returned exactly once.
               reproduction_steps: Reconnect while events are being appended, then poll with the last cursor.
-              environment: Roadmap 1.0 on Debian 12
+              environment: Helm 1.0 on Debian 12
               affected_version: 1.0.0
             labels: []
             comment_count: 0

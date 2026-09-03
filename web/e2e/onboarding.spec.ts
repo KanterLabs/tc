@@ -7,6 +7,9 @@ test('first local administrator setup signs into the workspace', async ({ page, 
   test.skip(status.mode !== 'local' || !status.setup_required, 'requires a fresh local-auth database');
 
   await page.goto('/');
+  await expect(page).toHaveTitle('Helm');
+  await expect(page.getByText('Helm keeps projects focused', { exact: false })).toBeVisible();
+  await expect(page.locator('svg.helm-mark')).toBeVisible();
   await page.getByLabel('Full name').fill('Onboarding Admin');
   await page.getByLabel('Email').fill('onboarding@example.test');
   await page.getByLabel('Password').fill('LocalOnboarding-2026!');

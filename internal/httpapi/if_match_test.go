@@ -6,7 +6,7 @@ import (
 	"net/http/httptest"
 	"testing"
 
-	"roadmap/internal/store"
+	"github.com/KanterLabs/helm/internal/store"
 )
 
 func TestParseIfMatchAcceptsOnlyVersionETags(t *testing.T) {

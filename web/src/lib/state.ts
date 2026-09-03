@@ -662,10 +662,44 @@ export function displayEvent(event: { action?: string; type?: string; kind?: str
   return raw.replace(/[_-]+/g, ' ').replace(/\b\w/g, (letter) => letter.toUpperCase());
 }
 
-export function loadRecentProjects(storage: Storage | undefined, key = 'roadmap.recent-projects'): string[] {
+export const helmStorageKeys = {
+  theme: 'helm.theme',
+  lastProject: 'helm.last-project',
+  recentProjects: 'helm.recent-projects'
+} as const;
+
+export const legacyRoadmapStorageKeys = {
+  theme: 'roadmap.theme',
+  lastProject: 'roadmap.last-project',
+  recentProjects: 'roadmap.recent-projects'
+} as const;
+
+/** Read the Helm key first, then copy a retained Roadmap value forward. */
+export function readMigratedStorage(
+  storage: Storage | undefined,
+  key: string,
+  legacyKey: string
+): string | null {
+  if (!storage) return null;
+  try {
+    const current = storage.getItem(key);
+    if (current !== null) return current;
+    const legacy = storage.getItem(legacyKey);
+    if (legacy !== null) storage.setItem(key, legacy);
+    return legacy;
+  } catch {
+    return null;
+  }
+}
+
+export function loadRecentProjects(
+  storage: Storage | undefined,
+  key = helmStorageKeys.recentProjects,
+  legacyKey = legacyRoadmapStorageKeys.recentProjects
+): string[] {
   if (!storage) return [];
   try {
-    const parsed = JSON.parse(storage.getItem(key) || '[]');
+    const parsed = JSON.parse(readMigratedStorage(storage, key, legacyKey) || '[]');
     return Array.isArray(parsed) ? parsed.filter((value): value is string => typeof value === 'string') : [];
   } catch {
     return [];
@@ -675,9 +709,14 @@ export function loadRecentProjects(storage: Storage | undefined, key = 'roadmap.
 export function rememberProject(
   projectId: string,
   storage: Storage | undefined,
-  key = 'roadmap.recent-projects'
+  key = helmStorageKeys.recentProjects,
+  legacyKey = legacyRoadmapStorageKeys.recentProjects
 ): string[] {
-  const next = [projectId, ...loadRecentProjects(storage, key).filter((id) => id !== projectId)].slice(0, 6);
-  storage?.setItem(key, JSON.stringify(next));
+  const next = [projectId, ...loadRecentProjects(storage, key, legacyKey).filter((id) => id !== projectId)].slice(0, 6);
+  try {
+    storage?.setItem(key, JSON.stringify(next));
+  } catch {
+    // Storage can be disabled by browser policy; in-memory navigation remains usable.
+  }
   return next;
 }

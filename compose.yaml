@@ -1,10 +1,10 @@
-name: roadmap
+name: helm
 
 services:
-  roadmap:
+  helm:
     # A local `docker compose up --build` uses the source tree.  Production
-    # deployments set ROADMAP_IMAGE to the immutable SHA-tagged image.
-    image: ${ROADMAP_IMAGE:-roadmap:local}
+    # deployments use HELM_IMAGE; ROADMAP_IMAGE remains a compatibility alias.
+    image: ${HELM_IMAGE:-${ROADMAP_IMAGE:-helm:local}}
     build:
       context: .
       dockerfile: Dockerfile
@@ -14,13 +14,20 @@ services:
     ports:
       - "127.0.0.1:8080:8080"
     environment:
-      ROADMAP_ADDR: ${ROADMAP_ADDR:-0.0.0.0:8080}
-      ROADMAP_DB: ${ROADMAP_DB:-/data/roadmap.db}
-      ROADMAP_AUTH_MODE: ${ROADMAP_AUTH_MODE:-local}
-      ROADMAP_PUBLIC_ORIGIN: ${ROADMAP_PUBLIC_ORIGIN:-http://localhost:8080}
+      HELM_ADDR: ${HELM_ADDR:-${ROADMAP_ADDR:-0.0.0.0:8080}}
+      HELM_DB: ${HELM_DB:-${ROADMAP_DB:-/data/roadmap.db}}
+      HELM_AUTH_MODE: ${HELM_AUTH_MODE:-${ROADMAP_AUTH_MODE:-local}}
+      HELM_PUBLIC_ORIGIN: ${HELM_PUBLIC_ORIGIN:-${ROADMAP_PUBLIC_ORIGIN:-http://localhost:8080}}
+      HELM_ADMIN_EMAIL: ${HELM_ADMIN_EMAIL:-${ROADMAP_ADMIN_EMAIL:-}}
+      HELM_SECURE_COOKIES: ${HELM_SECURE_COOKIES:-${ROADMAP_SECURE_COOKIES:-false}}
+      HELM_DEMO_SEED: ${HELM_DEMO_SEED:-${ROADMAP_DEMO_SEED:-true}}
+      ROADMAP_ADDR: ${ROADMAP_ADDR:-}
+      ROADMAP_DB: ${ROADMAP_DB:-}
+      ROADMAP_AUTH_MODE: ${ROADMAP_AUTH_MODE:-}
+      ROADMAP_PUBLIC_ORIGIN: ${ROADMAP_PUBLIC_ORIGIN:-}
       ROADMAP_ADMIN_EMAIL: ${ROADMAP_ADMIN_EMAIL:-}
-      ROADMAP_SECURE_COOKIES: ${ROADMAP_SECURE_COOKIES:-false}
-      ROADMAP_DEMO_SEED: ${ROADMAP_DEMO_SEED:-true}
+      ROADMAP_SECURE_COOKIES: ${ROADMAP_SECURE_COOKIES:-}
+      ROADMAP_DEMO_SEED: ${ROADMAP_DEMO_SEED:-}
     volumes:
       - roadmap-data:/data
     read_only: true
@@ -31,7 +38,7 @@ services:
     cap_drop:
       - ALL
     healthcheck:
-      test: ["CMD", "/usr/local/bin/roadmap", "healthcheck"]
+      test: ["CMD", "/usr/local/bin/helm", "healthcheck"]
       interval: 30s
       timeout: 3s
       start_period: 10s
@@ -39,3 +46,4 @@ services:
 
 volumes:
   roadmap-data:
+    name: roadmap_roadmap-data

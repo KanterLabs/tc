@@ -23,10 +23,10 @@ CT_NET_TYPE=veth
 ARCHIVE_MAX_BYTES=536870912
 ARCHIVE_INGEST_TIMEOUT=120
 SIGNING_PUBLIC_KEY=/etc/roadmap-deploy/release-signing-public.pem
-VERIFY_SCRIPT=/usr/local/sbin/roadmap-verify-release
+VERIFY_SCRIPT=/usr/local/sbin/helm-verify-release
 CT_CONFIG_ERROR=''
 
-log() { printf '[roadmap-gateway] %s\n' "$*" >&2; }
+log() { printf '[helm-gateway] %s\n' "$*" >&2; }
 fail() { log "$*"; exit 1; }
 
 target_vmid_state() {
@@ -169,7 +169,7 @@ ct_tags_are_exact() {
 
 # This predicate must never call fail: cleanup uses it as a guard while the
 # normal status/rollback/deploy paths turn its diagnostic into a hard failure.
-ct_config_matches_roadmap() {
+ct_config_matches_helm_identity() {
 	local config=$1 line key existing_name unprivileged arch onboot ostype cores memory swap net0 rootfs
 	local nameserver searchdomain startup tags
 	CT_CONFIG_ERROR=''
@@ -280,21 +280,26 @@ ct_config_matches_roadmap() {
 
 validate_ct_config() {
 	local config=$1
-	ct_config_matches_roadmap "$config" || fail "$CT_CONFIG_ERROR"
+	ct_config_matches_helm_identity "$config" || fail "$CT_CONFIG_ERROR"
 }
 
 [[ "$(id -u)" -eq 0 ]] || fail 'gateway must run as root'
 
 # sshd supplies SSH_ORIGINAL_COMMAND for the forced command. sudo is allowed
 # to preserve that one variable in bootstrap-proxmox.sh. Local argv is kept
-# only for an explicit root-side test invocation (`ROADMAP_GATEWAY_LOCAL_TEST=1`);
+# only for an explicit root-side test invocation (`HELM_GATEWAY_LOCAL_TEST=1`;
+# `ROADMAP_GATEWAY_LOCAL_TEST` remains a compatibility alias);
 # an SSH request can never replace its original command with argv supplied
 # after sudo.
 if [[ ${SSH_ORIGINAL_COMMAND+x} ]]; then
 	[[ $# -eq 0 ]] || fail 'SSH gateway does not accept command-line arguments'
 	REQUEST=${SSH_ORIGINAL_COMMAND:-}
 else
-	[[ ${ROADMAP_GATEWAY_LOCAL_TEST:-} = 1 && -z ${SSH_CONNECTION+x} ]] \
+	if [[ -n "${HELM_GATEWAY_LOCAL_TEST:-}" && -n "${ROADMAP_GATEWAY_LOCAL_TEST:-}" && "$HELM_GATEWAY_LOCAL_TEST" != "$ROADMAP_GATEWAY_LOCAL_TEST" ]]; then
+		fail 'HELM_GATEWAY_LOCAL_TEST and ROADMAP_GATEWAY_LOCAL_TEST must match when both are set'
+	fi
+	local_test=${HELM_GATEWAY_LOCAL_TEST:-${ROADMAP_GATEWAY_LOCAL_TEST:-}}
+	[[ "$local_test" = 1 && -z ${SSH_CONNECTION+x} ]] \
 		|| fail 'SSH request is missing SSH_ORIGINAL_COMMAND'
 	REQUEST=$*
 fi
@@ -408,7 +413,7 @@ cleanup_deploy() {
 	# copies it into /etc/roadmap inside the guest before this cleanup runs.
 	if target_vmid_is_lxc_for_cleanup \
 		&& cleanup_config=$(pct config "$CTID" 2>/dev/null) \
-		&& ct_config_matches_roadmap "$cleanup_config"; then
+		&& ct_config_matches_helm_identity "$cleanup_config"; then
 		pct exec "$CTID" -- bash -c 'rm -f -- /root/roadmap-release.tar.gz; rm -rf -- /root/roadmap-release' >/dev/null 2>&1 || true
 	fi
 	rm -f -- "$ARCHIVE"
@@ -418,12 +423,12 @@ cleanup_deploy() {
 		# guest destroy (or an exec into that guest).
 		if target_vmid_is_lxc_for_cleanup \
 			&& cleanup_config=$(pct config "$CTID" 2>/dev/null) \
-			&& ct_config_matches_roadmap "$cleanup_config"; then
+			&& ct_config_matches_helm_identity "$cleanup_config"; then
 			log "destroying newly-created failed CT $CTID"
 			pct stop "$CTID" --skiplock 1 >/dev/null 2>&1 || true
 			if target_vmid_is_lxc_for_cleanup \
 				&& cleanup_config=$(pct config "$CTID" 2>/dev/null) \
-				&& ct_config_matches_roadmap "$cleanup_config"; then
+				&& ct_config_matches_helm_identity "$cleanup_config"; then
 				pct destroy "$CTID" --purge 1 >/dev/null 2>&1 || true
 			else
 				log "refusing to destroy CT $CTID after its configuration changed"

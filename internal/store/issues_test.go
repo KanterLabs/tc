@@ -6,7 +6,7 @@ import (
 	"errors"
 	"testing"
 
-	"roadmap/internal/db"
+	"github.com/KanterLabs/helm/internal/db"
 )
 
 func TestBugStoreLifecycleAndFilters(t *testing.T) {

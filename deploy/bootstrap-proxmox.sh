@@ -2,7 +2,14 @@
 set -Eeuo pipefail
 
 ROOT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
-CONFIG_FILE=${ROADMAP_DEPLOY_CONFIG:-"$ROOT_DIR/.tc-deploy.env"}
+if [[ -n "${HELM_DEPLOY_CONFIG:-}" && -n "${ROADMAP_DEPLOY_CONFIG:-}" && "$HELM_DEPLOY_CONFIG" != "$ROADMAP_DEPLOY_CONFIG" ]]; then
+	printf 'HELM_DEPLOY_CONFIG and ROADMAP_DEPLOY_CONFIG must match when both are set\n' >&2
+	exit 1
+fi
+CONFIG_FILE=${HELM_DEPLOY_CONFIG:-${ROADMAP_DEPLOY_CONFIG:-"$ROOT_DIR/.helm-deploy.env"}}
+if [[ "$CONFIG_FILE" = "$ROOT_DIR/.helm-deploy.env" && ! -f "$CONFIG_FILE" && -f "$ROOT_DIR/.tc-deploy.env" ]]; then
+	CONFIG_FILE="$ROOT_DIR/.tc-deploy.env"
+fi
 PUBLIC_KEY_FILE=${1:-}
 SIGNING_PUBLIC_KEY_FILE=${2:-}
 
@@ -47,7 +54,7 @@ cleanup() {
 }
 trap cleanup EXIT
 
-scp -q "$ROOT_DIR/deploy/roadmap-deploy-gateway" "root@$PVE_HOST:$REMOTE_BOOTSTRAP_DIR/gateway"
+scp -q "$ROOT_DIR/deploy/helm-deploy-gateway" "root@$PVE_HOST:$REMOTE_BOOTSTRAP_DIR/gateway"
 scp -q "$ROOT_DIR/deploy/verify-release.sh" "root@$PVE_HOST:$REMOTE_BOOTSTRAP_DIR/verifier"
 scp -q "$PUBLIC_KEY_FILE" "root@$PVE_HOST:$REMOTE_BOOTSTRAP_DIR/deploy-key"
 scp -q "$SIGNING_PUBLIC_KEY_FILE" "root@$PVE_HOST:$REMOTE_BOOTSTRAP_DIR/release-signing-key"
@@ -103,15 +110,19 @@ for staging_dir in /var/lib/roadmap-deploy /var/lib/roadmap-deploy/staging; do
 	install -d -m 0700 -o root -g root "$staging_dir"
 done
 
-printf '%s\n' "command=\"sudo -n /usr/local/sbin/roadmap-deploy-gateway\",no-agent-forwarding,no-port-forwarding,no-pty,no-user-rc,no-X11-forwarding $key" \
+printf '%s\n' "command=\"sudo -n /usr/local/sbin/helm-deploy-gateway\",no-agent-forwarding,no-port-forwarding,no-pty,no-user-rc,no-X11-forwarding $key" \
 	> "/home/$DEPLOY_USER/.ssh/authorized_keys.new"
 chown "$DEPLOY_USER:$DEPLOY_USER" "/home/$DEPLOY_USER/.ssh/authorized_keys.new"
 chmod 0600 "/home/$DEPLOY_USER/.ssh/authorized_keys.new"
 mv -T -- "/home/$DEPLOY_USER/.ssh/authorized_keys.new" "/home/$DEPLOY_USER/.ssh/authorized_keys"
 
-install -m 0755 -o root -g root "$GATEWAY_SOURCE" /usr/local/sbin/roadmap-deploy-gateway.new
+install -m 0755 -o root -g root "$GATEWAY_SOURCE" /usr/local/sbin/helm-deploy-gateway.new
+mv -T -- /usr/local/sbin/helm-deploy-gateway.new /usr/local/sbin/helm-deploy-gateway
+ln -s -- helm-deploy-gateway /usr/local/sbin/roadmap-deploy-gateway.new
 mv -T -- /usr/local/sbin/roadmap-deploy-gateway.new /usr/local/sbin/roadmap-deploy-gateway
-install -m 0755 -o root -g root "$VERIFIER_SOURCE" /usr/local/sbin/roadmap-verify-release.new
+install -m 0755 -o root -g root "$VERIFIER_SOURCE" /usr/local/sbin/helm-verify-release.new
+mv -T -- /usr/local/sbin/helm-verify-release.new /usr/local/sbin/helm-verify-release
+ln -s -- helm-verify-release /usr/local/sbin/roadmap-verify-release.new
 mv -T -- /usr/local/sbin/roadmap-verify-release.new /usr/local/sbin/roadmap-verify-release
 if [[ -L /etc/roadmap-deploy || ( -e /etc/roadmap-deploy && ! -d /etc/roadmap-deploy ) ]]; then
 	echo 'release-signing key directory is invalid' >&2
@@ -122,7 +133,7 @@ install -m 0644 -o root -g root "$SIGNING_KEY_SOURCE" /etc/roadmap-deploy/releas
 mv -T -- /etc/roadmap-deploy/release-signing-public.pem.new /etc/roadmap-deploy/release-signing-public.pem
 {
 	printf 'Defaults:%s env_keep += "SSH_ORIGINAL_COMMAND SSH_CONNECTION"\n' "$DEPLOY_USER"
-	printf '%s ALL=(root) NOPASSWD: /usr/local/sbin/roadmap-deploy-gateway\n' "$DEPLOY_USER"
+	printf '%s ALL=(root) NOPASSWD: /usr/local/sbin/helm-deploy-gateway\n' "$DEPLOY_USER"
 } > /etc/sudoers.d/roadmap-deploy
 chmod 0440 /etc/sudoers.d/roadmap-deploy
 visudo -cf /etc/sudoers.d/roadmap-deploy >/dev/null

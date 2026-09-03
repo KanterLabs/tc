@@ -5,7 +5,7 @@ import (
 	"reflect"
 	"testing"
 
-	"roadmap/internal/db"
+	"github.com/KanterLabs/helm/internal/db"
 )
 
 func TestCompletedAgentWorkRetainsSnapshotAndRestoresOnReopen(t *testing.T) {

@@ -1,11 +1,11 @@
-# Roadmap
+# Helm
 
-Roadmap is a small, self-hosted project board and internal bug tracker for
+Helm is a small, self-hosted project board and internal bug tracker for
 teams where humans and software agents move work together. Humans get a
 focused Kanban workspace; agents get a stable, auditable API for discovering,
 claiming, updating, and finishing tasks without sharing a human login.
 
-Roadmap v1 intentionally keeps the model small: one board per project,
+Helm v1 intentionally keeps the model small: one board per project,
 ordered semantic columns, and SQLite persistence. It is not intended to be a
 Trello-compatible API or a full team-suite replacement.
 
@@ -51,7 +51,7 @@ current UI.
 
 ```text
 Browser (Svelte + TypeScript) ─┐
-                               ├─ Go Roadmap server
+                               ├─ Go Helm server
 Agent clients (JSON API) ──────┘    ├─ /api/v1 REST API
                                     ├─ /healthz and /readyz
                                     ├─ embedded frontend and migrations
@@ -80,10 +80,10 @@ Visit <http://localhost:8080>. The local Compose defaults are local account
 authentication, `http://localhost:8080` as the public origin, secure cookies
 disabled for localhost, and demo seed data enabled. On the first visit, create
 the local administrator in the setup screen. To start with an empty database,
-set `ROADMAP_DEMO_SEED=false` before starting:
+set `HELM_DEMO_SEED=false` before starting:
 
 ```sh
-ROADMAP_DEMO_SEED=false docker compose up --build --detach
+HELM_DEMO_SEED=false docker compose up --build --detach
 ```
 
 Stop the stack with:
@@ -97,29 +97,33 @@ only when intentionally discarding local data.
 
 ## Authentication and agent access
 
-`ROADMAP_AUTH_MODE` selects the human-facing mode:
+`HELM_AUTH_MODE` selects the human-facing mode:
 
 - `local` (default): the first-run setup creates a local administrator; users
   sign in with an email/password session cookie.
 - `cloudflare`: the service verifies Cloudflare Access identity assertions.
-  Configure the HTTPS `ROADMAP_CLOUDFLARE_ISSUER` and
-  `ROADMAP_CF_ACCESS_AUDIENCES` as a comma-separated list containing the UI
-  and `/api/v1/*` application AUD tags. `ROADMAP_CLOUDFLARE_JWKS_URL` is
+  Configure the HTTPS `HELM_CLOUDFLARE_ISSUER` and
+  `HELM_CF_ACCESS_AUDIENCES` as a comma-separated list containing the UI
+  and `/api/v1/*` application AUD tags. `HELM_CLOUDFLARE_JWKS_URL` is
   optional when the issuer's standard certificates endpoint is usable.
-  Production also sets `ROADMAP_PUBLIC_ORIGIN`,
-  `ROADMAP_SECURE_COOKIES=true`, `ROADMAP_DEMO_SEED=false`, and binds only to
+  Production also sets `HELM_PUBLIC_ORIGIN`,
+  `HELM_SECURE_COOKIES=true`, `HELM_DEMO_SEED=false`, and binds only to
   loopback. Password login and ordinary proxy identity headers are not used in
   Cloudflare mode.
 - `disabled`: development-only authentication bypass. Never use it for a
   reachable or production deployment.
 
+`HELM_*` variables are canonical. Equal-value `ROADMAP_*` aliases remain
+supported for retained releases and existing operator configuration; when
+both spellings are set to different non-empty values, Helm fails closed.
+
 Agents are separate actors. An administrator creates an agent, then issues a
 token from Settings or `POST /api/v1/agents/{agent}/tokens`. Send it as:
 
 ```sh
-export ROADMAP_TOKEN='store-this-in-your-secret-manager'
+export HELM_TOKEN='store-this-in-your-secret-manager'
 curl --fail \
-  -H "Authorization: Bearer ${ROADMAP_TOKEN}" \
+  -H "Authorization: Bearer ${HELM_TOKEN}" \
   http://127.0.0.1:8080/api/v1/projects
 ```
 
@@ -210,8 +214,8 @@ Board-audit workflow:
    [`docs/API_CONTRACT.md`](docs/API_CONTRACT.md) for exact finding, review,
    and move request fields and aliases.
 
-The UI's Run audit action creates a queued run for an agent. The bundled
-TC Roadmap skill processes that same run with `submit --audit AUDIT_ID`, so a
+The UI's Run audit action creates a queued run for an agent. The bundled Helm
+skill processes that same run with `submit --audit AUDIT_ID`, so a
 UI request is not duplicated before its findings are finalized for review.
 
 ```sh
@@ -250,28 +254,30 @@ npm run check
 npm test
 ```
 
-## Codex Roadmap skill
+## Codex Helm skill
 
-The installable [`tc-roadmap`](skills/tc-roadmap/SKILL.md) skill makes TC the
+The installable [`helm`](skills/helm/SKILL.md) skill makes TC the
 durable work record for coding agents. It creates or resumes one task for a
 substantive workstream, records the goal and checkpoints, posts meaningful
 progress, and completes or blocks the task with the same optimistic-concurrency
 and claim semantics as any other API client.
 
 Install it from the public repository with Codex's skill installer using the
-GitHub path `KanterLabs/tc/tree/main/skills/tc-roadmap`. The installed
+GitHub path `KanterLabs/helm/tree/main/skills/helm`. The installed
 `scripts/update_skill.py` command compares its recorded source revision with
 GitHub `main` first, and only sparse-clones and atomically installs the skill
 when the revision changed. A matching revision is a no-op for the skill fetch,
 but still reconciles the local lifecycle hooks. The companion
-[`scripts/install_hooks.py`](skills/tc-roadmap/scripts/install_hooks.py)
+[`scripts/install_hooks.py`](skills/helm/scripts/install_hooks.py)
 additively installs bounded SessionStart, PostToolUse, PreCompact, and Stop
 commands into `hooks.json`, preserving existing policy and never changing
 Codex trust hashes; review/trust the command once in Codex `/hooks` after a
 configuration change.
 Agent and optional Cloudflare Access credentials stay in environment variables
 or a mode-`0600` local file; see
-[`skills/tc-roadmap/references/authentication.md`](skills/tc-roadmap/references/authentication.md).
+[`skills/helm/references/authentication.md`](skills/helm/references/authentication.md).
+The [`tc-roadmap`](skills/tc-roadmap/SKILL.md) package remains as a
+compatibility shim for installed agents during the transition.
 
 The Playwright suite (`npm run e2e`) expects an already-running server at
 `http://127.0.0.1:18080` by default; install its browser once with
@@ -285,11 +291,18 @@ The intended homelab path is:
 ```text
 Cloudflare Access
   → tc.shanekanterman.dev (UI and /api/v1/* applications)
-  → roadmap-homelab Tunnel
-  → cloudflared in the Debian 12 `roadmap` LXC
-  → roadmap.service on 127.0.0.1:8080
+  → roadmap-homelab Tunnel (retained infrastructure identity)
+  → cloudflared in the Debian 12 `roadmap` LXC (retained guest identity)
+  → helm.service on 127.0.0.1:8080
   → /var/lib/roadmap/data/roadmap.db
 ```
+
+The data root, database and backup names, Unix account, Compose volume,
+hostname, tunnel/guest identities, `X-Roadmap-Revision` header, Roadmap API
+routes and schema names, and signed Roadmap v1 gateway envelope are stable
+compatibility identifiers. See
+[`docs/HELM_LEGACY_IDENTIFIERS.md`](docs/HELM_LEGACY_IDENTIFIERS.md) for the
+reviewed allowlist.
 
 The guest has no inbound application or SSH port; the application and
 connector communicate over loopback. Releases use an immutable SHA-tagged Go
@@ -323,7 +336,7 @@ copy before the active database is touched. The database is kept outside
 release directories and is never replaced by an executable upgrade. By
 default, five releases and fourteen backups are retained.
 
-The active release is switched atomically. Failed Roadmap health or
+The active release is switched atomically. Failed Helm health or
 cloudflared checks automatically restore the previous release and restart the
 services. A binary/release rollback changes only the active release pointer:
 it never restores an older database or discards writes accepted by the
@@ -339,7 +352,7 @@ The live validator can optionally send the Cloudflare service-token headers to
 `/api/v1/roadmap` without an application bearer token. CI requires this probe
 with `CF_ACCESS_CLIENT_ID` and `CF_ACCESS_CLIENT_SECRET` (mapped from the
 production secrets above); it expects the origin's JSON `401` error and echoed
-`X-Request-ID`, which distinguishes Roadmap from an Access edge error.
+`X-Request-ID`, which distinguishes Helm from an Access edge error.
 
 For manual backups, database restores, first-time bootstrap, and the exact
 operator permissions, follow [`docs/OPERATIONS.md`](docs/OPERATIONS.md). A

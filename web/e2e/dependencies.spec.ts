@@ -19,7 +19,7 @@ type Task = {
 };
 type Collection<T> = { data: T[]; next_cursor?: string | null };
 
-const e2eOrigin = new URL(process.env.ROADMAP_E2E_BASE_URL || 'http://127.0.0.1:18080').origin;
+const e2eOrigin = new URL(process.env.HELM_E2E_BASE_URL || process.env.ROADMAP_E2E_BASE_URL || 'http://127.0.0.1:18080').origin;
 
 function mutationHeaders(version?: number, key = `dependencies-e2e-${crypto.randomUUID()}`): Record<string, string> {
   return {
@@ -57,7 +57,7 @@ async function expectDependencyConflict(response: APIResponse, operation: string
 test('orders dependent work across drawer, board, filters, polling, and mobile', async ({ page, request }) => {
   test.setTimeout(120_000);
   const status = await json<{ mode?: string }>(await request.get('/api/v1/auth/status'), 'read auth status');
-  expect(status.mode, 'The E2E server must run with ROADMAP_AUTH_MODE=disabled').toBe('disabled');
+  expect(status.mode, 'The E2E server must run with HELM_AUTH_MODE=disabled').toBe('disabled');
 
   const runID = `${Date.now().toString(36)}${Math.random().toString(36).slice(2, 7)}`.toUpperCase();
   const suffix = runID.slice(-8);

@@ -17,6 +17,7 @@ __pycache__/
 *.db-wal
 /.env
 /.tc-deploy.env
+/.helm-deploy.env
 /.cloudflare-tunnel-token
 /.deploy-key
 /.deploy-key.pub
@@ -25,6 +26,11 @@ __pycache__/
 /roadmap-release-signing-private.pem
 /roadmap-release-signing-public.pem
 /roadmap-access-token.env
+/helm-deploy-key
+/helm-deploy-key.pub
+/helm-release-signing-private.pem
+/helm-release-signing-public.pem
+/helm-access-token.env
 /*.pem
 /*.key
 /*-key

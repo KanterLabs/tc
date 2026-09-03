@@ -121,7 +121,7 @@ describe('public API client', () => {
     const init = fetchMock.mock.calls[0][1] as RequestInit;
     const headers = init.headers as Headers;
     expect(headers.get('If-Match')).toBe('"v2"');
-    expect(headers.get('Idempotency-Key')).toMatch(/^roadmap-|^[0-9a-f-]{20,}$/);
+    expect(headers.get('Idempotency-Key')).toMatch(/^helm-|^[0-9a-f-]{20,}$/);
     expect(JSON.parse(String(init.body))).toEqual({ title: 'Updated' });
   });
 
@@ -182,14 +182,14 @@ describe('public API client', () => {
     const progressInit = progressCall[1] as RequestInit;
     expect(JSON.parse(String(progressInit.body))).toEqual(input);
     expect((progressInit.headers as Headers).get('If-Match')).toBe('"v7"');
-    expect((progressInit.headers as Headers).get('Idempotency-Key')).toMatch(/^roadmap-|^[0-9a-f-]{20,}$/);
+    expect((progressInit.headers as Headers).get('Idempotency-Key')).toMatch(/^helm-|^[0-9a-f-]{20,}$/);
 
     const blockCall = fetchMock.mock.calls[1];
     const blockInit = blockCall[1] as RequestInit;
     expect(String(blockCall[0])).toContain('/api/v1/tasks/task-1/block');
     expect(JSON.parse(String(blockInit.body))).toEqual({ reason: 'Waiting for credentials' });
     expect((blockInit.headers as Headers).get('If-Match')).toBe('"v8"');
-    expect((blockInit.headers as Headers).get('Idempotency-Key')).toMatch(/^roadmap-|^[0-9a-f-]{20,}$/);
+    expect((blockInit.headers as Headers).get('Idempotency-Key')).toMatch(/^helm-|^[0-9a-f-]{20,}$/);
   });
 
   it('lists a typed task timeline with stable cursor and kind filters', async () => {
@@ -254,7 +254,7 @@ describe('public API client', () => {
     expect(String(createCall[0])).toContain('/api/v1/projects/project-1/audits');
     expect((createCall[1]?.method)).toBe('POST');
     expect(JSON.parse(String((createCall[1] as RequestInit).body))).toEqual({ scope: 'board', status: 'queued' });
-    expect((createCall[1]?.headers as Headers).get('Idempotency-Key')).toMatch(/^roadmap-|^[0-9a-f-]{20,}$/);
+    expect((createCall[1]?.headers as Headers).get('Idempotency-Key')).toMatch(/^helm-|^[0-9a-f-]{20,}$/);
   });
 
   it('loads audit metadata and every bounded finding page', async () => {
@@ -297,7 +297,7 @@ describe('public API client', () => {
     expect(String(fetchMock.mock.calls[0][0])).toContain('/api/v1/audit-findings/finding-1');
     expect(JSON.parse(String(reviewInit.body))).toEqual({ review_state: 'approved', proposed_semantic_destination: 'ready' });
     expect((reviewInit.headers as Headers).get('If-Match')).toBe('"v3"');
-    expect((reviewInit.headers as Headers).get('Idempotency-Key')).toMatch(/^roadmap-|^[0-9a-f-]{20,}$/);
+    expect((reviewInit.headers as Headers).get('Idempotency-Key')).toMatch(/^helm-|^[0-9a-f-]{20,}$/);
 
     const moveInit = fetchMock.mock.calls[1][1] as RequestInit;
     expect(String(fetchMock.mock.calls[1][0])).toContain('/api/v1/tasks/task-1/move');
@@ -307,7 +307,7 @@ describe('public API client', () => {
       source: 'board_audit'
     });
     expect((moveInit.headers as Headers).get('If-Match')).toBe('"v7"');
-    expect((moveInit.headers as Headers).get('Idempotency-Key')).toMatch(/^roadmap-|^[0-9a-f-]{20,}$/);
+    expect((moveInit.headers as Headers).get('Idempotency-Key')).toMatch(/^helm-|^[0-9a-f-]{20,}$/);
   });
 
   it('finalizes an audit run as an explicit lifecycle mutation', async () => {
@@ -317,7 +317,7 @@ describe('public API client', () => {
     expect(String(url)).toContain('/api/v1/audits/audit-1/finalize');
     expect(init?.method).toBe('POST');
     expect(JSON.parse(String((init as RequestInit).body))).toEqual({ status: 'partial' });
-    expect((init?.headers as Headers).get('Idempotency-Key')).toMatch(/^roadmap-|^[0-9a-f-]{20,}$/);
+    expect((init?.headers as Headers).get('Idempotency-Key')).toMatch(/^helm-|^[0-9a-f-]{20,}$/);
   });
 
   it('turns the standard error envelope into ApiError', async () => {

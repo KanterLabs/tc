@@ -1,4 +1,4 @@
-name: Roadmap CI and deploy
+name: Helm CI and deploy
 
 on:
   pull_request:
@@ -18,7 +18,7 @@ permissions:
 # block production. Production mutation jobs below use their own fixed,
 # non-canceling lock.
 concurrency:
-  group: roadmap-${{ github.workflow }}-${{ github.ref }}
+  group: helm-${{ github.workflow }}-${{ github.ref }}
   # Pull-request checks may be superseded, but no main workflow may be
   # canceled while it is carrying a production deployment.
   cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
@@ -52,6 +52,7 @@ jobs:
           npm run build
       - name: Embed frontend and run Go checks
         run: |
+          rm -rf -- internal/webassets/dist internal/frontend/dist
           install -d internal/webassets/dist internal/frontend/dist dist
           cp -a web/dist/. internal/webassets/dist/
           cp -a web/dist/. internal/frontend/dist/
@@ -63,15 +64,15 @@ jobs:
           go test ./...
           go vet ./...
           GOSUMDB=sum.golang.org go run golang.org/x/vuln/cmd/govulncheck@v1.1.4 ./...
-          bash -n deploy/*.sh deploy/roadmap-deploy-gateway
+          bash -n deploy/*.sh deploy/helm-deploy-gateway
           ./deploy/test-deployment-security.sh
-          CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o dist/roadmap ./cmd/roadmap
+          CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o dist/helm ./cmd/helm
           docker compose config >/dev/null
       - name: Upload immutable binary artifact
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: roadmap-binary-${{ github.sha }}
-          path: dist/roadmap
+          name: helm-binary-${{ github.sha }}
+          path: dist/helm
           if-no-files-found: error
           retention-days: 14
 
@@ -98,12 +99,13 @@ jobs:
           npx playwright install chromium
           npm run build
           cd ..
+          rm -rf -- internal/webassets/dist
           install -d internal/webassets/dist
           cp -a web/dist/. internal/webassets/dist/
-          CGO_ENABLED=0 go build -trimpath -o /tmp/roadmap-e2e ./cmd/roadmap
+          CGO_ENABLED=0 go build -trimpath -o /tmp/helm-e2e ./cmd/helm
       - name: Run the real browser workflow
         env:
-          ROADMAP_E2E_BASE_URL: http://127.0.0.1:18080
+          HELM_E2E_BASE_URL: http://127.0.0.1:18080
         run: |
           test_dir=$(mktemp -d)
           cleanup() {
@@ -113,13 +115,13 @@ jobs:
             fi
           }
           trap cleanup EXIT
-          ROADMAP_ADDR=127.0.0.1:18080 \
-            ROADMAP_DB="$test_dir/roadmap.db" \
-            ROADMAP_AUTH_MODE=disabled \
-            ROADMAP_PUBLIC_ORIGIN=http://127.0.0.1:18080 \
-            ROADMAP_SECURE_COOKIES=false \
-            ROADMAP_DEMO_SEED=false \
-            /tmp/roadmap-e2e >"$test_dir/server.log" 2>&1 &
+          HELM_ADDR=127.0.0.1:18080 \
+            HELM_DB="$test_dir/roadmap.db" \
+            HELM_AUTH_MODE=disabled \
+            HELM_PUBLIC_ORIGIN=http://127.0.0.1:18080 \
+            HELM_SECURE_COOKIES=false \
+            HELM_DEMO_SEED=false \
+            /tmp/helm-e2e >"$test_dir/server.log" 2>&1 &
           server_pid=$!
           for attempt in $(seq 1 30); do
             if curl --fail --silent http://127.0.0.1:18080/readyz >/dev/null; then
@@ -137,13 +139,13 @@ jobs:
           kill "$server_pid"
           wait "$server_pid" || true
           server_pid=
-          ROADMAP_ADDR=127.0.0.1:18081 \
-            ROADMAP_DB="$test_dir/local-roadmap.db" \
-            ROADMAP_AUTH_MODE=local \
-            ROADMAP_PUBLIC_ORIGIN=http://127.0.0.1:18081 \
-            ROADMAP_SECURE_COOKIES=false \
-            ROADMAP_DEMO_SEED=false \
-            /tmp/roadmap-e2e >"$test_dir/local-server.log" 2>&1 &
+          HELM_ADDR=127.0.0.1:18081 \
+            HELM_DB="$test_dir/local-roadmap.db" \
+            HELM_AUTH_MODE=local \
+            HELM_PUBLIC_ORIGIN=http://127.0.0.1:18081 \
+            HELM_SECURE_COOKIES=false \
+            HELM_DEMO_SEED=false \
+            /tmp/helm-e2e >"$test_dir/local-server.log" 2>&1 &
           server_pid=$!
           for attempt in $(seq 1 30); do
             if curl --fail --silent http://127.0.0.1:18081/readyz >/dev/null; then
@@ -156,12 +158,12 @@ jobs:
             sleep 1
           done
           cd web
-          ROADMAP_E2E_BASE_URL=http://127.0.0.1:18081 npx playwright test e2e/onboarding.spec.ts
+          HELM_E2E_BASE_URL=http://127.0.0.1:18081 npx playwright test e2e/onboarding.spec.ts
       - name: Upload browser diagnostics
         if: ${{ failure() }}
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: roadmap-browser-${{ github.sha }}
+          name: helm-browser-${{ github.sha }}
           path: |
             web/playwright-report
             web/test-results
@@ -192,16 +194,16 @@ jobs:
           persist-credentials: false
       - name: Build immutable production image
         run: |
-          image_dir="$RUNNER_TEMP/roadmap-container"
+          image_dir="$RUNNER_TEMP/helm-container"
           install -d -m 0700 "$image_dir"
-          docker build --pull --tag "roadmap:${GITHUB_SHA}" .
-          docker image inspect "roadmap:${GITHUB_SHA}" >/dev/null
-          container_id=$(docker run --detach "roadmap:${GITHUB_SHA}")
+          docker build --pull --tag "helm:${GITHUB_SHA}" .
+          docker image inspect "helm:${GITHUB_SHA}" >/dev/null
+          container_id=$(docker run --detach "helm:${GITHUB_SHA}")
           cleanup() { docker rm --force "$container_id" >/dev/null 2>&1 || true; }
           trap cleanup EXIT
           ready=false
-          for attempt in $(seq 1 30); do
-            if docker exec "$container_id" /usr/local/bin/roadmap healthcheck >/dev/null 2>&1; then
+          for _ in $(seq 1 30); do
+            if docker exec "$container_id" /usr/local/bin/helm healthcheck >/dev/null 2>&1; then
               ready=true
               break
             fi
@@ -211,24 +213,24 @@ jobs:
             docker logs "$container_id"
             exit 1
           fi
-          docker exec "$container_id" /usr/local/bin/roadmap healthcheck
+          docker exec "$container_id" /usr/local/bin/helm healthcheck
           printf 'container_smoke=ok\n'
-          image_tar="$image_dir/roadmap-${GITHUB_SHA}.tar"
-          docker save --output "$image_tar" "roadmap:${GITHUB_SHA}"
+          image_tar="$image_dir/helm-${GITHUB_SHA}.tar"
+          docker save --output "$image_tar" "helm:${GITHUB_SHA}"
           docker run --rm \
             --volume "$image_dir:/scan:ro" \
             aquasec/trivy:0.67.2@sha256:e2b22eac59c02003d8749f5b8d9bd073b62e30fefaef5b7c8371204e0a4b0c08 \
-            image --input "/scan/roadmap-${GITHUB_SHA}.tar" \
+            image --input "/scan/helm-${GITHUB_SHA}.tar" \
             --scanners vuln --severity HIGH,CRITICAL --ignore-unfixed --exit-code 1 --no-progress
           gzip -n "$image_tar"
           sha256sum "$image_tar.gz" > "$image_tar.gz.sha256"
       - name: Upload immutable image artifact
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: roadmap-image-${{ github.sha }}
+          name: helm-image-${{ github.sha }}
           path: |
-            ${{ runner.temp }}/roadmap-container/roadmap-${{ github.sha }}.tar.gz
-            ${{ runner.temp }}/roadmap-container/roadmap-${{ github.sha }}.tar.gz.sha256
+            ${{ runner.temp }}/helm-container/helm-${{ github.sha }}.tar.gz
+            ${{ runner.temp }}/helm-container/helm-${{ github.sha }}.tar.gz.sha256
           if-no-files-found: error
           retention-days: 14
 
@@ -240,7 +242,7 @@ jobs:
       name: production
       url: https://tc.shanekanterman.dev
     concurrency:
-      group: roadmap-production
+      group: helm-production
       cancel-in-progress: false
     steps:
       # github.sha is the selected main commit; pinning the checkout prevents
@@ -253,13 +255,13 @@ jobs:
       - name: Download immutable binary
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
-          name: roadmap-binary-${{ github.sha }}
+          name: helm-binary-${{ github.sha }}
           path: dist
       - name: Restore binary executable mode
         run: |
-          test -f dist/roadmap
-          chmod 0755 dist/roadmap
-          test -x dist/roadmap
+          test -f dist/helm
+          chmod 0755 dist/helm
+          test -x dist/helm
       - name: Configure deploy identity
         env:
           DEPLOY_KEY: ${{ secrets.ROADMAP_DEPLOY_SSH_KEY }}
@@ -268,22 +270,22 @@ jobs:
           test -n "$DEPLOY_KEY"
           test -n "$DEPLOY_KNOWN_HOSTS"
           [[ "$RUNNER_TEMP" = /* ]]
-          ssh_dir="$RUNNER_TEMP/roadmap-ssh"
+          ssh_dir="$RUNNER_TEMP/helm-ssh"
           install -d -m 0700 "$ssh_dir"
-          printf '%s\n' "$DEPLOY_KEY" > "$ssh_dir/roadmap-deploy"
-          chmod 0600 "$ssh_dir/roadmap-deploy"
+          printf '%s\n' "$DEPLOY_KEY" > "$ssh_dir/helm-deploy"
+          chmod 0600 "$ssh_dir/helm-deploy"
           printf '%s\n' "$DEPLOY_KNOWN_HOSTS" > "$ssh_dir/known_hosts"
           chmod 0600 "$ssh_dir/known_hosts"
           printf '%s\n' \
             'Host 10.0.0.20' \
-            "  IdentityFile $ssh_dir/roadmap-deploy" \
+            "  IdentityFile $ssh_dir/helm-deploy" \
             "  UserKnownHostsFile $ssh_dir/known_hosts" \
             '  IdentitiesOnly yes' \
             '  BatchMode yes' \
             '  StrictHostKeyChecking yes' \
             > "$ssh_dir/config"
           chmod 0600 "$ssh_dir/config"
-          printf 'ROADMAP_SSH_CONFIG=%s\n' "$ssh_dir/config" >> "$GITHUB_ENV"
+          printf 'HELM_SSH_CONFIG=%s\n' "$ssh_dir/config" >> "$GITHUB_ENV"
       - name: Capture previous release for recovery
         id: previous_release
         run: |
@@ -294,36 +296,36 @@ jobs:
       - name: Prepare Cloudflare Access and tunnel
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.ROADMAP_CLOUDFLARE_API_TOKEN }}
-          ROADMAP_REQUIRE_DURABLE_SERVICE_TOKEN_CAPTURE: "1"
+          HELM_REQUIRE_DURABLE_SERVICE_TOKEN_CAPTURE: "1"
         run: |
           test -n "$CLOUDFLARE_API_TOKEN"
-          chmod 0755 deploy/*.sh deploy/roadmap-deploy-gateway
-          cloudflare_dir="$RUNNER_TEMP/roadmap-cloudflare"
+          chmod 0755 deploy/*.sh deploy/helm-deploy-gateway
+          cloudflare_dir="$RUNNER_TEMP/helm-cloudflare"
           install -d -m 0700 "$cloudflare_dir"
-          printf 'ROADMAP_CLOUDFLARED_TOKEN_FILE=%s\n' "$cloudflare_dir/cloudflared.token" >> "$GITHUB_ENV"
-          printf 'ROADMAP_OWNER_ENV_FILE=%s\n' "$cloudflare_dir/owner.env" >> "$GITHUB_ENV"
+          printf 'HELM_CLOUDFLARED_TOKEN_FILE=%s\n' "$cloudflare_dir/cloudflared.token" >> "$GITHUB_ENV"
+          printf 'HELM_OWNER_ENV_FILE=%s\n' "$cloudflare_dir/owner.env" >> "$GITHUB_ENV"
           ./deploy/cloudflare.sh prepare \
             "$cloudflare_dir/cloudflared.token" \
             "$cloudflare_dir/owner.env" \
-            "$cloudflare_dir/roadmap-access-token.env"
+            "$cloudflare_dir/helm-access-token.env"
       - name: Materialize release signing key
         env:
           RELEASE_SIGNING_KEY: ${{ secrets.ROADMAP_RELEASE_SIGNING_KEY }}
         run: |
           test -n "$RELEASE_SIGNING_KEY"
-          install -d -m 0700 "$RUNNER_TEMP/roadmap-signing"
-          printf '%s\n' "$RELEASE_SIGNING_KEY" > "$RUNNER_TEMP/roadmap-signing/private.pem"
-          chmod 0600 "$RUNNER_TEMP/roadmap-signing/private.pem"
+          install -d -m 0700 "$RUNNER_TEMP/helm-signing"
+          printf '%s\n' "$RELEASE_SIGNING_KEY" > "$RUNNER_TEMP/helm-signing/private.pem"
+          chmod 0600 "$RUNNER_TEMP/helm-signing/private.pem"
       - name: Deploy to Proxmox
         env:
-          ROADMAP_RELEASE_SIGNING_KEY_FILE: ${{ runner.temp }}/roadmap-signing/private.pem
+          HELM_RELEASE_SIGNING_KEY_FILE: ${{ runner.temp }}/helm-signing/private.pem
         run: ./deploy/deploy-ci.sh deploy "${GITHUB_SHA}"
       - name: Publish DNS and validate live Access
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.ROADMAP_CLOUDFLARE_API_TOKEN }}
           CF_ACCESS_CLIENT_ID: ${{ secrets.ROADMAP_CF_ACCESS_CLIENT_ID }}
           CF_ACCESS_CLIENT_SECRET: ${{ secrets.ROADMAP_CF_ACCESS_CLIENT_SECRET }}
-          ROADMAP_REQUIRE_SERVICE_AUTH_PROBE: "1"
+          HELM_REQUIRE_SERVICE_AUTH_PROBE: "1"
           PREVIOUS_RELEASE_SHA: ${{ steps.previous_release.outputs.sha }}
         run: |
           if ./deploy/cloudflare.sh publish && ./deploy/validate-live.sh; then
@@ -343,9 +345,9 @@ jobs:
       - name: Remove deployment credentials
         if: ${{ always() }}
         run: |
-          rm -f -- "$RUNNER_TEMP/roadmap-signing/private.pem"
-          rm -rf -- "$RUNNER_TEMP/roadmap-ssh" "$RUNNER_TEMP/roadmap-cloudflare"
-          rm -f -- dist/cloudflared.token dist/owner.env dist/roadmap-access-token.env
+          rm -f -- "$RUNNER_TEMP/helm-signing/private.pem"
+          rm -rf -- "$RUNNER_TEMP/helm-ssh" "$RUNNER_TEMP/helm-cloudflare"
+          rm -f -- dist/cloudflared.token dist/owner.env dist/helm-access-token.env
 
   rollback:
     if: ${{ github.ref == 'refs/heads/main' && github.event_name == 'workflow_dispatch' && inputs.rollback_sha != '' }}
@@ -354,7 +356,7 @@ jobs:
       name: production
       url: https://tc.shanekanterman.dev
     concurrency:
-      group: roadmap-production
+      group: helm-production
       cancel-in-progress: false
     steps:
       # A manual rollback is production-authorized only when dispatched from
@@ -372,22 +374,22 @@ jobs:
           test -n "$DEPLOY_KEY"
           test -n "$DEPLOY_KNOWN_HOSTS"
           [[ "$RUNNER_TEMP" = /* ]]
-          ssh_dir="$RUNNER_TEMP/roadmap-ssh"
+          ssh_dir="$RUNNER_TEMP/helm-ssh"
           install -d -m 0700 "$ssh_dir"
-          printf '%s\n' "$DEPLOY_KEY" > "$ssh_dir/roadmap-deploy"
-          chmod 0600 "$ssh_dir/roadmap-deploy"
+          printf '%s\n' "$DEPLOY_KEY" > "$ssh_dir/helm-deploy"
+          chmod 0600 "$ssh_dir/helm-deploy"
           printf '%s\n' "$DEPLOY_KNOWN_HOSTS" > "$ssh_dir/known_hosts"
           chmod 0600 "$ssh_dir/known_hosts"
           printf '%s\n' \
             'Host 10.0.0.20' \
-            "  IdentityFile $ssh_dir/roadmap-deploy" \
+            "  IdentityFile $ssh_dir/helm-deploy" \
             "  UserKnownHostsFile $ssh_dir/known_hosts" \
             '  IdentitiesOnly yes' \
             '  BatchMode yes' \
             '  StrictHostKeyChecking yes' \
             > "$ssh_dir/config"
           chmod 0600 "$ssh_dir/config"
-          printf 'ROADMAP_SSH_CONFIG=%s\n' "$ssh_dir/config" >> "$GITHUB_ENV"
+          printf 'HELM_SSH_CONFIG=%s\n' "$ssh_dir/config" >> "$GITHUB_ENV"
       - name: Roll back retained release
         env:
           ROLLBACK_SHA: ${{ inputs.rollback_sha }}
@@ -399,11 +401,11 @@ jobs:
           CLOUDFLARE_API_TOKEN: ${{ secrets.ROADMAP_CLOUDFLARE_API_TOKEN }}
           CF_ACCESS_CLIENT_ID: ${{ secrets.ROADMAP_CF_ACCESS_CLIENT_ID }}
           CF_ACCESS_CLIENT_SECRET: ${{ secrets.ROADMAP_CF_ACCESS_CLIENT_SECRET }}
-          ROADMAP_REQUIRE_SERVICE_AUTH_PROBE: "1"
+          HELM_REQUIRE_SERVICE_AUTH_PROBE: "1"
         run: ./deploy/validate-live.sh
       - name: Remove deployment credentials
         if: ${{ always() }}
         run: |
-          rm -f -- "$RUNNER_TEMP/roadmap-signing/private.pem"
-          rm -rf -- "$RUNNER_TEMP/roadmap-ssh" "$RUNNER_TEMP/roadmap-cloudflare"
-          rm -f -- dist/cloudflared.token dist/owner.env dist/roadmap-access-token.env
+          rm -f -- "$RUNNER_TEMP/helm-signing/private.pem"
+          rm -rf -- "$RUNNER_TEMP/helm-ssh" "$RUNNER_TEMP/helm-cloudflare"
+          rm -f -- dist/cloudflared.token dist/owner.env dist/helm-access-token.env

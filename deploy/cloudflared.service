@@ -1,8 +1,8 @@
 [Unit]
-Description=Cloudflare Tunnel for Roadmap
-After=network-online.target roadmap.service
+Description=Cloudflare Tunnel for Helm
+After=network-online.target helm.service
 Wants=network-online.target
-Requires=roadmap.service
+Requires=helm.service
 
 [Service]
 Type=notify

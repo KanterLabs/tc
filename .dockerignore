@@ -7,6 +7,7 @@ node_modules
 playwright-report
 test-results
 .tc-deploy.env
+.helm-deploy.env
 .env
 .deploy-key
 .deploy-key.pub
@@ -15,6 +16,11 @@ roadmap-deploy-key.pub
 roadmap-release-signing-private.pem
 roadmap-release-signing-public.pem
 roadmap-access-token.env
+helm-deploy-key
+helm-deploy-key.pub
+helm-release-signing-private.pem
+helm-release-signing-public.pem
+helm-access-token.env
 *.pem
 *.key
 *.pub

@@ -6,16 +6,16 @@ set -Eeuo pipefail
 
 ROOT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 DEPLOY_DIR="$ROOT_DIR/deploy"
-GATEWAY="$DEPLOY_DIR/roadmap-deploy-gateway"
+GATEWAY="$DEPLOY_DIR/helm-deploy-gateway"
 BOOTSTRAP="$DEPLOY_DIR/bootstrap-proxmox.sh"
 DEPLOY_CI="$DEPLOY_DIR/deploy-ci.sh"
 VERIFY="$DEPLOY_DIR/verify-release.sh"
 BUILD_BUNDLE="$DEPLOY_DIR/build-bundle.sh"
-BACKUP="$DEPLOY_DIR/roadmap-backup.sh"
-RESTORE="$DEPLOY_DIR/roadmap-restore.sh"
-ROLLBACK="$DEPLOY_DIR/roadmap-rollback.sh"
+BACKUP="$DEPLOY_DIR/helm-backup.sh"
+RESTORE="$DEPLOY_DIR/helm-restore.sh"
+ROLLBACK="$DEPLOY_DIR/helm-rollback.sh"
 INSTALL="$DEPLOY_DIR/install-inside-lxc.sh"
-SERVICE="$DEPLOY_DIR/roadmap.service"
+SERVICE="$DEPLOY_DIR/helm.service"
 CLOUDFLARE="$DEPLOY_DIR/cloudflare.sh"
 VALIDATE="$DEPLOY_DIR/validate-live.sh"
 WORKFLOW="$ROOT_DIR/.github/workflows/ci.yml"
@@ -44,25 +44,25 @@ for file in "$GATEWAY" "$BOOTSTRAP" "$DEPLOY_CI" "$VERIFY" "$BUILD_BUNDLE" \
 	[[ -f "$file" && ! -L "$file" ]] || fail "deployment file is missing: $file"
 done
 
-fixture=$(mktemp -d "${TMPDIR:-/tmp}/roadmap-deploy-security.XXXXXX")
+fixture=$(mktemp -d "${TMPDIR:-/tmp}/helm-deploy-security.XXXXXX")
 cleanup_fixture() { rm -rf -- "$fixture"; }
 trap cleanup_fixture EXIT
 # Mocked backup publication tests do not have a release binary from which to
 # query migration-info; use a deterministic non-secret fixture digest.
-export ROADMAP_MIGRATION_DIGEST=0000000000000000000000000000000000000000000000000000000000000000
+export HELM_MIGRATION_DIGEST=0000000000000000000000000000000000000000000000000000000000000000
 
 # The SSH key enters one fixed root command through non-interactive sudo. The
 # gateway sees SSH_ORIGINAL_COMMAND, while local argv is an explicit root-only
 # test escape hatch. No deploy-key holder can request a shell or arbitrary sudo.
-contains 'command=\"sudo -n /usr/local/sbin/roadmap-deploy-gateway\"' "$BOOTSTRAP"
+contains 'command=\"sudo -n /usr/local/sbin/helm-deploy-gateway\"' "$BOOTSTRAP"
 contains 'env_keep += "SSH_ORIGINAL_COMMAND SSH_CONNECTION"' "$BOOTSTRAP"
-contains 'ALL=(root) NOPASSWD: /usr/local/sbin/roadmap-deploy-gateway' "$BOOTSTRAP"
+contains 'ALL=(root) NOPASSWD: /usr/local/sbin/helm-deploy-gateway' "$BOOTSTRAP"
 contains '/var/lib/roadmap-deploy/staging' "$BOOTSTRAP"
 contains 'mktemp -d "$base/bootstrap.XXXXXX"' "$BOOTSTRAP"
 contains 'release-signing-public.pem' "$BOOTSTRAP"
 contains '[[ ${SSH_ORIGINAL_COMMAND+x} ]]' "$GATEWAY"
 contains 'REQUEST=${SSH_ORIGINAL_COMMAND:-}' "$GATEWAY"
-contains 'ROADMAP_GATEWAY_LOCAL_TEST=1' "$GATEWAY"
+contains 'HELM_GATEWAY_LOCAL_TEST=1' "$GATEWAY"
 contains '[[ $# -eq 0 ]] || fail '\''SSH gateway does not accept command-line arguments'\''' "$GATEWAY"
 contains 'flock -x 8' "$GATEWAY"
 contains 'timeout --foreground "$ARCHIVE_INGEST_TIMEOUT"' "$GATEWAY"
@@ -85,7 +85,7 @@ contains 'ssh -o BatchMode=yes -T "$PVE_DEPLOY_USER@$PVE_HOST" "deploy $SHA" < "
 contains 'ssh -o BatchMode=yes -T "$PVE_DEPLOY_USER@$PVE_HOST" status < /dev/null' "$DEPLOY_CI"
 contains 'ssh -o BatchMode=yes -T "$PVE_DEPLOY_USER@$PVE_HOST" "rollback $SHA" < /dev/null' "$DEPLOY_CI"
 not_contains 'scp -q' "$DEPLOY_CI"
-not_contains '/usr/local/sbin/roadmap-deploy-gateway' "$DEPLOY_CI"
+not_contains '/usr/local/sbin/helm-deploy-gateway' "$DEPLOY_CI"
 
 # Only the intended command alphabet can reach gateway action dispatch.
 for meta in "*';'*" "*'&'*" "*'|'*" "*'\$'*" "*'\`'*" "*'<'*" "*'>'*" "*'('*" "*')'*" "*'\\\\'*"; do
@@ -126,9 +126,9 @@ bounded_tar_line=$(grep -n '^bounded_tar()' "$VERIFY" | cut -d: -f1)
 [[ -n "$archive_cap_line" && -n "$bounded_tar_line" && "$archive_cap_line" -lt "$bounded_tar_line" ]] \
 	|| fail 'compressed archive cap is not checked before tar processing'
 contains 'ARCHIVE_INGEST_TIMEOUT=120' "$GATEWAY"
-contains 'ROADMAP_RELEASE_SIGNING_KEY_FILE' "$BUILD_BUNDLE"
-contains 'ROADMAP_RELEASE_SHA=%s' "$BUILD_BUNDLE"
-contains 'owner environment already contains ROADMAP_RELEASE_SHA' "$BUILD_BUNDLE"
+contains 'HELM_RELEASE_SIGNING_KEY_FILE' "$BUILD_BUNDLE"
+contains 'HELM_RELEASE_SHA=%s' "$BUILD_BUNDLE"
+contains 'owner environment already contains a release SHA' "$BUILD_BUNDLE"
 contains 'CLOUDFLARED_VERSION=2026.8.2' "$BUILD_BUNDLE"
 contains 'CLOUDFLARED_SHA256=fcfb02b575a52ca1af2e3267af4e1517bcdeb30ac48c834c69abaed3c0576ad2' "$BUILD_BUNDLE"
 
@@ -136,16 +136,17 @@ contains 'CLOUDFLARED_SHA256=fcfb02b575a52ca1af2e3267af4e1517bcdeb30ac48c834c69a
 contains 'DATA_DIR="$STATE_DIR/data"' "$INSTALL"
 contains 'install -d -m 0755 -o root -g root "$STATE_DIR"' "$INSTALL"
 contains 'install -d -m 0750 -o roadmap -g roadmap "$DATA_DIR"' "$INSTALL"
-contains 'ROADMAP_DEPLOY_LOCK_HELD=1' "$INSTALL"
+contains 'HELM_DEPLOY_LOCK_HELD=1' "$INSTALL"
 contains 'healthy_revision()' "$INSTALL"
 contains 'validate_release_env()' "$INSTALL"
+contains 'sha256sum --check --strict "${checksum##*/}"' "$INSTALL"
 contains 'X-Roadmap-Revision' "$INSTALL"
 contains 'loopback_listener()' "$INSTALL"
 contains '127\.0\.0\.1:8080|\[::1\]:8080' "$INSTALL"
 contains 'install -m 0640 -o root -g root "$RELEASE_DIR/roadmap.env" "$new_target/roadmap.env"' "$INSTALL"
 contains 'stop_unit cloudflared.service' "$INSTALL"
-contains 'stop_unit roadmap.service' "$INSTALL"
-contains 'ROADMAP_MIGRATION_INFO_BINARY' "$INSTALL"
+contains 'stop_unit helm.service' "$INSTALL"
+contains 'HELM_MIGRATION_INFO_BINARY' "$INSTALL"
 contains 'schema-preflight' "$INSTALL"
 contains 'verified pre-upgrade backup' "$INSTALL"
 contains "pre_upgrade_backup=%s source_schema=%s candidate_schema=%s latest_schema=%s migration_digest=%s checksum=%s integrity=%s fk=%s preflight=%s" "$INSTALL"
@@ -158,9 +159,9 @@ contains 'PRAGMA foreign_key_check;' "$INSTALL"
 contains 'fresh-install candidate schema preflight' "$INSTALL"
 contains 'legacy database layout requires an explicit offline maintenance migration; no services were stopped' "$INSTALL"
 contains 'migration-info' "$BACKUP"
-contains 'migration-info' "$ROOT_DIR/cmd/roadmap/main.go"
+contains 'migration-info' "$ROOT_DIR/cmd/helm/main.go"
 not_contains 'systemctl stop cloudflared.service 2>/dev/null || true' "$INSTALL"
-not_contains 'systemctl stop roadmap.service 2>/dev/null || true' "$INSTALL"
+not_contains 'systemctl stop helm.service 2>/dev/null || true' "$INSTALL"
 contains 'Keep guest installer stdout/stderr attached' "$GATEWAY"
 contains 'pre_upgrade_backup=...' "$GATEWAY"
 
@@ -312,22 +313,22 @@ printf 'loopback_listener_runtime_tests=ok\n'
 # a clean install cannot fail verification on a missing executable.
 install_switch_line=$(grep -n '^atomic_switch "\$release_target"' "$INSTALL" | cut -d: -f1 || true)
 install_verify_line=$(grep -n '^systemd-analyze verify ' "$INSTALL" | cut -d: -f1 || true)
-install_roadmap_start_line=$(grep -n '^systemctl start roadmap\.service$' "$INSTALL" | cut -d: -f1 || true)
-[[ -n "$install_switch_line" && -n "$install_verify_line" && -n "$install_roadmap_start_line" ]] \
-	|| fail 'install ordering regression checks could not find the release switch, unit verification, and roadmap start'
+install_helm_start_line=$(grep -n '^systemctl start helm\.service$' "$INSTALL" | cut -d: -f1 || true)
+[[ -n "$install_switch_line" && -n "$install_verify_line" && -n "$install_helm_start_line" ]] \
+	|| fail 'install ordering regression checks could not find the release switch, unit verification, and Helm start'
 [[ "$install_switch_line" -lt "$install_verify_line" ]] \
 	|| fail 'install switches the current release after systemd unit verification'
-[[ "$install_switch_line" -lt "$install_roadmap_start_line" ]] \
-	|| fail 'install starts roadmap before switching the current release'
+[[ "$install_switch_line" -lt "$install_helm_start_line" ]] \
+	|| fail 'install starts Helm before switching the current release'
 contains 'WorkingDirectory=/var/lib/roadmap/data' "$SERVICE"
 contains 'ReadWritePaths=/var/lib/roadmap/data' "$SERVICE"
 not_contains 'ReadWritePaths=/var/lib/roadmap ' "$SERVICE"
-contains 'RandomizedDelaySec=1h' "$DEPLOY_DIR/roadmap-backup.timer"
-contains 'Persistent=true' "$DEPLOY_DIR/roadmap-backup.timer"
-contains 'roadmap-backup.timer' "$INSTALL"
-contains 'ROADMAP_DATA_DIR' "$BACKUP"
-contains 'ROADMAP_DATA_DIR' "$RESTORE"
-contains 'ROADMAP_DEPLOY_LOCK_HELD' "$BACKUP"
+contains 'RandomizedDelaySec=1h' "$DEPLOY_DIR/helm-backup.timer"
+contains 'Persistent=true' "$DEPLOY_DIR/helm-backup.timer"
+contains 'helm-backup.timer' "$INSTALL"
+contains 'HELM_DATA_DIR' "$BACKUP"
+contains 'HELM_DATA_DIR' "$RESTORE"
+contains 'HELM_DEPLOY_LOCK_HELD' "$BACKUP"
 contains 'schema_version' "$BACKUP"
 contains 'migration_digest' "$BACKUP"
 contains 'PRAGMA foreign_key_check' "$BACKUP"
@@ -346,7 +347,7 @@ contains 'current_auth.auth_setup' "$RESTORE"
 contains 'current_auth.actor_projects' "$RESTORE"
 contains 'current_auth.actor_resource_usage' "$RESTORE"
 contains 'CREATE TABLE IF NOT EXISTS actor_resource_usage' "$RESTORE"
-contains 'RETENTION=${ROADMAP_BACKUP_RETENTION:-14}' "$RESTORE"
+contains 'RETENTION=$(compat_env HELM_BACKUP_RETENTION ROADMAP_BACKUP_RETENTION 14)' "$RESTORE"
 contains 'prune_backups()' "$RESTORE"
 contains 'prune_backups "$current_snapshot" "$BACKUP_PATH"' "$RESTORE"
 contains 'protected_recovery' "$RESTORE"
@@ -399,7 +400,7 @@ source <(awk '/^ct_rootfs_is_exact\(\)/,/^}/' "$GATEWAY")
 source <(awk '/^ct_tags_are_exact\(\)/,/^}/' "$GATEWAY")
 source <(awk '/^target_vmid_state\(\)/,/^}/' "$GATEWAY")
 source <(awk '/^target_vmid_is_lxc_for_cleanup\(\)/,/^}/' "$GATEWAY")
-source <(awk '/^ct_config_matches_roadmap\(\)/,/^}/' "$GATEWAY")
+source <(awk '/^ct_config_matches_helm_identity\(\)/,/^}/' "$GATEWAY")
 source <(awk '/^cleanup_deploy\(\)/,/^}/' "$GATEWAY")
 log() { printf '[gateway-fixture] %s\n' "$*" >&2; }
 CTID=103
@@ -443,7 +444,7 @@ if (
 	qm() { gateway_status_qm "$@"; }
 	pct() { gateway_status_pct "$@"; }
 	export -f qm pct gateway_status_qm gateway_status_pct
-	ROADMAP_GATEWAY_LOCAL_TEST=1 "$gateway_status_script" status
+	HELM_GATEWAY_LOCAL_TEST=1 "$gateway_status_script" status
 ) >"$gateway_status_output" 2>&1; then
 	fail 'gateway status accepted a QEMU VMID collision'
 fi
@@ -455,13 +456,13 @@ printf 'gateway_qemu_vmid_collision_test=ok\n'
 gateway_drift_config=${gateway_canonical_config/hostname: roadmap/hostname: unrelated}
 gateway_extra_option_config="$gateway_canonical_config"$'\nfeatures: nesting=1'
 gateway_extra_net_config=${gateway_canonical_config/type=veth/type=veth,rate=100}
-ct_config_matches_roadmap "$gateway_canonical_config" \
-	|| fail 'canonical Roadmap CT configuration was rejected'
-if ct_config_matches_roadmap "$gateway_extra_option_config"; then
-	fail 'Roadmap CT configuration accepted an unreviewed top-level option'
+ct_config_matches_helm_identity "$gateway_canonical_config" \
+	|| fail 'canonical Helm CT configuration was rejected'
+if ct_config_matches_helm_identity "$gateway_extra_option_config"; then
+	fail 'Helm CT configuration accepted an unreviewed top-level option'
 fi
-if ct_config_matches_roadmap "$gateway_extra_net_config"; then
-	fail 'Roadmap CT configuration accepted an unreviewed network option'
+if ct_config_matches_helm_identity "$gateway_extra_net_config"; then
+	fail 'Helm CT configuration accepted an unreviewed network option'
 fi
 gateway_pct_mode=
 gateway_pct_config_calls=
@@ -538,15 +539,16 @@ contains 'pct config "$CTID"' "$GATEWAY"
 contains 'current_sha=none' "$GATEWAY"
 contains 'created=1' "$GATEWAY"
 not_contains 'systemctl stop cloudflared.service 2>/dev/null || true' "$ROLLBACK"
-not_contains 'systemctl stop roadmap.service 2>/dev/null || true' "$ROLLBACK"
+not_contains 'systemctl stop helm.service 2>/dev/null || true' "$ROLLBACK"
 not_contains 'systemctl stop cloudflared.service >/dev/null 2>&1 || true' "$RESTORE"
-not_contains 'systemctl stop roadmap.service >/dev/null 2>&1 || true' "$RESTORE"
+not_contains 'systemctl stop helm.service >/dev/null 2>&1 || true' "$RESTORE"
 contains "start_and_verify_previous 'requested release failed app health'" "$ROLLBACK"
 contains "start_and_verify_previous 'requested release failed cloudflared validation'" "$ROLLBACK"
 count_contains 2 'if start_and_verify_previous' "$ROLLBACK"
 contains 'atomic_switch "$previous_target"' "$ROLLBACK"
-contains 'systemctl start roadmap.service || return 1' "$ROLLBACK"
+contains 'systemctl start helm.service || return 1' "$ROLLBACK"
 contains 'systemctl start cloudflared.service || return 1' "$ROLLBACK"
+contains 'systemctl is-active --quiet helm.service || return 1' "$ROLLBACK"
 contains 'systemctl is-active --quiet roadmap.service || return 1' "$ROLLBACK"
 contains 'systemctl is-active --quiet cloudflared.service || return 1' "$ROLLBACK"
 contains 'exit 1' "$ROLLBACK"
@@ -572,6 +574,7 @@ rollback_systemctl() {
 			;;
 		is-active)
 			unit=${!#}
+			[[ "$unit" = roadmap.service ]] && unit=helm.service
 			state_file="$ROLLBACK_SERVICE_STATE_DIR/${unit%.service}"
 			state=$(<"$state_file")
 			if [[ "${1:-}" = is-active && "${2:-}" = --quiet ]]; then
@@ -582,16 +585,18 @@ rollback_systemctl() {
 			;;
 		stop)
 			unit=$2
+			[[ "$unit" = roadmap.service ]] && unit=helm.service
 			state_file="$ROLLBACK_SERVICE_STATE_DIR/${unit%.service}"
 			printf 'stop %s\n' "$unit" >> "$ROLLBACK_CALL_LOG"
 			printf 'inactive\n' > "$state_file"
 			;;
 		start)
 			unit=$2
+			[[ "$unit" = roadmap.service ]] && unit=helm.service
 			state_file="$ROLLBACK_SERVICE_STATE_DIR/${unit%.service}"
 			current=$(readlink -- "$ROLLBACK_CURRENT_LINK" 2>/dev/null || true)
 			if [[ "$current" = "$ROLLBACK_TARGET_DIR" &&
-				( "$ROLLBACK_MODE" = app-restart-failure && "$unit" = roadmap.service ||
+				( "$ROLLBACK_MODE" = app-restart-failure && "$unit" = helm.service ||
 				  "$ROLLBACK_MODE" = connector-restart-failure && "$unit" = cloudflared.service ) &&
 				! -e "$ROLLBACK_START_FAILURE_MARKER" ]]; then
 				: > "$ROLLBACK_START_FAILURE_MARKER"
@@ -663,20 +668,20 @@ rollback_run_case() {
 	chmod 0755 "$state_dir"
 	/usr/bin/install -d -m 0755 "$previous_dir" "$target_dir"
 	printf 'previous release binary\n' > "$previous_dir/roadmap"
-	printf 'target release binary\n' > "$target_dir/roadmap"
-	chmod 0755 "$previous_dir/roadmap" "$target_dir/roadmap"
+	printf 'target release binary\n' > "$target_dir/helm"
+	chmod 0755 "$previous_dir/roadmap" "$target_dir/helm"
 	(
 		cd "$previous_dir" && sha256sum roadmap > roadmap.sha256
 	)
 	(
-		cd "$target_dir" && sha256sum roadmap > roadmap.sha256
+		cd "$target_dir" && sha256sum helm > helm.sha256
 	)
 	printf 'ROADMAP_RELEASE_SHA=%s\nROADMAP_ENV_MARKER=previous\n' "$previous_sha" > "$previous_dir/roadmap.env"
-	printf 'ROADMAP_RELEASE_SHA=%s\nROADMAP_ENV_MARKER=target\n' "$target_sha" > "$target_dir/roadmap.env"
+	printf 'HELM_RELEASE_SHA=%s\nROADMAP_RELEASE_SHA=%s\nHELM_ENV_MARKER=target\n' "$target_sha" "$target_sha" > "$target_dir/roadmap.env"
 	cp -- "$previous_dir/roadmap.env" "$case_dir/previous.env.ref"
 	ln -s -- "$previous_dir" "$state_dir/current"
 	printf 'ROADMAP_RELEASE_SHA=%s\nROADMAP_ENV_MARKER=live-before\n' "$previous_sha" > "$config_dir/roadmap.env"
-	printf 'active\n' > "$service_state_dir/roadmap"
+	printf 'active\n' > "$service_state_dir/helm"
 	printf 'active\n' > "$service_state_dir/cloudflared"
 	: > "$call_log"
 
@@ -713,10 +718,10 @@ rollback_run_case() {
 		|| fail "rollback $mode did not restore the exact previous environment"
 	[[ "$(readlink -- "$state_dir/current")" = "$previous_dir" ]] \
 		|| fail "rollback $mode did not restore the previous current link"
-	[[ "$(<"$service_state_dir/roadmap")" = active && "$(<"$service_state_dir/cloudflared")" = active ]] \
+	[[ "$(<"$service_state_dir/helm")" = active && "$(<"$service_state_dir/cloudflared")" = active ]] \
 		|| fail "rollback $mode did not restore both prior services"
-	grep -Eq '^start roadmap\.service$' "$call_log" \
-		|| fail "rollback $mode did not restart roadmap.service"
+	grep -Eq '^start helm\.service$' "$call_log" \
+		|| fail "rollback $mode did not restart helm.service"
 	grep -Eq '^start cloudflared\.service$' "$call_log" \
 		|| fail "rollback $mode did not restart cloudflared.service"
 }
@@ -737,11 +742,11 @@ for file in "$CLOUDFLARE" "$VALIDATE"; do
 	contains 'trap cleanup EXIT' "$file"
 	not_contains '--header "Authorization: Bearer' "$file"
 done
-contains "SERVICE_POLICY_NAME='Roadmap agents Service Auth'" "$CLOUDFLARE"
+contains "SERVICE_POLICY_NAME='Helm agents Service Auth'" "$CLOUDFLARE"
 contains 'audTag:[$ui,$aud]' "$CLOUDFLARE"
 contains 'validate_policy_set' "$CLOUDFLARE"
 contains 'duration:"8760h"' "$CLOUDFLARE"
-contains 'ROADMAP_REQUIRE_DURABLE_SERVICE_TOKEN_CAPTURE' "$CLOUDFLARE"
+contains 'HELM_REQUIRE_DURABLE_SERVICE_TOKEN_CAPTURE' "$CLOUDFLARE"
 contains 'without a durable secret-capture destination' "$CLOUDFLARE"
 contains 'expires_at // .expiration_time' "$CLOUDFLARE"
 contains 'validate_owner_env()' "$CLOUDFLARE"
@@ -757,15 +762,15 @@ contains 'if ! mv -T -- "$owner_tmp" "$OWNER_ENV_OUTPUT"' "$CLOUDFLARE"
 contains 'prior outputs restored' "$CLOUDFLARE"
 contains 'if ! write_prepare_outputs' "$CLOUDFLARE"
 not_contains 'sed -e "s/@CLOUDFLARE_ISSUER@/' "$CLOUDFLARE"
-contains '@CLOUDFLARE_ISSUER@' "$DEPLOY_DIR/roadmap.env.template"
-contains '@UI_AUDIENCE@' "$DEPLOY_DIR/roadmap.env.template"
-contains '@API_AUDIENCE@' "$DEPLOY_DIR/roadmap.env.template"
-contains 'ROADMAP_CF_ACCESS_AUDIENCES' "$DEPLOY_DIR/roadmap.env.template"
+contains '@CLOUDFLARE_ISSUER@' "$DEPLOY_DIR/helm.env.template"
+contains '@UI_AUDIENCE@' "$DEPLOY_DIR/helm.env.template"
+contains '@API_AUDIENCE@' "$DEPLOY_DIR/helm.env.template"
+contains 'HELM_CF_ACCESS_AUDIENCES' "$DEPLOY_DIR/helm.env.template"
 contains 'API Access app policy set is not exactly owner Allow plus Service Auth' "$VALIDATE"
 contains 'tunnel_config=' "$VALIDATE"
 contains 'CF_ACCESS_CLIENT_ID' "$VALIDATE"
 contains 'CF_ACCESS_CLIENT_SECRET' "$VALIDATE"
-contains 'ROADMAP_REQUIRE_SERVICE_AUTH_PROBE' "$VALIDATE"
+contains 'HELM_REQUIRE_SERVICE_AUTH_PROBE' "$VALIDATE"
 contains 'X-Request-ID: $expected_request_id' "$VALIDATE"
 contains 'JSON unauthorized' "$VALIDATE"
 contains 'validate_access_app()' "$VALIDATE"
@@ -781,8 +786,8 @@ contains '.result.session_duration == "168h"' "$VALIDATE"
 contains '.result.allowed_idps // []) == [$idp]' "$VALIDATE"
 contains '.result.service_auth_401_redirect // false) == $service401' "$VALIDATE"
 contains '$ingress[0].originRequest.access.teamName == $team' "$VALIDATE"
-contains '! -L "$ROADMAP_SSH_CONFIG"' "$DEPLOY_CI"
-contains 'ROADMAP_SSH_CONFIG must be owned by the invoking user and mode 0600 or stricter' "$DEPLOY_CI"
+contains '! -L "$SSH_CONFIG"' "$DEPLOY_CI"
+contains 'HELM_SSH_CONFIG must be owned by the invoking user and mode 0600 or stricter' "$DEPLOY_CI"
 
 # A freshly-published DNS record can briefly return resolver/connect failures
 # or a non-Access status. Exercise the bounded retry loop with a curl sequence
@@ -822,7 +827,7 @@ probe_curl() {
 		connect) return 7 ;;
 		302|303|401|500)
 			if [[ "$PROBE_KIND" = service ]]; then
-				printf 'HTTP/1.1 %s Fixture\r\nContent-Type: application/json\r\nX-Request-ID: roadmap-service-auth-probe\r\n\r\n' \
+				printf 'HTTP/1.1 %s Fixture\r\nContent-Type: application/json\r\nX-Request-ID: helm-service-auth-probe\r\n\r\n' \
 					"$event" > "$header_file"
 				printf '%s' '{"error":{"code":"unauthorized","message":"fixture"}}' > "$output_file"
 			fi
@@ -1042,7 +1047,15 @@ cloudflare_prepare_curl() {
 	elif [[ "$method" = GET && "$path" = "$base/access/organizations" ]]; then
 		printf '{"success":true,"result":{"auth_domain":"team.cloudflareaccess.com"}}'
 	elif [[ "$method" = GET && "$path" = "$base/access/service_tokens?per_page=100" ]]; then
-		printf '{"success":true,"result":[]}'
+		if [[ "${CF_MOCK_SERVICE_TOKEN_MODE:-new}" = legacy ]]; then
+			if grep -Fq "PUT $base/access/service_tokens/service-token-fixture" "$CF_MOCK_LOG"; then
+				printf '{"success":true,"result":[{"id":"service-token-fixture","name":"Helm agents","client_id":"client-fixture","expires_at":"%s"}]}' "$CF_MOCK_EXPIRY"
+			else
+				printf '{"success":true,"result":[{"id":"service-token-fixture","name":"Roadmap agents","client_id":"client-fixture","expires_at":"%s"}]}' "$CF_MOCK_EXPIRY"
+			fi
+		else
+			printf '{"success":true,"result":[]}'
+		fi
 	elif [[ "$method" = POST && "$path" = "$base/access/service_tokens" ]]; then
 		printf '{"success":true,"result":{"id":"service-token-fixture","client_id":"client-fixture","client_secret":"secret-fixture","expires_at":"%s"}}' "$CF_MOCK_EXPIRY"
 	elif [[ "$method" = GET && "$path" = "$base/access/apps?per_page=100" ]]; then
@@ -1054,13 +1067,13 @@ cloudflare_prepare_curl() {
 			printf '{"success":true,"result":{"id":"ui-app-fixture"}}'
 		fi
 	elif [[ "$method" = GET && "$path" = "$base/access/apps/ui-app-fixture" ]]; then
-		printf '{"success":true,"result":{"name":"Roadmap owner UI","domain":"tc.shanekanterman.dev","type":"self_hosted","session_duration":"168h","auto_redirect_to_identity":true,"allowed_idps":["%s"],"app_launcher_visible":false,"service_auth_401_redirect":false,"aud":"ui-audience"}}' "$idp_fixture"
+		printf '{"success":true,"result":{"name":"Helm owner UI","domain":"tc.shanekanterman.dev","type":"self_hosted","session_duration":"168h","auto_redirect_to_identity":true,"allowed_idps":["%s"],"app_launcher_visible":false,"service_auth_401_redirect":false,"aud":"ui-audience"}}' "$idp_fixture"
 	elif [[ "$method" = GET && "$path" = "$base/access/apps/api-app-fixture" ]]; then
-		printf '{"success":true,"result":{"name":"Roadmap agents API","domain":"tc.shanekanterman.dev/api/v1/*","type":"self_hosted","session_duration":"168h","auto_redirect_to_identity":true,"allowed_idps":["%s"],"app_launcher_visible":false,"service_auth_401_redirect":true,"aud":"api-audience"}}' "$idp_fixture"
+		printf '{"success":true,"result":{"name":"Helm agents API","domain":"tc.shanekanterman.dev/api/v1/*","type":"self_hosted","session_duration":"168h","auto_redirect_to_identity":true,"allowed_idps":["%s"],"app_launcher_visible":false,"service_auth_401_redirect":true,"aud":"api-audience"}}' "$idp_fixture"
 	elif [[ "$method" = GET && "$path" = "$base/access/apps/ui-app-fixture/policies" ]]; then
-		printf '%s' '{"success":true,"result":[{"id":"ui-owner-policy","name":"Roadmap owner only","decision":"allow","precedence":1,"include":[{"email":{"email":"owner@example.com"}}]}]}'
+		printf '%s' '{"success":true,"result":[{"id":"ui-owner-policy","name":"Helm owner only","decision":"allow","precedence":1,"include":[{"email":{"email":"owner@example.com"}}]}]}'
 	elif [[ "$method" = GET && "$path" = "$base/access/apps/api-app-fixture/policies" ]]; then
-		printf '%s' '{"success":true,"result":[{"id":"api-owner-policy","name":"Roadmap owner only","decision":"allow","precedence":2,"include":[{"email":{"email":"owner@example.com"}}]},{"id":"api-service-policy","name":"Roadmap agents Service Auth","decision":"non_identity","precedence":1,"include":[{"service_token":{"token_id":"service-token-fixture"}}]}]}'
+		printf '%s' '{"success":true,"result":[{"id":"api-owner-policy","name":"Helm owner only","decision":"allow","precedence":2,"include":[{"email":{"email":"owner@example.com"}}]},{"id":"api-service-policy","name":"Helm agents Service Auth","decision":"non_identity","precedence":1,"include":[{"service_token":{"token_id":"service-token-fixture"}}]}]}'
 	elif [[ "$method" = PUT || "$method" = POST ]]; then
 		printf '{"success":true,"result":{}}'
 	elif [[ "$method" = GET && "$path" = "$base/cfd_tunnel?is_deleted=false&per_page=100" ]]; then
@@ -1077,7 +1090,7 @@ cloudflare_prepare_curl() {
 }
 
 cloudflare_prepare_provider_case() {
-	local name=$1 mode=$2 expected_status=$3 case_dir="$fixture/cloudflare-provider-$1"
+	local name=$1 mode=$2 expected_status=$3 token_mode=${4:-new} case_dir="$fixture/cloudflare-provider-$1"
 	local output="$case_dir/output.log" status expected_idp_calls=1
 	[[ "$mode" = create ]] && expected_idp_calls=2
 	/usr/bin/install -d -m 0700 "$case_dir"
@@ -1085,12 +1098,13 @@ cloudflare_prepare_provider_case() {
 	CF_MOCK_FAIL=
 	CF_MOCK_EXPIRY=$(date -u -d '+30 days' +%Y-%m-%dT%H:%M:%SZ)
 	CF_MOCK_IDP_MODE=$mode
-	export CF_MOCK_LOG CF_MOCK_FAIL CF_MOCK_EXPIRY CF_MOCK_IDP_MODE
+	CF_MOCK_SERVICE_TOKEN_MODE=$token_mode
+	export CF_MOCK_LOG CF_MOCK_FAIL CF_MOCK_EXPIRY CF_MOCK_IDP_MODE CF_MOCK_SERVICE_TOKEN_MODE
 	set +e
 	(
-		export CLOUDFLARE_API_TOKEN=fixture-token ROADMAP_ADMIN_EMAIL=owner@example.com
-		export ROADMAP_REQUIRE_DURABLE_SERVICE_TOKEN_CAPTURE=0
-		unset ROADMAP_PUBLIC_ORIGIN
+		export CLOUDFLARE_API_TOKEN=fixture-token HELM_ADMIN_EMAIL=owner@example.com
+		export HELM_REQUIRE_DURABLE_SERVICE_TOKEN_CAPTURE=0
+		unset HELM_PUBLIC_ORIGIN ROADMAP_PUBLIC_ORIGIN
 		export -f cloudflare_prepare_curl
 		curl() { cloudflare_prepare_curl "$@"; }
 		export -f curl
@@ -1108,10 +1122,17 @@ cloudflare_prepare_provider_case() {
 	fi
 	[[ "$(grep -Fc -- '/access/identity_providers' "$CF_MOCK_LOG" || true)" = "$expected_idp_calls" ]] \
 		|| fail "Cloudflare provider $name performed an unexpected number of IdP requests"
+	if [[ "$token_mode" = legacy && "$expected_status" = success ]]; then
+		[[ "$(grep -Fc -- 'PUT /accounts/090ae73dce25f4eca9a53ee396fdc916/access/service_tokens/service-token-fixture' "$CF_MOCK_LOG" || true)" = 1 ]] \
+			|| fail 'Cloudflare legacy service token was not renamed in place'
+		[[ "$(grep -Fc -- 'POST /accounts/090ae73dce25f4eca9a53ee396fdc916/access/service_tokens' "$CF_MOCK_LOG" || true)" = 0 ]] \
+			|| fail 'Cloudflare legacy service token migration rotated the credential'
+	fi
 }
 
 cloudflare_prepare_provider_case reuse reuse success
 cloudflare_prepare_provider_case create create success
+cloudflare_prepare_provider_case legacy-token reuse success legacy
 cloudflare_prepare_provider_case ambiguous ambiguous failure
 cloudflare_prepare_provider_case nonconforming nonconforming failure
 CF_MOCK_IDP_MODE=reuse
@@ -1131,9 +1152,9 @@ cloudflare_prepare_failure_case() {
 	export CF_MOCK_LOG CF_MOCK_FAIL CF_MOCK_EXPIRY
 	set +e
 	(
-		export CLOUDFLARE_API_TOKEN=fixture-token ROADMAP_ADMIN_EMAIL=owner@example.com
-		export ROADMAP_REQUIRE_DURABLE_SERVICE_TOKEN_CAPTURE=0
-		unset ROADMAP_PUBLIC_ORIGIN
+		export CLOUDFLARE_API_TOKEN=fixture-token HELM_ADMIN_EMAIL=owner@example.com
+		export HELM_REQUIRE_DURABLE_SERVICE_TOKEN_CAPTURE=0
+		unset HELM_PUBLIC_ORIGIN ROADMAP_PUBLIC_ORIGIN
 		export -f cloudflare_prepare_curl
 		curl() { cloudflare_prepare_curl "$@"; }
 		export -f curl
@@ -1166,9 +1187,9 @@ printf 'cloudflare_prepare_recovery_runtime_tests=ok\n'
 # Production mutation jobs alone share the fixed non-canceling lock; PR/check
 # traffic remains ref-scoped. Manual deployment/rollback is main-only and its
 # scripts are checked out at the selected main SHA.
-contains 'group: roadmap-${{ github.workflow }}-${{ github.ref }}' "$WORKFLOW"
+contains 'group: helm-${{ github.workflow }}-${{ github.ref }}' "$WORKFLOW"
 contains "cancel-in-progress: \${{ github.ref != 'refs/heads/main' }}" "$WORKFLOW"
-count_contains 2 'group: roadmap-production' "$WORKFLOW"
+count_contains 2 'group: helm-production' "$WORKFLOW"
 count_contains 2 'cancel-in-progress: false' "$WORKFLOW"
 contains "github.ref == 'refs/heads/main'" "$WORKFLOW"
 contains 'ref: ${{ github.sha }}' "$WORKFLOW"
@@ -1184,21 +1205,21 @@ contains 'actions/setup-node@' "$WORKFLOW"
 contains 'ROADMAP_RELEASE_SIGNING_KEY' "$WORKFLOW"
 contains 'ROADMAP_CF_ACCESS_CLIENT_ID' "$WORKFLOW"
 contains 'ROADMAP_CF_ACCESS_CLIENT_SECRET' "$WORKFLOW"
-contains 'ROADMAP_REQUIRE_DURABLE_SERVICE_TOKEN_CAPTURE: "1"' "$WORKFLOW"
-contains 'cloudflare_dir="$RUNNER_TEMP/roadmap-cloudflare"' "$WORKFLOW"
-contains 'ROADMAP_CLOUDFLARED_TOKEN_FILE=%s' "$WORKFLOW"
-contains 'ROADMAP_OWNER_ENV_FILE=%s' "$WORKFLOW"
-count_contains 2 'rm -rf -- "$RUNNER_TEMP/roadmap-ssh" "$RUNNER_TEMP/roadmap-cloudflare"' "$WORKFLOW"
-count_contains 2 'rm -f -- dist/cloudflared.token dist/owner.env dist/roadmap-access-token.env' "$WORKFLOW"
-contains 'ROADMAP_CLOUDFLARED_TOKEN_FILE' "$ROOT_DIR/deploy/build-bundle.sh"
-contains 'ROADMAP_OWNER_ENV_FILE' "$ROOT_DIR/deploy/build-bundle.sh"
+contains 'HELM_REQUIRE_DURABLE_SERVICE_TOKEN_CAPTURE: "1"' "$WORKFLOW"
+contains 'cloudflare_dir="$RUNNER_TEMP/helm-cloudflare"' "$WORKFLOW"
+contains 'HELM_CLOUDFLARED_TOKEN_FILE=%s' "$WORKFLOW"
+contains 'HELM_OWNER_ENV_FILE=%s' "$WORKFLOW"
+count_contains 2 'rm -rf -- "$RUNNER_TEMP/helm-ssh" "$RUNNER_TEMP/helm-cloudflare"' "$WORKFLOW"
+count_contains 2 'rm -f -- dist/cloudflared.token dist/owner.env dist/helm-access-token.env' "$WORKFLOW"
+contains 'HELM_CLOUDFLARED_TOKEN_FILE' "$ROOT_DIR/deploy/build-bundle.sh"
+contains 'HELM_OWNER_ENV_FILE' "$ROOT_DIR/deploy/build-bundle.sh"
 contains 'Capture previous release for recovery' "$WORKFLOW"
 contains 'automatic rollback' "$WORKFLOW"
-contains 'chmod 0755 dist/roadmap' "$WORKFLOW"
+contains 'chmod 0755 dist/helm' "$WORKFLOW"
 contains 'container_smoke=ok' "$WORKFLOW"
 contains 'ready=false' "$WORKFLOW"
-contains 'docker exec "$container_id" /usr/local/bin/roadmap healthcheck' "$WORKFLOW"
-contains '/usr/local/bin/roadmap healthcheck' "$WORKFLOW"
+contains 'docker exec "$container_id" /usr/local/bin/helm healthcheck' "$WORKFLOW"
+contains '/usr/local/bin/helm healthcheck' "$WORKFLOW"
 not_contains 'persist-credentials: true' "$WORKFLOW"
 checkout_count=$(grep -Fc -- 'uses: actions/checkout@' "$WORKFLOW" || true)
 persisted_checkout_count=$(grep -Fc -- 'persist-credentials: false' "$WORKFLOW" || true)
@@ -1219,7 +1240,7 @@ awk '
 ' "$WORKFLOW" || fail 'a workflow checkout block lacks persist-credentials: false'
 
 contains 'HEALTHCHECK' "$ROOT_DIR/Dockerfile"
-contains 'test: ["CMD", "/usr/local/bin/roadmap", "healthcheck"]' "$ROOT_DIR/compose.yaml"
+contains 'test: ["CMD", "/usr/local/bin/helm", "healthcheck"]' "$ROOT_DIR/compose.yaml"
 
 contains '/var/lib/roadmap/data/roadmap.db' "$ROOT_DIR/README.md"
 contains '`ROADMAP_RELEASE_SIGNING_KEY`' "$ROOT_DIR/README.md"
@@ -1227,7 +1248,7 @@ contains '`ROADMAP_RELEASE_SIGNING_KEY`' "$ROOT_DIR/README.md"
 # Local key material must never enter a Docker build context. .gitignore is
 # intentionally owned by the repository integration agent; test its Docker
 # counterpart here and report missing Git exclusions to the parent.
-for secret_pattern in roadmap-deploy-key roadmap-deploy-key.pub roadmap-release-signing-private.pem roadmap-release-signing-public.pem '*.pem' '*.key' '*.pub'; do
+for secret_pattern in helm-deploy-key helm-deploy-key.pub helm-release-signing-private.pem helm-release-signing-public.pem roadmap-deploy-key roadmap-deploy-key.pub roadmap-release-signing-private.pem roadmap-release-signing-public.pem '*.pem' '*.key' '*.pub'; do
 	contains "$secret_pattern" "$DOCKERIGNORE"
 done
 

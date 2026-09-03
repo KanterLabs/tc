@@ -1,11 +1,11 @@
 [Unit]
-Description=Verified Roadmap SQLite backup
-After=roadmap.service
+Description=Verified Helm SQLite backup
+After=helm.service
 RequiresMountsFor=/var/lib/roadmap/data /var/lib/roadmap/backups
 
 [Service]
 Type=oneshot
-ExecStart=/usr/local/sbin/roadmap-backup daily
+ExecStart=/usr/local/sbin/helm-backup daily
 User=root
 Group=root
 NoNewPrivileges=true
@@ -14,3 +14,6 @@ ProtectSystem=strict
 ProtectHome=true
 PrivateDevices=true
 ReadWritePaths=/var/lib/roadmap/data /var/lib/roadmap/backups
+
+[Install]
+Alias=roadmap-backup.service

@@ -1,9 +1,19 @@
 ---
 name: tc-roadmap
-description: Track substantive agent work, goals, progress, blockers, and completion in a TC Roadmap project. Use at the start of multi-step implementation, deployment, CI, maintenance, research, or other project work that should remain visible to Shane; keep the Roadmap task current throughout the work. Do not use for quick factual answers or casual conversation.
+description: Compatibility alias for the Helm agent-work skill. Use existing $tc-roadmap invocations safely during migration; new work should prefer $helm. Track substantive agent work, goals, progress, blockers, and completion without changing existing task or project IDs.
 ---
 
-# TC Roadmap
+# TC Roadmap compatibility
+
+This directory is retained for installed agents and explicit `$tc-roadmap`
+invocations during the Helm migration. The canonical public skill is
+`skills/helm`; this compatibility package keeps the existing script names,
+state root, API paths, task IDs, and project IDs intact.
+
+`scripts/update_skill.py` now fetches `https://github.com/KanterLabs/helm.git`
+and installs the canonical sibling at `skills/helm` without deleting this
+directory or credentials. Once Helm is present, `scripts/install_hooks.py`
+reconciles the canonical hook while preserving any existing legacy command.
 
 Use TC as the durable project record for substantive work. The chat plan is temporary; the Roadmap task is the shared source of truth humans and later agent sessions can inspect.
 
@@ -227,6 +237,13 @@ when work remains.
 
 ## Authentication and failures
 
-The helper reads `TC_ROADMAP_TOKEN` or a mode-`0600` JSON file at `~/.config/tc-roadmap/credentials.json`. It also supports Cloudflare Access service credentials without printing them. Read [references/authentication.md](references/authentication.md) only when configuring or troubleshooting access.
+The helper accepts canonical `HELM_URL`/`HELM_TOKEN` settings and the
+compatibility aliases `TC_ROADMAP_URL`, `TC_ROADMAP_TOKEN`, and
+`ROADMAP_TOKEN`; conflicting values fail closed. It also reads the existing
+mode-`0600` JSON file at `~/.config/tc-roadmap/credentials.json` (or a
+canonical Helm credential file) and supports Cloudflare Access service
+credentials without printing them. Read
+[references/authentication.md](references/authentication.md) only when
+configuring or troubleshooting access.
 
 The helper writes JSON results to stdout and sanitized errors to stderr. Treat `409` as a concurrency signal: re-read the task and preserve the other actor's work. Never paste credential values into commands, chat, task fields, logs, or source control.

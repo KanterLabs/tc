@@ -8,8 +8,8 @@ import (
 	"sync"
 	"time"
 
-	"roadmap/internal/auth"
-	"roadmap/internal/store"
+	"github.com/KanterLabs/helm/internal/auth"
+	"github.com/KanterLabs/helm/internal/store"
 )
 
 // Agent bearer traffic is bounded by an actor-keyed request bucket, while

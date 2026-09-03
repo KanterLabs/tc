@@ -18,6 +18,7 @@ from typing import Any
 SESSION_START_MATCHER = "startup|resume|clear|compact"
 HOOK_EVENTS = ("SessionStart", "PostToolUse", "PreCompact", "Stop")
 HOOK_RELATIVE_PATH = Path("skills") / "tc-roadmap" / "scripts" / "tc_roadmap_hook.py"
+CANONICAL_HOOK_RELATIVE_PATH = Path("skills") / "helm" / "scripts" / "helm_hook.py"
 HOOK_MODE = 0o600
 HOOK_TIMEOUTS = {
     "SessionStart": (5, "Refreshing TC Roadmap session"),
@@ -165,6 +166,18 @@ def _hook_command(home: Path) -> str:
     return "/usr/bin/python3 " + shlex.quote(str(script))
 
 
+def _canonical_hook_command(home: Path) -> str:
+    script = (home / CANONICAL_HOOK_RELATIVE_PATH).expanduser()
+    return "/usr/bin/python3 " + shlex.quote(str(script))
+
+
+def _hook_commands(home: Path) -> tuple[str, ...]:
+    """Use Helm once it is installed, retaining legacy fallback beforehand."""
+
+    canonical = home / CANONICAL_HOOK_RELATIVE_PATH
+    return (_canonical_hook_command(home),) if canonical.is_file() else (_hook_command(home),)
+
+
 def _group_matches(event: str, group: dict[str, Any]) -> bool:
     if event == "SessionStart":
         return group.get("matcher") == SESSION_START_MATCHER
@@ -279,16 +292,17 @@ def install_hooks(
     _ensure_parent(path)
     config, original = _read_config(path)
     hooks = _validate_relevant_shape(config)
-    command = _hook_command(home)
+    commands = _hook_commands(home)
 
     added: list[str] = []
-    for event in HOOK_EVENTS:
-        groups = hooks.get(event)
-        if groups is None:
-            groups = []
-            hooks[event] = groups
-        if _reconcile_event(groups, event, command):
-            added.append(event)
+    for command in commands:
+        for event in HOOK_EVENTS:
+            groups = hooks.get(event)
+            if groups is None:
+                groups = []
+                hooks[event] = groups
+            if _reconcile_event(groups, event, command):
+                added.append(event)
 
     mode_changed = original is not None and stat.S_IMODE(original.st_mode) != HOOK_MODE
     changed = bool(added) or original is None or mode_changed

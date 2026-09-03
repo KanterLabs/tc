@@ -46,7 +46,7 @@ type Collection<T> = {
   next_cursor?: string | null;
 };
 
-const e2eOrigin = new URL(process.env.ROADMAP_E2E_BASE_URL || 'http://127.0.0.1:18080').origin;
+const e2eOrigin = new URL(process.env.HELM_E2E_BASE_URL || process.env.ROADMAP_E2E_BASE_URL || 'http://127.0.0.1:18080').origin;
 
 function etagForVersion(version: number): string {
   return `"v${version}"`;
@@ -134,7 +134,7 @@ test('shows live agent work across the board, drawer, and My Work', async ({ pag
   test.setTimeout(90_000);
 
   const status = await getJSON<{ mode?: string }>(request, '/api/v1/auth/status');
-  expect(status.mode, 'The E2E server must run with ROADMAP_AUTH_MODE=disabled').toBe('disabled');
+  expect(status.mode, 'The E2E server must run with HELM_AUTH_MODE=disabled').toBe('disabled');
 
   const runID = `${Date.now().toString(36)}${Math.random().toString(36).slice(2, 7)}`.toUpperCase();
   const suffix = runID.slice(-8);

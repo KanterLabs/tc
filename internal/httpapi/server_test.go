@@ -11,10 +11,10 @@ import (
 	"sync"
 	"testing"
 
-	"roadmap/internal/auth"
-	"roadmap/internal/config"
-	"roadmap/internal/db"
-	"roadmap/internal/store"
+	"github.com/KanterLabs/helm/internal/auth"
+	"github.com/KanterLabs/helm/internal/config"
+	"github.com/KanterLabs/helm/internal/db"
+	"github.com/KanterLabs/helm/internal/store"
 )
 
 type staticCloudflareVerifier struct {
@@ -33,7 +33,7 @@ func testServer(t *testing.T, mode string) (*Server, *store.Store) {
 	}
 	t.Cleanup(func() { _ = database.Close() })
 	data := store.New(database)
-	cfg := config.Config{AuthMode: mode, PublicOrigin: "http://roadmap.test", SecureCookies: false}
+	cfg := config.Config{AuthMode: mode, PublicOrigin: "http://helm.test", SecureCookies: false}
 	return New(data, auth.NewManager(data, cfg), cfg), data
 }
 
@@ -45,7 +45,7 @@ func request(t *testing.T, handler http.Handler, method, target string, payload 
 	}
 	req := httptest.NewRequest(method, target, bytesReader(body))
 	if method != http.MethodGet && method != http.MethodHead && method != http.MethodOptions {
-		req.Header.Set("Origin", "http://roadmap.test")
+		req.Header.Set("Origin", "http://helm.test")
 	}
 	for name, value := range headers {
 		req.Header.Set(name, value)
@@ -67,7 +67,7 @@ func TestContractMutationETagAndIdempotency(t *testing.T) {
 	if replay.Code != http.StatusCreated || replay.Body.String() != projectResponse.Body.String() {
 		t.Fatalf("idempotent replay changed response: %d %s", replay.Code, replay.Body.String())
 	}
-	trailingSlashOrigin := request(t, server, http.MethodPost, "/api/v1/projects", map[string]any{"key": "WEB", "name": "Wrong origin"}, map[string]string{"Content-Type": "application/json", "Origin": "http://roadmap.test/"})
+	trailingSlashOrigin := request(t, server, http.MethodPost, "/api/v1/projects", map[string]any{"key": "WEB", "name": "Wrong origin"}, map[string]string{"Content-Type": "application/json", "Origin": "http://helm.test/"})
 	if trailingSlashOrigin.Code != http.StatusForbidden {
 		t.Fatalf("trailing slash origin status = %d, body=%s", trailingSlashOrigin.Code, trailingSlashOrigin.Body.String())
 	}
@@ -328,7 +328,7 @@ func TestEmbeddedFrontendServesAssetsAndSPAPaths(t *testing.T) {
 	server, _ := testServer(t, "disabled")
 
 	page := request(t, server, http.MethodGet, "/", nil, nil)
-	if page.Code != http.StatusOK || !strings.Contains(page.Body.String(), "Roadmap") {
+	if page.Code != http.StatusOK || !strings.Contains(page.Body.String(), "Helm") {
 		t.Fatalf("embedded index: status=%d content-type=%q body=%s", page.Code, page.Header().Get("Content-Type"), page.Body.String())
 	}
 	if got := page.Header().Get("Content-Type"); !strings.HasPrefix(got, "text/html") {
@@ -336,7 +336,7 @@ func TestEmbeddedFrontendServesAssetsAndSPAPaths(t *testing.T) {
 	}
 
 	route := request(t, server, http.MethodGet, "/p/example", nil, nil)
-	if route.Code != http.StatusOK || !strings.Contains(route.Body.String(), "Roadmap") {
+	if route.Code != http.StatusOK || !strings.Contains(route.Body.String(), "Helm") {
 		t.Fatalf("SPA route: status=%d body=%s", route.Code, route.Body.String())
 	}
 

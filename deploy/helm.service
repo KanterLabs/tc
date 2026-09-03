@@ -1,5 +1,5 @@
 [Unit]
-Description=Roadmap project board
+Description=Helm project board
 After=network-online.target
 Wants=network-online.target
 
@@ -8,7 +8,7 @@ Type=simple
 User=roadmap
 Group=roadmap
 EnvironmentFile=/etc/roadmap/roadmap.env
-ExecStart=/var/lib/roadmap/current/roadmap
+ExecStart=/usr/local/sbin/helm-run-current
 WorkingDirectory=/var/lib/roadmap/data
 Restart=on-failure
 RestartSec=3s
@@ -35,3 +35,4 @@ ReadWritePaths=/var/lib/roadmap/data
 
 [Install]
 WantedBy=multi-user.target
+Alias=roadmap.service

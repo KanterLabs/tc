@@ -1,4 +1,4 @@
-module roadmap
+module github.com/KanterLabs/helm
 
 go 1.25.0
 

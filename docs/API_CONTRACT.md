@@ -1,4 +1,4 @@
-# Roadmap v1 API contract
+# Helm v1 API contract
 
 The browser and external agents use the same JSON API under `/api/v1`.
 Single-resource responses return the resource directly. Collection responses
@@ -15,7 +15,7 @@ fields are omitted when they have no value unless a route explicitly documents
 
 ## Discovery, headers, and security
 
-- `GET /api/v1` is public discovery and returns `{ "name": "roadmap", "version": "v1" }`, plus `revision` when configured.
+- `GET /api/v1` is public discovery and returns `{ "name": "helm", "version": "v1" }`, plus `revision` when configured.
 - `GET /openapi.json` returns the OpenAPI 3.1 contract and is served with
   `Cache-Control: no-store`, like the JSON API responses.
 - Every response includes `X-Request-ID`. Deployments with a release SHA also include `X-Roadmap-Revision`.

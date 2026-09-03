@@ -34,19 +34,80 @@ type Config struct {
 }
 
 func FromEnv() (Config, error) {
+	addr, err := resolveEnv("HELM_ADDR", "ROADMAP_ADDR")
+	if err != nil {
+		return Config{}, err
+	}
+	db, err := resolveEnv("HELM_DB", "ROADMAP_DB")
+	if err != nil {
+		return Config{}, err
+	}
+	authMode, err := resolveEnv("HELM_AUTH_MODE", "ROADMAP_AUTH_MODE")
+	if err != nil {
+		return Config{}, err
+	}
+	publicOrigin, err := resolveEnv("HELM_PUBLIC_ORIGIN", "ROADMAP_PUBLIC_ORIGIN")
+	if err != nil {
+		return Config{}, err
+	}
+	adminEmail, err := resolveEnv("HELM_ADMIN_EMAIL", "ROADMAP_ADMIN_EMAIL")
+	if err != nil {
+		return Config{}, err
+	}
+	releaseSHA, err := resolveEnv("HELM_RELEASE_SHA", "ROADMAP_RELEASE_SHA")
+	if err != nil {
+		return Config{}, err
+	}
+	cloudflareIssuer, err := resolveEnv(
+		"HELM_CLOUDFLARE_ISSUER", "HELM_CF_ACCESS_ISSUER",
+		"ROADMAP_CLOUDFLARE_ISSUER", "ROADMAP_CF_ACCESS_ISSUER",
+	)
+	if err != nil {
+		return Config{}, err
+	}
+	cloudflareAudience, err := resolveEnv(
+		"HELM_CLOUDFLARE_AUDIENCE", "HELM_CLOUDFLARE_AUD",
+		"ROADMAP_CLOUDFLARE_AUDIENCE", "ROADMAP_CLOUDFLARE_AUD",
+	)
+	if err != nil {
+		return Config{}, err
+	}
+	cloudflareAudiences, err := resolveEnv(
+		"HELM_CF_ACCESS_AUDIENCES", "HELM_CLOUDFLARE_AUDIENCES",
+		"ROADMAP_CF_ACCESS_AUDIENCES", "ROADMAP_CLOUDFLARE_AUDIENCES",
+	)
+	if err != nil {
+		return Config{}, err
+	}
+	cloudflareJWKSURL, err := resolveEnv(
+		"HELM_CLOUDFLARE_JWKS_URL", "HELM_CF_ACCESS_JWKS_URL", "HELM_CLOUDFLARE_CERTS_URL",
+		"ROADMAP_CLOUDFLARE_JWKS_URL", "ROADMAP_CF_ACCESS_JWKS_URL", "ROADMAP_CLOUDFLARE_CERTS_URL",
+	)
+	if err != nil {
+		return Config{}, err
+	}
+	secureCookies, err := resolveEnv("HELM_SECURE_COOKIES", "ROADMAP_SECURE_COOKIES")
+	if err != nil {
+		return Config{}, err
+	}
+	demoSeed, err := resolveEnv("HELM_DEMO_SEED", "ROADMAP_DEMO_SEED")
+	if err != nil {
+		return Config{}, err
+	}
+
 	c := Config{
-		Addr:               envOr("ROADMAP_ADDR", ":8080"),
-		DB:                 envOr("ROADMAP_DB", "data/roadmap.db"),
-		AuthMode:           strings.ToLower(envOr("ROADMAP_AUTH_MODE", "local")),
-		PublicOrigin:       strings.TrimRight(strings.TrimSpace(os.Getenv("ROADMAP_PUBLIC_ORIGIN")), "/"),
-		AdminEmail:         strings.TrimSpace(os.Getenv("ROADMAP_ADMIN_EMAIL")),
-		ReleaseSHA:         strings.TrimSpace(os.Getenv("ROADMAP_RELEASE_SHA")),
-		CloudflareIssuer:   envOrAny("ROADMAP_CLOUDFLARE_ISSUER", "ROADMAP_CF_ACCESS_ISSUER"),
-		CloudflareAudience: envOrAny("ROADMAP_CLOUDFLARE_AUDIENCE", "ROADMAP_CLOUDFLARE_AUD"),
-		CloudflareJWKSURL:  envOrAny("ROADMAP_CLOUDFLARE_JWKS_URL", "ROADMAP_CF_ACCESS_JWKS_URL", "ROADMAP_CLOUDFLARE_CERTS_URL"),
+		Addr:               valueOr(addr, ":8080"),
+		DB:                 valueOr(db, "data/roadmap.db"),
+		AuthMode:           strings.ToLower(valueOr(authMode, "local")),
+		PublicOrigin:       strings.TrimRight(publicOrigin.value, "/"),
+		AdminEmail:         adminEmail.value,
+		ReleaseSHA:         releaseSHA.value,
+		CloudflareIssuer:   cloudflareIssuer.value,
+		CloudflareAudience: cloudflareAudience.value,
+		CloudflareJWKSURL:  cloudflareJWKSURL.value,
 		SecureCookies:      true,
 	}
-	if value := envOrAny("ROADMAP_CF_ACCESS_AUDIENCES", "ROADMAP_CLOUDFLARE_AUDIENCES"); value != "" {
+	if value := cloudflareAudiences.value; value != "" {
 		for _, audience := range strings.Split(value, ",") {
 			if audience = strings.TrimSpace(audience); audience != "" {
 				c.CloudflareAudiences = append(c.CloudflareAudiences, audience)
@@ -59,25 +120,25 @@ func FromEnv() (Config, error) {
 	if len(c.CloudflareAudiences) > 0 {
 		c.CloudflareAudience = c.CloudflareAudiences[0]
 	}
-	if value := strings.TrimSpace(os.Getenv("ROADMAP_SECURE_COOKIES")); value != "" {
+	if value := secureCookies.value; value != "" {
 		parsed, err := strconv.ParseBool(value)
 		if err != nil {
-			return Config{}, fmt.Errorf("ROADMAP_SECURE_COOKIES must be true or false: %w", err)
+			return Config{}, fmt.Errorf("HELM_SECURE_COOKIES must be true or false: %w", err)
 		}
 		c.SecureCookies = parsed
 	}
-	if value := strings.TrimSpace(os.Getenv("ROADMAP_DEMO_SEED")); value != "" {
+	if value := demoSeed.value; value != "" {
 		parsed, err := strconv.ParseBool(value)
 		if err != nil {
-			return Config{}, fmt.Errorf("ROADMAP_DEMO_SEED must be true or false: %w", err)
+			return Config{}, fmt.Errorf("HELM_DEMO_SEED must be true or false: %w", err)
 		}
 		c.DemoSeed = parsed
 	}
 	if c.AuthMode != "local" && c.AuthMode != "cloudflare" && c.AuthMode != "disabled" {
-		return Config{}, fmt.Errorf("ROADMAP_AUTH_MODE must be local, cloudflare, or disabled")
+		return Config{}, fmt.Errorf("HELM_AUTH_MODE must be local, cloudflare, or disabled")
 	}
 	if c.ReleaseSHA != "" && !validReleaseSHA(c.ReleaseSHA) {
-		return Config{}, fmt.Errorf("ROADMAP_RELEASE_SHA must be 40 lowercase hexadecimal characters")
+		return Config{}, fmt.Errorf("HELM_RELEASE_SHA must be 40 lowercase hexadecimal characters")
 	}
 	if c.AuthMode == "local" || c.AuthMode == "cloudflare" {
 		origin, err := normalizeOrigin(c.PublicOrigin, c.AuthMode == "cloudflare")
@@ -87,42 +148,42 @@ func FromEnv() (Config, error) {
 		c.PublicOrigin = origin
 	}
 	if c.AuthMode == "disabled" && !loopbackAddr(c.Addr) {
-		return Config{}, fmt.Errorf("ROADMAP_AUTH_MODE=disabled requires ROADMAP_ADDR to bind to loopback")
+		return Config{}, fmt.Errorf("HELM_AUTH_MODE=disabled requires HELM_ADDR to bind to loopback")
 	}
 	if c.AuthMode == "cloudflare" {
 		if !loopbackAddr(c.Addr) {
-			return Config{}, fmt.Errorf("ROADMAP_AUTH_MODE=cloudflare requires ROADMAP_ADDR to bind to loopback")
+			return Config{}, fmt.Errorf("HELM_AUTH_MODE=cloudflare requires HELM_ADDR to bind to loopback")
 		}
 		if !c.SecureCookies {
-			return Config{}, fmt.Errorf("ROADMAP_SECURE_COOKIES must be true in cloudflare mode")
+			return Config{}, fmt.Errorf("HELM_SECURE_COOKIES must be true in cloudflare mode")
 		}
 		if c.DemoSeed {
-			return Config{}, fmt.Errorf("ROADMAP_DEMO_SEED must be false in cloudflare mode")
+			return Config{}, fmt.Errorf("HELM_DEMO_SEED must be false in cloudflare mode")
 		}
 		if !validEmail(c.AdminEmail) {
-			return Config{}, fmt.Errorf("ROADMAP_ADMIN_EMAIL must be a valid email when ROADMAP_AUTH_MODE=cloudflare")
+			return Config{}, fmt.Errorf("HELM_ADMIN_EMAIL must be a valid email when HELM_AUTH_MODE=cloudflare")
 		}
 		if c.CloudflareIssuer == "" {
-			return Config{}, fmt.Errorf("ROADMAP_CLOUDFLARE_ISSUER is required when ROADMAP_AUTH_MODE=cloudflare")
+			return Config{}, fmt.Errorf("HELM_CLOUDFLARE_ISSUER is required when HELM_AUTH_MODE=cloudflare")
 		}
-		if err := validateURL("ROADMAP_CLOUDFLARE_ISSUER", c.CloudflareIssuer, true); err != nil {
+		if err := validateURL("HELM_CLOUDFLARE_ISSUER", c.CloudflareIssuer, true); err != nil {
 			return Config{}, err
 		}
 		if len(c.CloudflareAudiences) < 2 {
-			return Config{}, fmt.Errorf("ROADMAP_CF_ACCESS_AUDIENCES must include the UI and API application audiences")
+			return Config{}, fmt.Errorf("HELM_CF_ACCESS_AUDIENCES must include the UI and API application audiences")
 		}
 		seenAudiences := make(map[string]struct{}, len(c.CloudflareAudiences))
 		for _, audience := range c.CloudflareAudiences {
 			if strings.TrimSpace(audience) == "" || strings.ContainsAny(audience, "\r\n,") {
-				return Config{}, fmt.Errorf("ROADMAP_CF_ACCESS_AUDIENCES contains an invalid audience")
+				return Config{}, fmt.Errorf("HELM_CF_ACCESS_AUDIENCES contains an invalid audience")
 			}
 			if _, exists := seenAudiences[audience]; exists {
-				return Config{}, fmt.Errorf("ROADMAP_CF_ACCESS_AUDIENCES must contain distinct application audiences")
+				return Config{}, fmt.Errorf("HELM_CF_ACCESS_AUDIENCES must contain distinct application audiences")
 			}
 			seenAudiences[audience] = struct{}{}
 		}
 		if c.CloudflareJWKSURL != "" {
-			if err := validateURL("ROADMAP_CLOUDFLARE_JWKS_URL", c.CloudflareJWKSURL, true); err != nil {
+			if err := validateURL("HELM_CLOUDFLARE_JWKS_URL", c.CloudflareJWKSURL, true); err != nil {
 				return Config{}, err
 			}
 		}
@@ -130,18 +191,51 @@ func FromEnv() (Config, error) {
 	return c, nil
 }
 
+type resolvedEnv struct {
+	name  string
+	value string
+}
+
+// resolveEnv reads one canonical environment variable and its compatibility
+// aliases. Empty values are treated as unset, preserving the existing
+// fallback behavior. Every non-empty spelling must agree before a value is
+// accepted; in particular, a legacy value cannot silently override a Helm
+// value (or vice versa).
+func resolveEnv(names ...string) (resolvedEnv, error) {
+	var resolved resolvedEnv
+	for _, name := range names {
+		value := strings.TrimSpace(os.Getenv(name))
+		if value == "" {
+			continue
+		}
+		if resolved.name == "" {
+			resolved = resolvedEnv{name: name, value: value}
+			continue
+		}
+		if value != resolved.value {
+			return resolvedEnv{}, fmt.Errorf("conflicting environment variables %s and %s", resolved.name, name)
+		}
+	}
+	return resolved, nil
+}
+
+func valueOr(value resolvedEnv, fallback string) string {
+	if value.value != "" {
+		return value.value
+	}
+	return fallback
+}
+
 func envOr(name, fallback string) string {
-	if value := strings.TrimSpace(os.Getenv(name)); value != "" {
-		return value
+	if value, err := resolveEnv(name); err == nil && value.value != "" {
+		return value.value
 	}
 	return fallback
 }
 
 func envOrAny(names ...string) string {
-	for _, name := range names {
-		if value := strings.TrimSpace(os.Getenv(name)); value != "" {
-			return value
-		}
+	if value, err := resolveEnv(names...); err == nil {
+		return value.value
 	}
 	return ""
 }
@@ -160,18 +254,18 @@ func validateURL(name, value string, requireHTTPS bool) error {
 func normalizeOrigin(value string, requireHTTPS bool) (string, error) {
 	value = strings.TrimSpace(value)
 	if value == "" {
-		return "", fmt.Errorf("ROADMAP_PUBLIC_ORIGIN is required when ROADMAP_AUTH_MODE is local or cloudflare")
+		return "", fmt.Errorf("HELM_PUBLIC_ORIGIN is required when HELM_AUTH_MODE is local or cloudflare")
 	}
 	parsed, err := url.ParseRequestURI(value)
 	if err != nil || parsed.Host == "" || parsed.User != nil || parsed.RawQuery != "" || parsed.ForceQuery || parsed.Fragment != "" || strings.Contains(value, "#") || (parsed.Path != "" && parsed.Path != "/") || parsed.Scheme != "http" && parsed.Scheme != "https" {
-		return "", fmt.Errorf("ROADMAP_PUBLIC_ORIGIN must be a normalized http(s) origin")
+		return "", fmt.Errorf("HELM_PUBLIC_ORIGIN must be a normalized http(s) origin")
 	}
 	if requireHTTPS && parsed.Scheme != "https" {
-		return "", fmt.Errorf("ROADMAP_PUBLIC_ORIGIN must use https in cloudflare mode")
+		return "", fmt.Errorf("HELM_PUBLIC_ORIGIN must use https in cloudflare mode")
 	}
 	normalized := strings.TrimRight(value, "/")
 	if normalized == "" {
-		return "", fmt.Errorf("ROADMAP_PUBLIC_ORIGIN must be a normalized http(s) origin")
+		return "", fmt.Errorf("HELM_PUBLIC_ORIGIN must be a normalized http(s) origin")
 	}
 	return normalized, nil
 }

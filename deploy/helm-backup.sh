@@ -4,17 +4,31 @@
 set -Eeuo pipefail
 umask 077
 
-STATE_DIR=${ROADMAP_STATE_DIR:-/var/lib/roadmap}
-DATA_DIR=${ROADMAP_DATA_DIR:-$STATE_DIR/data}
-DB_PATH=${ROADMAP_DB_PATH:-$DATA_DIR/roadmap.db}
-BACKUP_DIR=${ROADMAP_BACKUP_DIR:-$STATE_DIR/backups}
-RETENTION=${ROADMAP_BACKUP_RETENTION:-14}
+compat_env() {
+	local canonical=$1 legacy=$2 default_value=${3:-} canonical_value legacy_value
+	canonical_value=${!canonical:-}
+	legacy_value=${!legacy:-}
+	[[ -z "$canonical_value" || -z "$legacy_value" || "$canonical_value" = "$legacy_value" ]] || {
+		printf '[helm-backup] %s and %s must match when both are set\n' "$canonical" "$legacy" >&2
+		exit 1
+	}
+	printf '%s' "${canonical_value:-${legacy_value:-$default_value}}"
+}
+
+STATE_DIR=$(compat_env HELM_STATE_DIR ROADMAP_STATE_DIR /var/lib/roadmap)
+DATA_DIR=$(compat_env HELM_DATA_DIR ROADMAP_DATA_DIR "$STATE_DIR/data")
+DB_PATH=$(compat_env HELM_DB_PATH ROADMAP_DB_PATH "$DATA_DIR/roadmap.db")
+BACKUP_DIR=$(compat_env HELM_BACKUP_DIR ROADMAP_BACKUP_DIR "$STATE_DIR/backups")
+RETENTION=$(compat_env HELM_BACKUP_RETENTION ROADMAP_BACKUP_RETENTION 14)
 RELEASE_SHA=${1:-manual}
-MIGRATION_DIGEST=${ROADMAP_MIGRATION_DIGEST:-}
-MIGRATION_INFO_BINARY=${ROADMAP_MIGRATION_INFO_BINARY:-$STATE_DIR/current/roadmap}
+MIGRATION_DIGEST=$(compat_env HELM_MIGRATION_DIGEST ROADMAP_MIGRATION_DIGEST)
+default_migration_binary="$STATE_DIR/current/helm"
+[[ -x "$default_migration_binary" && ! -L "$default_migration_binary" ]] || default_migration_binary="$STATE_DIR/current/roadmap"
+MIGRATION_INFO_BINARY=$(compat_env HELM_MIGRATION_INFO_BINARY ROADMAP_MIGRATION_INFO_BINARY "$default_migration_binary")
+DEPLOY_LOCK_HELD=$(compat_env HELM_DEPLOY_LOCK_HELD ROADMAP_DEPLOY_LOCK_HELD 0)
 
 fail() {
-	printf '[roadmap-backup] %s\n' "$*" >&2
+	printf '[helm-backup] %s\n' "$*" >&2
 	exit 1
 }
 
@@ -208,7 +222,7 @@ remove_backup_set() {
 # pre-deploy backup. Standalone/manual and timer invocations acquire it here
 # so they cannot race an install, rollback, or restore.
 LOCK_PATH="$STATE_DIR/deploy.lock"
-if [[ ${ROADMAP_DEPLOY_LOCK_HELD:-} != 1 ]]; then
+if [[ "$DEPLOY_LOCK_HELD" != 1 ]]; then
 	if [[ -e "$LOCK_PATH" || -L "$LOCK_PATH" ]]; then
 		[[ -f "$LOCK_PATH" && ! -L "$LOCK_PATH" ]] || fail 'deployment lock is not a regular file'
 		[[ "$(stat -c '%U:%G' -- "$LOCK_PATH")" = root:root ]] || fail 'deployment lock owner is invalid'

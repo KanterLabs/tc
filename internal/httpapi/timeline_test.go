@@ -7,7 +7,7 @@ import (
 	"net/http"
 	"testing"
 
-	"roadmap/internal/store"
+	"github.com/KanterLabs/helm/internal/store"
 )
 
 func TestTaskTimelineHTTPContractAndPagination(t *testing.T) {

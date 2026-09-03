@@ -6,7 +6,7 @@ import (
 	"testing"
 	"time"
 
-	"roadmap/internal/db"
+	"github.com/KanterLabs/helm/internal/db"
 )
 
 func TestResolveTaskReferenceAcceptsOpaqueIDAndCaseInsensitiveKey(t *testing.T) {

@@ -2,14 +2,26 @@
 set -Eeuo pipefail
 
 ROOT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+
+compat_env() {
+	local canonical=$1 legacy=$2 default_value=${3:-} canonical_value legacy_value
+	canonical_value=${!canonical:-}
+	legacy_value=${!legacy:-}
+	[[ -z "$canonical_value" || -z "$legacy_value" || "$canonical_value" = "$legacy_value" ]] || {
+		printf '%s and %s must match when both are set\n' "$canonical" "$legacy" >&2
+		exit 1
+	}
+	printf '%s' "${canonical_value:-${legacy_value:-$default_value}}"
+}
+
 MODE=${1:-}
 TOKEN_OUTPUT=${2:-}
 OWNER_ENV_OUTPUT=${3:-}
-SERVICE_TOKEN_OUTPUT=${4:-${ROADMAP_ACCESS_TOKEN_OUTPUT:-"$ROOT_DIR/dist/roadmap-access-token.env"}}
-REQUIRE_DURABLE_SERVICE_TOKEN_CAPTURE=${ROADMAP_REQUIRE_DURABLE_SERVICE_TOKEN_CAPTURE:-0}
+SERVICE_TOKEN_OUTPUT=${4:-$(compat_env HELM_ACCESS_TOKEN_OUTPUT ROADMAP_ACCESS_TOKEN_OUTPUT "$ROOT_DIR/dist/helm-access-token.env")}
+REQUIRE_DURABLE_SERVICE_TOKEN_CAPTURE=$(compat_env HELM_REQUIRE_DURABLE_SERVICE_TOKEN_CAPTURE ROADMAP_REQUIRE_DURABLE_SERVICE_TOKEN_CAPTURE 0)
 
 [[ "$REQUIRE_DURABLE_SERVICE_TOKEN_CAPTURE" = 0 || "$REQUIRE_DURABLE_SERVICE_TOKEN_CAPTURE" = 1 ]] || {
-	printf 'ROADMAP_REQUIRE_DURABLE_SERVICE_TOKEN_CAPTURE must be 0 or 1\n' >&2
+	printf 'HELM_REQUIRE_DURABLE_SERVICE_TOKEN_CAPTURE must be 0 or 1\n' >&2
 	exit 1
 }
 
@@ -22,7 +34,7 @@ command -v curl >/dev/null 2>&1 || { printf 'curl is required\n' >&2; exit 1; }
 command -v jq >/dev/null 2>&1 || { printf 'jq is required\n' >&2; exit 1; }
 
 CF_API=https://api.cloudflare.com/client/v4
-CF_HEADER_FILE=$(mktemp /tmp/roadmap-cloudflare-header.XXXXXX)
+CF_HEADER_FILE=$(mktemp /tmp/helm-cloudflare-header.XXXXXX)
 CREATED_SERVICE_TOKEN_ID=
 CREATED_SERVICE_TOKEN_OUTPUT=
 
@@ -57,17 +69,21 @@ ACCOUNT_ID=090ae73dce25f4eca9a53ee396fdc916
 ZONE_ID=1206ce4daa0fe3c4791f9df9069764f6
 PUBLIC_HOST=tc.shanekanterman.dev
 PUBLIC_URL=https://tc.shanekanterman.dev
-if [[ "${ROADMAP_PUBLIC_ORIGIN+x}" = x && "$ROADMAP_PUBLIC_ORIGIN" != "$PUBLIC_URL" ]]; then
-	printf 'ROADMAP_PUBLIC_ORIGIN must be exactly %s\n' "$PUBLIC_URL" >&2
+CONFIGURED_PUBLIC_ORIGIN=$(compat_env HELM_PUBLIC_ORIGIN ROADMAP_PUBLIC_ORIGIN)
+if [[ -n "$CONFIGURED_PUBLIC_ORIGIN" && "$CONFIGURED_PUBLIC_ORIGIN" != "$PUBLIC_URL" ]]; then
+	printf 'HELM_PUBLIC_ORIGIN must be exactly %s\n' "$PUBLIC_URL" >&2
 	exit 1
 fi
 API_PATH="$PUBLIC_HOST/api/v1/*"
 TUNNEL_NAME=roadmap-homelab
-UI_APP_NAME='Roadmap owner UI'
-API_APP_NAME='Roadmap agents API'
-OWNER_POLICY_NAME='Roadmap owner only'
-SERVICE_TOKEN_NAME='Roadmap agents'
-SERVICE_POLICY_NAME='Roadmap agents Service Auth'
+UI_APP_NAME='Helm owner UI'
+API_APP_NAME='Helm agents API'
+OWNER_POLICY_NAME='Helm owner only'
+SERVICE_TOKEN_NAME='Helm agents'
+SERVICE_POLICY_NAME='Helm agents Service Auth'
+LEGACY_OWNER_POLICY_NAME='Roadmap owner only'
+LEGACY_SERVICE_TOKEN_NAME='Roadmap agents'
+LEGACY_SERVICE_POLICY_NAME='Roadmap agents Service Auth'
 
 cf_request() {
 	local method=$1 path=$2 body=${3:-} response success
@@ -106,9 +122,9 @@ valid_email() {
 
 owner_email() {
 	local configured members
-	configured=${ROADMAP_ADMIN_EMAIL:-}
+	configured=$(compat_env HELM_ADMIN_EMAIL ROADMAP_ADMIN_EMAIL)
 	if [[ -n "$configured" ]]; then
-		valid_email "$configured" || { printf 'ROADMAP_ADMIN_EMAIL is invalid\n' >&2; return 1; }
+		valid_email "$configured" || { printf 'HELM_ADMIN_EMAIL is invalid\n' >&2; return 1; }
 		printf '%s' "$configured"
 		return 0
 	fi
@@ -120,7 +136,7 @@ owner_email() {
 		return 1
 	fi
 	valid_email "$configured" || {
-		printf 'set ROADMAP_ADMIN_EMAIL or ensure the account has exactly one accepted member\n' >&2
+		printf 'set HELM_ADMIN_EMAIL or ensure the account has exactly one accepted member\n' >&2
 		return 1
 	}
 	printf '%s' "$configured"
@@ -288,7 +304,7 @@ upsert_owner_policy() {
 	if ! policies=$(cf_request GET "/accounts/$ACCOUNT_ID/access/apps/$app_id/policies"); then
 		return 1
 	fi
-	if ! policy_id=$(jq -r --arg name "$OWNER_POLICY_NAME" '[.result[] | select(.name == $name)] | if length == 1 then .[0].id elif length == 0 then empty else error("duplicate owner policies") end' <<<"$policies"); then
+	if ! policy_id=$(jq -r --arg name "$OWNER_POLICY_NAME" --arg legacy "$LEGACY_OWNER_POLICY_NAME" '[.result[] | select(.name == $name or .name == $legacy)] | if length == 1 then .[0].id elif length == 0 then empty else error("duplicate owner policies") end' <<<"$policies"); then
 		printf 'Cloudflare owner-policy response was invalid\n' >&2
 		return 1
 	fi
@@ -313,7 +329,7 @@ upsert_service_policy() {
 	if ! policies=$(cf_request GET "/accounts/$ACCOUNT_ID/access/apps/$app_id/policies"); then
 		return 1
 	fi
-	if ! policy_id=$(jq -r --arg name "$SERVICE_POLICY_NAME" '[.result[] | select(.name == $name)] | if length == 1 then .[0].id elif length == 0 then empty else error("duplicate service policies") end' <<<"$policies"); then
+	if ! policy_id=$(jq -r --arg name "$SERVICE_POLICY_NAME" --arg legacy "$LEGACY_SERVICE_POLICY_NAME" '[.result[] | select(.name == $name or .name == $legacy)] | if length == 1 then .[0].id elif length == 0 then empty else error("duplicate service policies") end' <<<"$policies"); then
 		printf 'Cloudflare service-policy response was invalid\n' >&2
 		return 1
 	fi
@@ -350,11 +366,11 @@ read_service_token_output() {
 }
 
 ensure_service_token() {
-	local tokens count token_id client_id client_secret response body created=0 created_expires_at=
+	local tokens count token_id client_id client_secret response body created=0 created_expires_at= existing_name
 	if ! tokens=$(cf_request GET "/accounts/$ACCOUNT_ID/access/service_tokens?per_page=100"); then
 		return 1
 	fi
-	if ! count=$(jq -r --arg name "$SERVICE_TOKEN_NAME" '[.result[] | select(.name == $name)] | length' <<<"$tokens"); then
+	if ! count=$(jq -r --arg name "$SERVICE_TOKEN_NAME" --arg legacy "$LEGACY_SERVICE_TOKEN_NAME" '[.result[] | select(.name == $name or .name == $legacy)] | length' <<<"$tokens"); then
 		printf 'Cloudflare service-token response was invalid\n' >&2
 		return 1
 	fi
@@ -401,10 +417,20 @@ ensure_service_token() {
 		fi
 	else
 		[[ "$count" = 1 ]] || { printf 'Cloudflare service token name is ambiguous\n' >&2; return 1; }
-		if ! token_id=$(jq -r --arg name "$SERVICE_TOKEN_NAME" '.result[] | select(.name == $name) | .id' <<<"$tokens") || \
-			! client_id=$(jq -r --arg name "$SERVICE_TOKEN_NAME" '.result[] | select(.name == $name) | (.client_id // empty)' <<<"$tokens"); then
+		if ! token_id=$(jq -r --arg name "$SERVICE_TOKEN_NAME" --arg legacy "$LEGACY_SERVICE_TOKEN_NAME" '.result[] | select(.name == $name or .name == $legacy) | .id' <<<"$tokens") || \
+			! client_id=$(jq -r --arg name "$SERVICE_TOKEN_NAME" --arg legacy "$LEGACY_SERVICE_TOKEN_NAME" '.result[] | select(.name == $name or .name == $legacy) | (.client_id // empty)' <<<"$tokens") || \
+			! existing_name=$(jq -r --arg name "$SERVICE_TOKEN_NAME" --arg legacy "$LEGACY_SERVICE_TOKEN_NAME" '.result[] | select(.name == $name or .name == $legacy) | .name' <<<"$tokens"); then
 			printf 'Cloudflare service-token response was invalid\n' >&2
 			return 1
+		fi
+		if [[ "$existing_name" = "$LEGACY_SERVICE_TOKEN_NAME" ]]; then
+			body=$(jq -cn --arg name "$SERVICE_TOKEN_NAME" '{name:$name}') || return 1
+			cf_request PUT "/accounts/$ACCOUNT_ID/access/service_tokens/$token_id" "$body" >/dev/null || return 1
+			tokens=$(cf_request GET "/accounts/$ACCOUNT_ID/access/service_tokens?per_page=100") || return 1
+			jq -e --arg id "$token_id" --arg name "$SERVICE_TOKEN_NAME" '([.result[] | select(.id == $id and .name == $name)] | length) == 1' <<<"$tokens" >/dev/null || {
+				printf 'Cloudflare service token did not converge to the Helm name\n' >&2
+				return 1
+			}
 		fi
 		client_secret=
 	fi
@@ -456,7 +482,7 @@ ensure_service_token() {
 			return 1
 		fi
 		umask 077
-		if ! printf 'CF_ACCESS_CLIENT_ID=%s\nCF_ACCESS_CLIENT_SECRET=%s\nROADMAP_ACCESS_SERVICE_TOKEN_ID=%s\n' "$client_id" "$client_secret" "$token_id" > "$temporary" || \
+		if ! printf 'CF_ACCESS_CLIENT_ID=%s\nCF_ACCESS_CLIENT_SECRET=%s\nHELM_ACCESS_SERVICE_TOKEN_ID=%s\nROADMAP_ACCESS_SERVICE_TOKEN_ID=%s\n' "$client_id" "$client_secret" "$token_id" "$token_id" > "$temporary" || \
 			! chmod 0600 "$temporary" || \
 			! mv -T -- "$temporary" "$SERVICE_TOKEN_OUTPUT"; then
 			rm -f -- "$temporary"
@@ -527,6 +553,9 @@ validate_owner_env() {
 		}
 		case "$line" in
 			''|'#'*) ;;
+			HELM_ADDR=*|HELM_DB=*|HELM_AUTH_MODE=*|HELM_PUBLIC_ORIGIN=*|\
+			HELM_ADMIN_EMAIL=*|HELM_CLOUDFLARE_ISSUER=*|HELM_CF_ACCESS_AUDIENCES=*|\
+			HELM_SECURE_COOKIES=*|HELM_DEMO_SEED=*|\
 			ROADMAP_ADDR=*|ROADMAP_DB=*|ROADMAP_AUTH_MODE=*|ROADMAP_PUBLIC_ORIGIN=*|\
 			ROADMAP_ADMIN_EMAIL=*|ROADMAP_CLOUDFLARE_ISSUER=*|ROADMAP_CF_ACCESS_AUDIENCES=*|\
 			ROADMAP_SECURE_COOKIES=*|ROADMAP_DEMO_SEED=*) ;;
@@ -538,6 +567,15 @@ validate_owner_env() {
 	done < "$path"
 
 	local expected_lines=(
+		'HELM_ADDR=127.0.0.1:8080'
+		'HELM_DB=/var/lib/roadmap/data/roadmap.db'
+		'HELM_AUTH_MODE=cloudflare'
+		'HELM_PUBLIC_ORIGIN=https://tc.shanekanterman.dev'
+		"HELM_ADMIN_EMAIL=$email"
+		"HELM_CLOUDFLARE_ISSUER=$issuer"
+		"HELM_CF_ACCESS_AUDIENCES=$ui_aud,$api_aud"
+		'HELM_SECURE_COOKIES=true'
+		'HELM_DEMO_SEED=false'
 		'ROADMAP_ADDR=127.0.0.1:8080'
 		'ROADMAP_DB=/var/lib/roadmap/data/roadmap.db'
 		'ROADMAP_AUTH_MODE=cloudflare'
@@ -640,7 +678,7 @@ write_prepare_outputs() {
 		printf 'could not secure tunnel-token temporary output\n' >&2
 		return 1
 	fi
-	template="$ROOT_DIR/deploy/roadmap.env.template"
+	template="$ROOT_DIR/deploy/helm.env.template"
 	if [[ ! -f "$template" || -L "$template" ]]; then
 		rm -f -- "$token_tmp" "$owner_tmp"
 		printf 'owner-environment template is missing or not regular\n' >&2

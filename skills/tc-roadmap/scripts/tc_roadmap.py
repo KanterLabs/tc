@@ -23,6 +23,7 @@ import roadmap_session
 
 DEFAULT_BASE_URL = "https://tc.shanekanterman.dev"
 DEFAULT_CONFIG = Path("~/.config/tc-roadmap/credentials.json").expanduser()
+CANONICAL_CONFIG = Path("~/.config/helm/credentials.json").expanduser()
 MAX_RESPONSE_BYTES = 4 * 1024 * 1024
 MAX_TRANSIENT_RETRIES = 2
 MAX_RETRY_DELAY_SECONDS = 5.0
@@ -78,8 +79,17 @@ class Config:
 
 
 def _credential_path() -> Path:
-    configured = os.environ.get("TC_ROADMAP_CONFIG", "").strip()
-    return Path(configured).expanduser() if configured else DEFAULT_CONFIG
+    canonical = os.environ.get("HELM_CONFIG", "").strip()
+    legacy = os.environ.get("TC_ROADMAP_CONFIG", "").strip()
+    if canonical and legacy and Path(canonical).expanduser() != Path(legacy).expanduser():
+        raise RoadmapError("conflicting Helm and legacy credential file settings")
+    if canonical or legacy:
+        return Path(canonical or legacy).expanduser()
+    # A legacy invocation may be the first process after migration; honor a
+    # canonical file when one already exists, otherwise retain the old path.
+    if CANONICAL_CONFIG.exists():
+        return CANONICAL_CONFIG
+    return DEFAULT_CONFIG
 
 
 def _read_config_file(path: Path) -> dict[str, Any]:
@@ -99,15 +109,59 @@ def _read_config_file(path: Path) -> dict[str, Any]:
     return value
 
 
+def _env_alias(environ: dict[str, str] | None, names: tuple[str, ...], label: str) -> str:
+    """Resolve one canonical setting while rejecting conflicting aliases."""
+
+    source = os.environ if environ is None else environ
+    values: list[tuple[str, str]] = []
+    for name in names:
+        raw = str(source.get(name, "")).strip()
+        if raw:
+            if name.endswith("URL"):
+                raw = raw.rstrip("/")
+            values.append((name, raw))
+    distinct = {value for _name, value in values}
+    if len(distinct) > 1:
+        raise RoadmapError(f"conflicting Helm and legacy {label} settings")
+    return values[0][1] if values else ""
+
+
+def _config_value(values: dict[str, Any], names: tuple[str, ...], label: str) -> str:
+    present = []
+    for name in names:
+        value = values.get(name)
+        if isinstance(value, str) and value.strip():
+            present.append((name, value.strip().rstrip("/") if name.endswith("url") else value.strip()))
+    distinct = {value for _name, value in present}
+    if len(distinct) > 1:
+        raise RoadmapError(f"conflicting Helm and legacy {label} settings")
+    return present[0][1] if present else ""
+
+
 def load_config() -> Config:
     values = _read_config_file(_credential_path())
-    base_url = os.environ.get("TC_ROADMAP_URL", str(values.get("base_url", DEFAULT_BASE_URL))).strip().rstrip("/")
-    token = os.environ.get(
-        "TC_ROADMAP_TOKEN",
-        os.environ.get("ROADMAP_TOKEN", str(values.get("token", ""))),
-    ).strip()
-    client_id = os.environ.get("TC_CF_ACCESS_CLIENT_ID", str(values.get("cf_access_client_id", ""))).strip()
-    client_secret = os.environ.get("TC_CF_ACCESS_CLIENT_SECRET", str(values.get("cf_access_client_secret", ""))).strip()
+    configured_url = _env_alias(None, ("HELM_URL", "TC_ROADMAP_URL"), "URL")
+    configured_token = _env_alias(None, ("HELM_TOKEN", "TC_ROADMAP_TOKEN", "ROADMAP_TOKEN"), "token")
+    file_url = _config_value(values, ("helm_url", "base_url", "tc_roadmap_url"), "URL")
+    file_token = _config_value(values, ("helm_token", "token", "tc_roadmap_token", "roadmap_token"), "token")
+    configured_client_id = _env_alias(
+        None, ("HELM_CF_ACCESS_CLIENT_ID", "TC_CF_ACCESS_CLIENT_ID"), "Cloudflare client ID"
+    )
+    configured_client_secret = _env_alias(
+        None, ("HELM_CF_ACCESS_CLIENT_SECRET", "TC_CF_ACCESS_CLIENT_SECRET"), "Cloudflare client secret"
+    )
+    file_client_id = _config_value(
+        values, ("helm_cf_access_client_id", "cf_access_client_id", "tc_cf_access_client_id"), "Cloudflare client ID"
+    )
+    file_client_secret = _config_value(
+        values,
+        ("helm_cf_access_client_secret", "cf_access_client_secret", "tc_cf_access_client_secret"),
+        "Cloudflare client secret",
+    )
+    base_url = (configured_url or file_url or DEFAULT_BASE_URL).strip().rstrip("/")
+    token = (configured_token or file_token).strip()
+    client_id = (configured_client_id or file_client_id).strip()
+    client_secret = (configured_client_secret or file_client_secret).strip()
     parsed = parse.urlsplit(base_url)
     if parsed.scheme not in {"http", "https"} or not parsed.netloc or parsed.username or parsed.password:
         raise RoadmapError("TC Roadmap URL must be an HTTP(S) origin without credentials")

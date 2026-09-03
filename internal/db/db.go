@@ -82,7 +82,7 @@ func Open(ctx context.Context, path string) (*sql.DB, error) {
 	}
 	if path == ":memory:" {
 		// A named shared in-memory database survives across pooled connections.
-		path = "file:roadmap-memory?mode=memory&cache=shared"
+		path = "file:helm-memory?mode=memory&cache=shared"
 	}
 	if !strings.Contains(path, "?") {
 		path += "?"
@@ -490,7 +490,7 @@ func CheckIntegrity(ctx context.Context, database *sql.DB) error {
 // validates only that copy, and removes it before returning. It never opens
 // the supplied path through the writable application setup, so production
 // data cannot be migrated by this operation. The source must be a standalone
-// SQLite file; callers should use roadmap-backup's online backup first when a
+// SQLite file; callers should use helm-backup's online backup first when a
 // live database has a WAL sidecar.
 func Preflight(ctx context.Context, sourcePath string) (SchemaInspection, error) {
 	absolute, err := preflightSourcePath(sourcePath)
@@ -521,7 +521,7 @@ func Preflight(ctx context.Context, sourcePath string) (SchemaInspection, error)
 		}
 	}
 
-	temporary, err := os.CreateTemp(filepath.Dir(absolute), ".roadmap-preflight-*")
+	temporary, err := os.CreateTemp(filepath.Dir(absolute), ".helm-preflight-*")
 	if err != nil {
 		return SchemaInspection{}, fmt.Errorf("create preflight copy: %w", err)
 	}

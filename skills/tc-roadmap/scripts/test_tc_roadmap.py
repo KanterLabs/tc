@@ -18,6 +18,26 @@ import roadmap_session as session
 
 
 class ConfigTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls._config_root = tempfile.TemporaryDirectory(prefix="tc-roadmap-config-tests-")
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        cls._config_root.cleanup()
+
+    def setUp(self) -> None:
+        self._config_defaults = [
+            mock.patch.object(helper, "DEFAULT_CONFIG", Path(self._config_root.name) / "tc-roadmap.json"),
+            mock.patch.object(helper, "CANONICAL_CONFIG", Path(self._config_root.name) / "helm.json"),
+        ]
+        for patcher in self._config_defaults:
+            patcher.start()
+
+    def tearDown(self) -> None:
+        for patcher in self._config_defaults:
+            patcher.stop()
+
     def test_loads_mode_0600_config_without_exposing_values(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             path = Path(raw) / "credentials.json"
@@ -49,8 +69,65 @@ class ConfigTests(unittest.TestCase):
             with self.assertRaisesRegex(helper.RoadmapError, "must use HTTPS"):
                 helper.load_config()
 
+    def test_canonical_environment_is_supported_by_legacy_invocation(self) -> None:
+        with mock.patch.dict(
+            os.environ,
+            {"HELM_URL": "https://helm.example", "HELM_TOKEN": "helm-token"},
+            clear=True,
+        ):
+            config = helper.load_config()
+        self.assertEqual(config.base_url, "https://helm.example")
+        self.assertEqual(config.token, "helm-token")
+
+    def test_conflicting_environment_aliases_fail_closed(self) -> None:
+        with mock.patch.dict(
+            os.environ,
+            {"HELM_TOKEN": "helm-token", "TC_ROADMAP_TOKEN": "legacy-token"},
+            clear=True,
+        ):
+            with self.assertRaisesRegex(helper.RoadmapError, "conflicting"):
+                helper.load_config()
+
+    def test_canonical_cloudflare_aliases_are_supported(self) -> None:
+        with mock.patch.dict(
+            os.environ,
+            {
+                "HELM_URL": "https://helm.example",
+                "HELM_TOKEN": "helm-token",
+                "HELM_CF_ACCESS_CLIENT_ID": "client-id",
+                "HELM_CF_ACCESS_CLIENT_SECRET": "client-secret",
+            },
+            clear=True,
+        ):
+            config = helper.load_config()
+        self.assertEqual(config.cf_access_client_id, "client-id")
+        self.assertEqual(config.cf_access_client_secret, "client-secret")
+
 
 class CommandTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls._state_root = tempfile.TemporaryDirectory(prefix="tc-roadmap-tests-")
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        cls._state_root.cleanup()
+
+    def setUp(self) -> None:
+        self._state_env = mock.patch.dict(
+            os.environ,
+            {
+                "CODEX_HOME": self._state_root.name,
+                "HELM_STATE_DIR": str(Path(self._state_root.name) / "state"),
+                "TC_ROADMAP_STATE_DIR": str(Path(self._state_root.name) / "legacy-state"),
+            },
+            clear=False,
+        )
+        self._state_env.start()
+
+    def tearDown(self) -> None:
+        self._state_env.stop()
+
     def test_idempotency_is_stable_and_action_specific(self) -> None:
         first = helper._idempotency("run-1", "progress", "validated")
         self.assertEqual(first, helper._idempotency("run-1", "progress", "validated"))

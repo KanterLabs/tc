@@ -14,8 +14,8 @@ import (
 	"unicode"
 	"unicode/utf8"
 
-	"roadmap/internal/config"
-	"roadmap/internal/store"
+	"github.com/KanterLabs/helm/internal/config"
+	"github.com/KanterLabs/helm/internal/store"
 )
 
 const sessionCookie = "roadmap_session"

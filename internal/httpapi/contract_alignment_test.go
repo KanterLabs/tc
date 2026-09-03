@@ -8,7 +8,7 @@ import (
 	"testing"
 	"time"
 
-	"roadmap/internal/store"
+	"github.com/KanterLabs/helm/internal/store"
 )
 
 func TestContractRejectsUnknownJSONFieldsAndInvalidPagination(t *testing.T) {

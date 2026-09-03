@@ -9,7 +9,7 @@ import (
 	"testing"
 	"time"
 
-	"roadmap/internal/store"
+	"github.com/KanterLabs/helm/internal/store"
 )
 
 func TestRoadmapScopeRedactsEmbeddedTaskAndEventCollections(t *testing.T) {

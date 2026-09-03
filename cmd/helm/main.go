@@ -13,11 +13,11 @@ import (
 	"syscall"
 	"time"
 
-	"roadmap/internal/auth"
-	"roadmap/internal/config"
-	"roadmap/internal/db"
-	"roadmap/internal/httpapi"
-	"roadmap/internal/store"
+	"github.com/KanterLabs/helm/internal/auth"
+	"github.com/KanterLabs/helm/internal/config"
+	"github.com/KanterLabs/helm/internal/db"
+	"github.com/KanterLabs/helm/internal/httpapi"
+	"github.com/KanterLabs/helm/internal/store"
 )
 
 const (
@@ -101,7 +101,7 @@ func main() {
 	api := httpapi.New(data, manager, cfg)
 	server := &http.Server{Addr: cfg.Addr, Handler: api, ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 15 * time.Second, WriteTimeout: 30 * time.Second, IdleTimeout: 60 * time.Second, MaxHeaderBytes: 64 * 1024}
 	go func() {
-		log.Printf(`{"level":"info","msg":"roadmap listening","addr":%q}`, cfg.Addr)
+		log.Printf(`{"level":"info","msg":"helm listening","addr":%q}`, cfg.Addr)
 		if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			log.Fatalf("server: %v", err)
 		}

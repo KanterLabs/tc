@@ -1,18 +1,29 @@
 #!/usr/bin/env bash
-# Atomically switch the active Roadmap release and recover the previous one if
+# Atomically switch the active Helm-compatible release and recover the previous one if
 # the candidate does not become healthy.
 set -Eeuo pipefail
 
-STATE_DIR=${ROADMAP_STATE_DIR:-/var/lib/roadmap}
+compat_env() {
+	local canonical=$1 legacy=$2 default_value=${3:-} canonical_value legacy_value
+	canonical_value=${!canonical:-}
+	legacy_value=${!legacy:-}
+	[[ -z "$canonical_value" || -z "$legacy_value" || "$canonical_value" = "$legacy_value" ]] || {
+		printf '[helm-rollback] %s and %s must match when both are set\n' "$canonical" "$legacy" >&2
+		exit 1
+	}
+	printf '%s' "${canonical_value:-${legacy_value:-$default_value}}"
+}
+
+STATE_DIR=$(compat_env HELM_STATE_DIR ROADMAP_STATE_DIR /var/lib/roadmap)
 RELEASES_DIR="$STATE_DIR/releases"
 CURRENT_LINK="$STATE_DIR/current"
 LOCK_PATH="$STATE_DIR/deploy.lock"
-CONFIG_DIR=${ROADMAP_CONFIG_DIR:-/etc/roadmap}
+CONFIG_DIR=$(compat_env HELM_CONFIG_DIR ROADMAP_CONFIG_DIR /etc/roadmap)
 SERVICE_STOP_TIMEOUT=30
 SHA=${1:-}
 
 fail() {
-	printf '[roadmap-rollback] %s\n' "$*" >&2
+	printf '[helm-rollback] %s\n' "$*" >&2
 	exit 1
 }
 
@@ -43,12 +54,33 @@ stop_unit() {
 }
 
 release_revision() {
-	local path=$1 count revision
+	local path=$1 helm_count roadmap_count helm_revision roadmap_revision revision
 	[[ -f "$path" && ! -L "$path" ]] || return 1
-	count=$(awk -F= '$1 == "ROADMAP_RELEASE_SHA" { count++ } END { print count + 0 }' "$path") || return 1
-	revision=$(awk -F= '$1 == "ROADMAP_RELEASE_SHA" { print substr($0, index($0, "=") + 1) }' "$path") || return 1
-	[[ "$count" = 1 && "$revision" =~ ^[0-9a-f]{40}$ ]] || return 1
+	helm_count=$(awk -F= '$1 == "HELM_RELEASE_SHA" { count++ } END { print count + 0 }' "$path") || return 1
+	roadmap_count=$(awk -F= '$1 == "ROADMAP_RELEASE_SHA" { count++ } END { print count + 0 }' "$path") || return 1
+	helm_revision=$(awk -F= '$1 == "HELM_RELEASE_SHA" { print substr($0, index($0, "=") + 1) }' "$path") || return 1
+	roadmap_revision=$(awk -F= '$1 == "ROADMAP_RELEASE_SHA" { print substr($0, index($0, "=") + 1) }' "$path") || return 1
+	[[ "$helm_count" -le 1 && "$roadmap_count" -le 1 ]] || return 1
+	[[ "$helm_count" -eq 1 || "$roadmap_count" -eq 1 ]] || return 1
+	if [[ "$helm_count" -eq 1 && "$roadmap_count" -eq 1 ]]; then
+		[[ "$helm_revision" = "$roadmap_revision" ]] || return 1
+	fi
+	revision=${helm_revision:-$roadmap_revision}
+	[[ "$revision" =~ ^[0-9a-f]{40}$ ]] || return 1
 	printf '%s' "$revision"
+}
+
+release_binary_name() {
+	local target=$1
+	if [[ -x "$target/helm" && ! -L "$target/helm" && -f "$target/helm.sha256" && ! -L "$target/helm.sha256" ]]; then
+		printf 'helm'
+		return 0
+	fi
+	if [[ -x "$target/roadmap" && ! -L "$target/roadmap" && -f "$target/roadmap.sha256" && ! -L "$target/roadmap.sha256" ]]; then
+		printf 'roadmap'
+		return 0
+	fi
+	return 1
 }
 
 validate_release_env() {
@@ -66,21 +98,19 @@ install_release_env() {
 }
 
 [[ "$(id -u)" -eq 0 ]] || fail 'must run as root'
-[[ "$SHA" =~ ^[0-9a-f]{40}$ ]] || fail 'usage: roadmap-rollback <40-character git sha>'
+[[ "$SHA" =~ ^[0-9a-f]{40}$ ]] || fail 'usage: helm-rollback <40-character git sha>'
 [[ -d "$STATE_DIR" && ! -L "$STATE_DIR" ]] || fail 'state directory is unavailable'
 [[ "$(stat -c '%U:%G' -- "$STATE_DIR")" = root:root ]] || fail 'state directory owner is invalid'
 [[ "$(stat -c '%a' -- "$STATE_DIR")" = 755 ]] || fail 'state directory mode is invalid'
 [[ -d "$RELEASES_DIR" && ! -L "$RELEASES_DIR" ]] || fail 'release directory is unavailable'
 TARGET="$RELEASES_DIR/$SHA"
-[[ -d "$TARGET" && ! -L "$TARGET" && -x "$TARGET/roadmap" && ! -L "$TARGET/roadmap" ]] \
-	|| fail 'requested release is not retained'
-[[ -f "$TARGET/roadmap.sha256" && ! -L "$TARGET/roadmap.sha256" ]] \
-	|| fail 'requested release has no binary checksum'
+[[ -d "$TARGET" && ! -L "$TARGET" ]] || fail 'requested release is not retained'
+TARGET_BINARY=$(release_binary_name "$TARGET") || fail 'requested release has no verified binary layout'
 [[ -f "$TARGET/roadmap.env" && ! -L "$TARGET/roadmap.env" ]] \
 	|| fail 'requested release has no release environment'
 validate_release_env "$TARGET/roadmap.env" "$SHA" ||
 	fail 'requested release environment revision is invalid'
-(cd "$TARGET" && sha256sum --check --strict roadmap.sha256 >/dev/null) \
+(cd "$TARGET" && sha256sum --check --strict "$TARGET_BINARY.sha256" >/dev/null) \
 	|| fail 'requested release binary checksum failed'
 
 if [[ -e "$LOCK_PATH" || -L "$LOCK_PATH" ]]; then
@@ -103,6 +133,9 @@ previous_sha=
 if [[ -n "$previous_target" ]]; then
 	previous_sha=${previous_target##*/}
 	[[ "$previous_sha" =~ ^[0-9a-f]{40}$ ]] || fail 'current release directory name is invalid'
+	previous_binary=$(release_binary_name "$previous_target") || fail 'current release binary layout is invalid'
+	(cd "$previous_target" && sha256sum --check --strict "$previous_binary.sha256" >/dev/null) ||
+		fail 'current release binary checksum failed'
 	[[ -f "$previous_target/roadmap.env" && ! -L "$previous_target/roadmap.env" ]] ||
 		fail 'current release has no release environment'
 	validate_release_env "$previous_target/roadmap.env" "$previous_sha" ||
@@ -146,20 +179,22 @@ healthy_revision() {
 start_and_verify_previous() {
 	local reason=$1
 	[[ -n "$previous_target" ]] || {
-		printf '[roadmap-rollback] %s; no previous release exists\n' "$reason" >&2
+		printf '[helm-rollback] %s; no previous release exists\n' "$reason" >&2
 		return 1
 	}
 
-	printf '[roadmap-rollback] %s; restoring previous release\n' "$reason" >&2
+	printf '[helm-rollback] %s; restoring previous release\n' "$reason" >&2
 	# Stop both units before switching the link. This makes recovery the same
 	# transaction for application and connector failures, and prevents a
 	# connector from retaining target-release configuration during the switch.
 	stop_unit cloudflared.service || return 1
 	stop_unit roadmap.service || return 1
+	stop_unit helm.service || return 1
 	install_release_env "$previous_target" "$previous_sha" || return 1
 	atomic_switch "$previous_target" || return 1
-	systemctl start roadmap.service || return 1
+	systemctl start helm.service || return 1
 	healthy_revision "$previous_sha" || return 1
+	systemctl is-active --quiet helm.service || return 1
 	systemctl is-active --quiet roadmap.service || return 1
 	systemctl start cloudflared.service || return 1
 	systemctl is-active --quiet cloudflared.service || return 1
@@ -177,7 +212,7 @@ on_exit() {
 	if [[ "$status" -ne 0 && "$recovery_needed" -eq 1 && "$recovery_in_progress" -eq 0 ]]; then
 		recovery_in_progress=1
 		if ! start_and_verify_previous 'deployment failed before completion'; then
-			printf '[roadmap-rollback] previous release recovery failed; inspect systemd and the local health endpoint\n' >&2
+			printf '[helm-rollback] previous release recovery failed; inspect systemd and the local health endpoint\n' >&2
 		fi
 		recovery_in_progress=0
 	fi
@@ -188,12 +223,13 @@ trap on_exit EXIT
 recovery_needed=1
 stop_unit cloudflared.service || fail 'could not stop cloudflared.service and verify it is inactive'
 stop_unit roadmap.service || fail 'could not stop roadmap.service and verify it is inactive'
+stop_unit helm.service || fail 'could not stop helm.service and verify it is inactive'
 install_release_env "$TARGET" "$SHA" || fail 'could not install requested release environment'
 atomic_switch "$TARGET" || fail 'could not switch to requested release'
 
 # Validate the application before starting the connector. Either this health
 # failure or the connector failure below must restore the prior release.
-if ! systemctl start roadmap.service || ! healthy_revision "$SHA" || ! systemctl is-active --quiet roadmap.service; then
+if ! systemctl start helm.service || ! healthy_revision "$SHA" || ! systemctl is-active --quiet helm.service || ! systemctl is-active --quiet roadmap.service; then
 	if start_and_verify_previous 'requested release failed app health'; then
 		recovery_needed=0
 		exit 1

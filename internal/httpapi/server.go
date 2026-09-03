@@ -1,4 +1,4 @@
-// Package httpapi exposes the documented Roadmap HTTP API and the embedded
+// Package httpapi exposes the documented Helm HTTP API and the embedded
 // frontend fallback used when a separate web/dist bundle is unavailable.
 package httpapi
 
@@ -23,10 +23,10 @@ import (
 	"time"
 	"unicode/utf8"
 
-	"roadmap/internal/auth"
-	"roadmap/internal/config"
-	"roadmap/internal/store"
-	"roadmap/internal/webassets"
+	"github.com/KanterLabs/helm/internal/auth"
+	"github.com/KanterLabs/helm/internal/config"
+	"github.com/KanterLabs/helm/internal/store"
+	"github.com/KanterLabs/helm/internal/webassets"
 )
 
 type Server struct {
@@ -51,8 +51,8 @@ type Server struct {
 type contextKey string
 
 const (
-	requestBodyKey      contextKey = "roadmap-request-body"
-	requestIdentityKey  contextKey = "roadmap-request-identity"
+	requestBodyKey      contextKey = "helm-request-body"
+	requestIdentityKey  contextKey = "helm-request-identity"
 	maxRequestBodyBytes            = 2 * 1024 * 1024
 )
 
@@ -442,7 +442,7 @@ func (s *Server) route(w http.ResponseWriter, r *http.Request) {
 			s.writeError(w, http.StatusMethodNotAllowed, "method_not_allowed", "method not allowed", nil)
 			return
 		}
-		response := map[string]any{"name": "roadmap", "version": "v1"}
+		response := map[string]any{"name": "helm", "version": "v1"}
 		if s.Cfg.ReleaseSHA != "" {
 			response["revision"] = s.Cfg.ReleaseSHA
 		}
@@ -672,7 +672,7 @@ func (s *Server) health(w http.ResponseWriter, r *http.Request, ready bool) {
 			return
 		}
 	}
-	response := map[string]any{"status": "ok", "service": "roadmap"}
+	response := map[string]any{"status": "ok", "service": "helm"}
 	if s.Cfg.ReleaseSHA != "" {
 		response["revision"] = s.Cfg.ReleaseSHA
 	}

@@ -22,6 +22,9 @@ class HookInstallerTests(unittest.TestCase):
     def _command(self, home: Path) -> str:
         return f"/usr/bin/python3 {home / 'skills/tc-roadmap/scripts/tc_roadmap_hook.py'}"
 
+    def _canonical_command(self, home: Path) -> str:
+        return f"/usr/bin/python3 {home / 'skills/helm/scripts/helm_hook.py'}"
+
     def test_empty_new_config_adds_every_event_and_mode_0600(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             home, hooks_path = self._paths(raw)
@@ -122,6 +125,23 @@ class HookInstallerTests(unittest.TestCase):
             self.assertFalse(second.mode_changed)
             self.assertEqual(hooks_path.read_bytes(), before)
             self.assertEqual(hooks_path.stat().st_ino, inode)
+
+    def test_existing_legacy_install_transitions_to_canonical_hook(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            home, hooks_path = self._paths(raw)
+            first = install_hooks.install_hooks(hooks_path, home)
+            self.assertTrue(first.changed)
+            canonical_script = home / "skills/helm/scripts/helm_hook.py"
+            canonical_script.parent.mkdir(parents=True)
+            canonical_script.write_text("#!/usr/bin/env python3\n", encoding="utf-8")
+
+            second = install_hooks.install_hooks(hooks_path, home)
+            data = json.loads(hooks_path.read_text(encoding="utf-8"))
+            self.assertTrue(second.changed)
+            for event in install_hooks.HOOK_EVENTS:
+                commands = {hook.get("command") for group in data["hooks"][event] for hook in group["hooks"]}
+                self.assertIn(self._command(home), commands)
+                self.assertIn(self._canonical_command(home), commands)
 
     def test_existing_command_is_deduped_without_mutating_its_metadata(self) -> None:
         with tempfile.TemporaryDirectory() as raw:

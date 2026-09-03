@@ -4,8 +4,8 @@ import (
 	"net/http"
 	"strings"
 
-	"roadmap/internal/auth"
-	"roadmap/internal/store"
+	"github.com/KanterLabs/helm/internal/auth"
+	"github.com/KanterLabs/helm/internal/store"
 )
 
 var taskTimelineKinds = map[string]struct{}{

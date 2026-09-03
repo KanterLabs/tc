@@ -9,8 +9,8 @@ import (
 	"strings"
 	"testing"
 
-	"roadmap/internal/auth"
-	"roadmap/internal/store"
+	"github.com/KanterLabs/helm/internal/auth"
+	"github.com/KanterLabs/helm/internal/store"
 )
 
 func TestAuditHTTPHandlersLifecycleAndReview(t *testing.T) {
@@ -139,7 +139,7 @@ func TestAuditHTTPHandlersRejectBadScopeAndSource(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			req := httptest.NewRequest(http.MethodPost, "/api/v1/audits/"+run.ID+"/findings", strings.NewReader(body))
 			req.Header.Set("Content-Type", "application/json")
-			req.Header.Set("Origin", "http://roadmap.test")
+			req.Header.Set("Origin", "http://helm.test")
 			response := httptest.NewRecorder()
 			server.auditFindings(response, req, identity, run.ID)
 			if response.Code != http.StatusBadRequest {
@@ -229,7 +229,7 @@ func callAuditCollection(t *testing.T, identity auth.Identity, handler func(http
 	req := httptest.NewRequest(method, target, bytes.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
 	if method != http.MethodGet && method != http.MethodHead && method != http.MethodOptions {
-		req.Header.Set("Origin", "http://roadmap.test")
+		req.Header.Set("Origin", "http://helm.test")
 	}
 	for name, value := range headers {
 		req.Header.Set(name, value)
@@ -254,7 +254,7 @@ func callAuditResource(t *testing.T, identity auth.Identity, handler func(http.R
 	req := httptest.NewRequest(method, target, bytes.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
 	if method != http.MethodGet && method != http.MethodHead && method != http.MethodOptions {
-		req.Header.Set("Origin", "http://roadmap.test")
+		req.Header.Set("Origin", "http://helm.test")
 	}
 	for name, value := range headers {
 		req.Header.Set(name, value)

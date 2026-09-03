@@ -2,9 +2,9 @@
   "openapi": "3.1.0",
   "jsonSchemaDialect": "https://json-schema.org/draft/2020-12/schema",
   "info": {
-    "title": "Roadmap API",
+    "title": "Helm API",
     "version": "1.0.0",
-    "description": "Stable JSON API for the Roadmap project board and its built-in internal bug\ntracker. Humans use a session cookie or Cloudflare Access identity; agents\nuse scoped bearer tokens.\nSingle-resource responses contain the resource directly. Collections use\na cursor-paginated object containing data and next_cursor. Collection\ncursors are opaque URL-safe offsets and an empty next_cursor means that\nthere is no next page. Every response includes X-Request-ID; deployments\nthat provide a release revision also include X-Roadmap-Revision.\nCookie- and Cloudflare-authenticated mutations require an Origin that\nexactly matches the configured public origin; bearer-token mutations do\nnot require Origin. Temporary bearer-authentication or request-body\nadmission saturation returns 503 with Retry-After.\n",
+    "description": "Stable JSON API for the Helm project board and its built-in internal bug\ntracker. Humans use a session cookie or Cloudflare Access identity; agents\nuse scoped bearer tokens.\nSingle-resource responses contain the resource directly. Collections use\na cursor-paginated object containing data and next_cursor. Collection\ncursors are opaque URL-safe offsets and an empty next_cursor means that\nthere is no next page. Every response includes X-Request-ID; deployments\nthat provide a release revision also include X-Roadmap-Revision.\nCookie- and Cloudflare-authenticated mutations require an Origin that\nexactly matches the configured public origin; bearer-token mutations do\nnot require Origin. Temporary bearer-authentication or request-body\nadmission saturation returns 503 with Retry-After.\n",
     "license": {
       "name": "MIT",
       "identifier": "MIT"
@@ -13,11 +13,11 @@
   "servers": [
     {
       "url": "/",
-      "description": "Current Roadmap server"
+      "description": "Current Helm server"
     }
   ],
   "externalDocs": {
-    "description": "Roadmap v1 API contract",
+    "description": "Helm v1 API contract",
     "url": "docs/API_CONTRACT.md"
   },
   "security": [
@@ -128,7 +128,7 @@
                 },
                 "example": {
                   "status": "ok",
-                  "service": "roadmap",
+                  "service": "helm",
                   "revision": "0123456789abcdef0123456789abcdef01234567"
                 }
               }
@@ -172,7 +172,7 @@
                 },
                 "example": {
                   "status": "ok",
-                  "service": "roadmap",
+                  "service": "helm",
                   "revision": "0123456789abcdef0123456789abcdef01234567"
                 }
               }
@@ -307,7 +307,7 @@
     "/api/v1": {
       "get": {
         "operationId": "getApiDiscovery",
-        "summary": "Discover the Roadmap API",
+        "summary": "Discover the Helm API",
         "description": "Returns the API name, version, and optional deployed revision.",
         "tags": [
           "Health"
@@ -332,7 +332,7 @@
                   "$ref": "#/components/schemas/ApiDiscovery"
                 },
                 "example": {
-                  "name": "roadmap",
+                  "name": "helm",
                   "version": "v1",
                   "revision": "0123456789abcdef0123456789abcdef01234567"
                 }
@@ -6007,7 +6007,7 @@
           },
           "service": {
             "type": "string",
-            "example": "roadmap"
+            "example": "helm"
           },
           "revision": {
             "type": "string",
@@ -6026,7 +6026,7 @@
         ],
         "properties": {
           "name": {
-            "const": "roadmap"
+            "const": "helm"
           },
           "version": {
             "const": "v1"
@@ -9522,7 +9522,7 @@
             "actual_behavior": "The first event after reconnecting is not returned.",
             "expected_behavior": "Every event after the supplied cursor is returned exactly once.",
             "reproduction_steps": "Reconnect while events are being appended, then poll with the last cursor.",
-            "environment": "Roadmap 1.0 on Debian 12",
+            "environment": "Helm 1.0 on Debian 12",
             "affected_version": "1.0.0"
           },
           "labels": [],
@@ -9769,7 +9769,7 @@
                 "actual_behavior": "The first event after reconnecting is not returned.",
                 "expected_behavior": "Every event after the supplied cursor is returned exactly once.",
                 "reproduction_steps": "Reconnect while events are being appended, then poll with the last cursor.",
-                "environment": "Roadmap 1.0 on Debian 12",
+                "environment": "Helm 1.0 on Debian 12",
                 "affected_version": "1.0.0"
               },
               "labels": [],

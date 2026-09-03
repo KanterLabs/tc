@@ -1,6 +1,17 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
+compat_env() {
+	local canonical=$1 legacy=$2 default_value=${3:-} canonical_value legacy_value
+	canonical_value=${!canonical:-}
+	legacy_value=${!legacy:-}
+	[[ -z "$canonical_value" || -z "$legacy_value" || "$canonical_value" = "$legacy_value" ]] || {
+		printf '%s and %s must match when both are set\n' "$canonical" "$legacy" >&2
+		exit 1
+	}
+	printf '%s' "${canonical_value:-${legacy_value:-$default_value}}"
+}
+
 : "${CLOUDFLARE_API_TOKEN:?CLOUDFLARE_API_TOKEN is required}"
 [[ "$CLOUDFLARE_API_TOKEN" != *$'\n'* && "$CLOUDFLARE_API_TOKEN" != *$'\r'* ]] || {
 	printf 'CLOUDFLARE_API_TOKEN contains a control character\n' >&2
@@ -8,30 +19,30 @@ set -Eeuo pipefail
 }
 CF_ACCESS_CLIENT_ID=${CF_ACCESS_CLIENT_ID:-}
 CF_ACCESS_CLIENT_SECRET=${CF_ACCESS_CLIENT_SECRET:-}
-REQUIRE_SERVICE_AUTH_PROBE=${ROADMAP_REQUIRE_SERVICE_AUTH_PROBE:-0}
+REQUIRE_SERVICE_AUTH_PROBE=$(compat_env HELM_REQUIRE_SERVICE_AUTH_PROBE ROADMAP_REQUIRE_SERVICE_AUTH_PROBE 0)
 [[ "$REQUIRE_SERVICE_AUTH_PROBE" = 0 || "$REQUIRE_SERVICE_AUTH_PROBE" = 1 ]] || {
-	printf 'ROADMAP_REQUIRE_SERVICE_AUTH_PROBE must be 0 or 1\n' >&2
+	printf 'HELM_REQUIRE_SERVICE_AUTH_PROBE must be 0 or 1\n' >&2
 	exit 1
 }
 # A newly-published proxied DNS record can briefly produce resolver/connect
 # errors (or a non-Access response) before the route is live. Keep retries
 # finite and cap the delay so live validation never becomes an unbounded wait.
-ACCESS_PROBE_MAX_ATTEMPTS=${ROADMAP_ACCESS_PROBE_MAX_ATTEMPTS:-6}
-ACCESS_PROBE_INITIAL_DELAY_SECONDS=${ROADMAP_ACCESS_PROBE_INITIAL_DELAY_SECONDS:-1}
+ACCESS_PROBE_MAX_ATTEMPTS=$(compat_env HELM_ACCESS_PROBE_MAX_ATTEMPTS ROADMAP_ACCESS_PROBE_MAX_ATTEMPTS 6)
+ACCESS_PROBE_INITIAL_DELAY_SECONDS=$(compat_env HELM_ACCESS_PROBE_INITIAL_DELAY_SECONDS ROADMAP_ACCESS_PROBE_INITIAL_DELAY_SECONDS 1)
 [[ "$ACCESS_PROBE_MAX_ATTEMPTS" =~ ^[1-9][0-9]*$ ]] || {
-	printf 'ROADMAP_ACCESS_PROBE_MAX_ATTEMPTS must be a positive integer\n' >&2
+	printf 'HELM_ACCESS_PROBE_MAX_ATTEMPTS must be a positive integer\n' >&2
 	exit 1
 }
 (( ACCESS_PROBE_MAX_ATTEMPTS <= 10 )) || {
-	printf 'ROADMAP_ACCESS_PROBE_MAX_ATTEMPTS must not exceed 10\n' >&2
+	printf 'HELM_ACCESS_PROBE_MAX_ATTEMPTS must not exceed 10\n' >&2
 	exit 1
 }
 [[ "$ACCESS_PROBE_INITIAL_DELAY_SECONDS" =~ ^[0-9]+$ ]] || {
-	printf 'ROADMAP_ACCESS_PROBE_INITIAL_DELAY_SECONDS must be a non-negative integer\n' >&2
+	printf 'HELM_ACCESS_PROBE_INITIAL_DELAY_SECONDS must be a non-negative integer\n' >&2
 	exit 1
 }
 (( ACCESS_PROBE_INITIAL_DELAY_SECONDS <= 30 )) || {
-	printf 'ROADMAP_ACCESS_PROBE_INITIAL_DELAY_SECONDS must not exceed 30 seconds\n' >&2
+	printf 'HELM_ACCESS_PROBE_INITIAL_DELAY_SECONDS must not exceed 30 seconds\n' >&2
 	exit 1
 }
 ACCESS_PROBE_MAX_DELAY_SECONDS=30
@@ -50,7 +61,7 @@ command -v curl >/dev/null 2>&1 || { printf 'curl is required\n' >&2; exit 1; }
 command -v jq >/dev/null 2>&1 || { printf 'jq is required\n' >&2; exit 1; }
 
 CF_API=https://api.cloudflare.com/client/v4
-CF_HEADER_FILE=$(mktemp /tmp/roadmap-cloudflare-header.XXXXXX)
+CF_HEADER_FILE=$(mktemp /tmp/helm-cloudflare-header.XXXXXX)
 CF_SERVICE_HEADER_FILE=
 CF_SERVICE_RESPONSE_HEADERS=
 CF_SERVICE_RESPONSE_BODY=
@@ -64,15 +75,17 @@ ACCOUNT_ID=090ae73dce25f4eca9a53ee396fdc916
 ZONE_ID=1206ce4daa0fe3c4791f9df9069764f6
 PUBLIC_HOST=tc.shanekanterman.dev
 PUBLIC_URL=https://tc.shanekanterman.dev
-if [[ "${ROADMAP_PUBLIC_ORIGIN+x}" = x && "$ROADMAP_PUBLIC_ORIGIN" != "$PUBLIC_URL" ]]; then
-	printf 'ROADMAP_PUBLIC_ORIGIN must be exactly %s\n' "$PUBLIC_URL" >&2
+CONFIGURED_PUBLIC_ORIGIN=$(compat_env HELM_PUBLIC_ORIGIN ROADMAP_PUBLIC_ORIGIN)
+if [[ -n "$CONFIGURED_PUBLIC_ORIGIN" && "$CONFIGURED_PUBLIC_ORIGIN" != "$PUBLIC_URL" ]]; then
+	printf 'HELM_PUBLIC_ORIGIN must be exactly %s\n' "$PUBLIC_URL" >&2
 	exit 1
 fi
 TUNNEL_NAME=roadmap-homelab
-UI_APP_NAME='Roadmap owner UI'
-API_APP_NAME='Roadmap agents API'
-OWNER_POLICY_NAME='Roadmap owner only'
-SERVICE_POLICY_NAME='Roadmap agents Service Auth'
+UI_APP_NAME='Helm owner UI'
+API_APP_NAME='Helm agents API'
+OWNER_POLICY_NAME='Helm owner only'
+SERVICE_TOKEN_NAME='Helm agents'
+SERVICE_POLICY_NAME='Helm agents Service Auth'
 
 cf_request() {
 	local method=$1 path=$2 response
@@ -90,20 +103,26 @@ valid_email() {
 }
 
 owner_email() {
-	local configured members
-	configured=${ROADMAP_ADMIN_EMAIL:-}
+	local configured members helm_email roadmap_email
+	configured=$(compat_env HELM_ADMIN_EMAIL ROADMAP_ADMIN_EMAIL)
 	if [[ -z "$configured" && -f dist/owner.env && ! -L dist/owner.env ]]; then
-		configured=$(awk -F= '$1 == "ROADMAP_ADMIN_EMAIL" { print substr($0, index($0, "=") + 1) }' dist/owner.env)
+		helm_email=$(awk -F= '$1 == "HELM_ADMIN_EMAIL" { print substr($0, index($0, "=") + 1) }' dist/owner.env)
+		roadmap_email=$(awk -F= '$1 == "ROADMAP_ADMIN_EMAIL" { print substr($0, index($0, "=") + 1) }' dist/owner.env)
+		[[ -z "$helm_email" || -z "$roadmap_email" || "$helm_email" = "$roadmap_email" ]] || {
+			printf 'owner environment contains conflicting Helm and Roadmap email aliases\n' >&2
+			return 1
+		}
+		configured=${helm_email:-$roadmap_email}
 	fi
 	if [[ -n "$configured" ]]; then
-		valid_email "$configured" || { printf 'Roadmap owner email is invalid\n' >&2; return 1; }
+		valid_email "$configured" || { printf 'Helm owner email is invalid\n' >&2; return 1; }
 		printf '%s' "$configured"
 		return 0
 	fi
 	members=$(cf_request GET "/accounts/$ACCOUNT_ID/members")
 	configured=$(jq -r '[.result[] | select(.status == "accepted") | .user.email] | if length == 1 then .[0] else empty end' <<<"$members")
 	valid_email "$configured" || {
-		printf 'could not determine the single accepted Roadmap owner email\n' >&2
+		printf 'could not determine the single accepted Helm owner email\n' >&2
 		return 1
 	}
 	printf '%s' "$configured"
@@ -233,15 +252,15 @@ service_auth_probe() {
 		printf 'service_auth_probe=skipped\n'
 		return 0
 	}
-	CF_SERVICE_HEADER_FILE=$(mktemp /tmp/roadmap-cloudflare-service-header.XXXXXX)
-	CF_SERVICE_RESPONSE_HEADERS=$(mktemp /tmp/roadmap-cloudflare-service-response-headers.XXXXXX)
-	CF_SERVICE_RESPONSE_BODY=$(mktemp /tmp/roadmap-cloudflare-service-response-body.XXXXXX)
+	CF_SERVICE_HEADER_FILE=$(mktemp /tmp/helm-cloudflare-service-header.XXXXXX)
+	CF_SERVICE_RESPONSE_HEADERS=$(mktemp /tmp/helm-cloudflare-service-response-headers.XXXXXX)
+	CF_SERVICE_RESPONSE_BODY=$(mktemp /tmp/helm-cloudflare-service-response-body.XXXXXX)
 	chmod 0600 "$CF_SERVICE_HEADER_FILE" "$CF_SERVICE_RESPONSE_HEADERS" "$CF_SERVICE_RESPONSE_BODY"
 	# Keep the one-time service credentials in a mode-0600 curl config file. The
 	# values never appear in argv, logs, or the response diagnostics below.
 	printf 'CF-Access-Client-Id: %s\nCF-Access-Client-Secret: %s\n' \
 		"$CF_ACCESS_CLIENT_ID" "$CF_ACCESS_CLIENT_SECRET" > "$CF_SERVICE_HEADER_FILE"
-	local status content_type request_id expected_request_id=roadmap-service-auth-probe
+	local status content_type request_id expected_request_id=helm-service-auth-probe
 	local curl_status attempt delay=$ACCESS_PROBE_INITIAL_DELAY_SECONDS failure_reason='unknown failure'
 	for ((attempt = 1; attempt <= ACCESS_PROBE_MAX_ATTEMPTS; attempt++)); do
 		: > "$CF_SERVICE_RESPONSE_HEADERS"
@@ -263,17 +282,17 @@ service_auth_probe() {
 			content_type=$(awk 'tolower($0) ~ /^content-type:/ { sub(/^[^:]*:[[:space:]]*/, ""); sub(/\r$/, ""); print; exit }' "$CF_SERVICE_RESPONSE_HEADERS")
 			request_id=$(awk 'tolower($0) ~ /^x-request-id:/ { sub(/^[^:]*:[[:space:]]*/, ""); sub(/\r$/, ""); print; exit }' "$CF_SERVICE_RESPONSE_HEADERS")
 			if [[ "$status" != 401 ]]; then
-				failure_reason="expected Roadmap HTTP 401, got $status"
+				failure_reason="expected Helm HTTP 401, got $status"
 			elif [[ "$content_type" != application/json* ]]; then
 				failure_reason='response was not JSON'
 			elif [[ "$request_id" != "$expected_request_id" ]]; then
-				failure_reason='response did not preserve the Roadmap X-Request-ID'
+				failure_reason='response did not preserve the Helm X-Request-ID'
 			elif jq -e '(.error.code == "unauthorized") and (.error.message | type == "string")' \
 				"$CF_SERVICE_RESPONSE_BODY" >/dev/null; then
 				printf 'service_auth_probe=ok\n'
 				return 0
 			else
-				failure_reason='response was not Roadmap JSON unauthorized'
+				failure_reason='response was not Helm JSON unauthorized'
 			fi
 		fi
 
@@ -295,7 +314,7 @@ service_auth_probe() {
 apps=$(cf_request GET "/accounts/$ACCOUNT_ID/access/apps?per_page=100")
 ui_id=$(jq -r --arg domain "$PUBLIC_HOST" '[.result[] | select(.domain == $domain)] | if length == 1 then .[0].id else empty end' <<<"$apps")
 api_id=$(jq -r --arg domain "$PUBLIC_HOST/api/v1/*" '[.result[] | select(.domain == $domain)] | if length == 1 then .[0].id else empty end' <<<"$apps")
-[[ -n "$ui_id" && -n "$api_id" ]] || { printf 'both Roadmap Access applications are required\n' >&2; exit 1; }
+[[ -n "$ui_id" && -n "$api_id" ]] || { printf 'both Helm Access applications are required\n' >&2; exit 1; }
 idp=$(identity_provider_id)
 team=$(access_team_name)
 ui_aud=$(validate_access_app "$ui_id" "$UI_APP_NAME" "$PUBLIC_HOST" "$idp" false)
@@ -304,16 +323,16 @@ api_aud=$(validate_access_app "$api_id" "$API_APP_NAME" "$PUBLIC_HOST/api/v1/*" 
 owner=$(owner_email)
 
 service_tokens=$(cf_request GET "/accounts/$ACCOUNT_ID/access/service_tokens?per_page=100")
-service_token_id=$(jq -r --arg name "Roadmap agents" '[.result[] | select(.name == $name)] | if length == 1 then .[0].id else empty end' <<<"$service_tokens")
+service_token_id=$(jq -r --arg name "$SERVICE_TOKEN_NAME" '[.result[] | select(.name == $name)] | if length == 1 then .[0].id else empty end' <<<"$service_tokens")
 service_token_expiry=$(jq -r --arg id "$service_token_id" '.result[] | select(.id == $id) | (.expires_at // .expiration_time // empty)' <<<"$service_tokens")
 [[ -n "$service_token_id" && "$service_token_expiry" != null && -n "$service_token_expiry" ]] || {
-	printf 'Roadmap service token is missing or ambiguous\n' >&2
+	printf 'Helm service token is missing or ambiguous\n' >&2
 	exit 1
 }
-expiry_epoch=$(date -u -d "$service_token_expiry" +%s 2>/dev/null) || { printf 'Roadmap service token expiry is invalid\n' >&2; exit 1; }
+expiry_epoch=$(date -u -d "$service_token_expiry" +%s 2>/dev/null) || { printf 'Helm service token expiry is invalid\n' >&2; exit 1; }
 now_epoch=$(date -u +%s)
 (( expiry_epoch > now_epoch && expiry_epoch <= now_epoch + 366*24*60*60 )) || {
-	printf 'Roadmap service token is expired or exceeds the one-year limit\n' >&2
+	printf 'Helm service token is expired or exceeds the one-year limit\n' >&2
 	exit 1
 }
 
@@ -332,8 +351,8 @@ jq -e --arg owner_name "$OWNER_POLICY_NAME" --arg service_name "$SERVICE_POLICY_
 tunnel=$(cf_request GET "/accounts/$ACCOUNT_ID/cfd_tunnel?is_deleted=false&per_page=100")
 tunnel_id=$(jq -r --arg name "$TUNNEL_NAME" '[.result[] | select(.name == $name)] | if length == 1 then .[0].id // empty else empty end' <<<"$tunnel")
 tunnel_status=$(jq -r --arg name "$TUNNEL_NAME" '[.result[] | select(.name == $name)] | if length == 1 then .[0].status // empty else empty end' <<<"$tunnel")
-[[ -n "$tunnel_id" && -n "$tunnel_status" ]] || { printf 'Roadmap tunnel is missing or ambiguous\n' >&2; exit 1; }
-[[ "$tunnel_status" = healthy ]] || { printf 'expected healthy Roadmap tunnel, got %s\n' "$tunnel_status" >&2; exit 1; }
+[[ -n "$tunnel_id" && -n "$tunnel_status" ]] || { printf 'Helm tunnel is missing or ambiguous\n' >&2; exit 1; }
+[[ "$tunnel_status" = healthy ]] || { printf 'expected healthy Helm tunnel, got %s\n' "$tunnel_status" >&2; exit 1; }
 
 tunnel_config=$(cf_request GET "/accounts/$ACCOUNT_ID/cfd_tunnel/$tunnel_id/configurations")
 jq -e --arg host "$PUBLIC_HOST" --arg team "$team" --arg ui "$ui_aud" --arg api "$api_aud" \
@@ -351,7 +370,7 @@ jq -e --arg host "$PUBLIC_HOST" --arg team "$team" --arg ui "$ui_aud" --arg api 
 	 ((($ingress[0].originRequest.access.audTag // []) | sort) == ([$ui, $api] | sort)) and
 	 (($ingress[1] | keys | sort) == ["service"]) and
 	 ($ingress[1].service == "http_status:404")' <<<"$tunnel_config" >/dev/null \
-	|| { printf 'Roadmap tunnel configuration is not exactly the reviewed ingress set\n' >&2; exit 1; }
+	|| { printf 'Helm tunnel configuration is not exactly the reviewed ingress set\n' >&2; exit 1; }
 
 dns=$(cf_request GET "/zones/$ZONE_ID/dns_records?name=$PUBLIC_HOST")
 jq -e --arg host "$PUBLIC_HOST" --arg target "$tunnel_id.cfargotunnel.com" \
@@ -360,7 +379,7 @@ jq -e --arg host "$PUBLIC_HOST" --arg target "$tunnel_id.cfargotunnel.com" \
 	 (.result[0].type == "CNAME") and
 	 (.result[0].content == $target) and
 	 (.result[0].proxied == true)' <<<"$dns" >/dev/null \
-	|| { printf 'Roadmap DNS record is not exactly the reviewed proxied tunnel CNAME\n' >&2; exit 1; }
+	|| { printf 'Helm DNS record is not exactly the reviewed proxied tunnel CNAME\n' >&2; exit 1; }
 
 # Health and OpenAPI deliberately remain behind Access. This check must fail
 # if somebody adds a public bypass to either endpoint.

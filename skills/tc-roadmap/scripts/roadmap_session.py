@@ -25,6 +25,8 @@ from typing import Any, Callable, Iterator, Mapping
 SCHEMA_VERSION = 1
 STATE_DIR_ENV = "TC_ROADMAP_STATE_DIR"
 ALT_STATE_DIR_ENV = "TC_ROADMAP_HOOK_STATE_DIR"
+CANONICAL_STATE_DIR_ENV = "HELM_STATE_DIR"
+CANONICAL_ALT_STATE_DIR_ENV = "HELM_HOOK_STATE_DIR"
 MAX_STATE_BYTES = 64 * 1024
 MAX_TEXT_LENGTH = 256
 MAX_OPERATION_ID_LENGTH = 128
@@ -230,7 +232,12 @@ def session_key(identifier: str) -> str:
 
 def default_state_dir(environ: Mapping[str, str] | None = None) -> Path:
     environ = os.environ if environ is None else environ
-    configured = str(environ.get(STATE_DIR_ENV, "")).strip() or str(environ.get(ALT_STATE_DIR_ENV, "")).strip()
+    configured = (
+        str(environ.get(STATE_DIR_ENV, "")).strip()
+        or str(environ.get(ALT_STATE_DIR_ENV, "")).strip()
+        or str(environ.get(CANONICAL_STATE_DIR_ENV, "")).strip()
+        or str(environ.get(CANONICAL_ALT_STATE_DIR_ENV, "")).strip()
+    )
     if configured:
         return Path(configured).expanduser()
     codex_home = str(environ.get("CODEX_HOME", "")).strip()

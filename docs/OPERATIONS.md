@@ -1,6 +1,6 @@
-# Roadmap operations
+# Helm operations
 
-Roadmap is an agent-first project board. The production path is intentionally
+Helm is an agent-first project board. The production path is intentionally
 narrow:
 
 ```text
@@ -8,7 +8,7 @@ Cloudflare Access (owner UI or agent service token)
   -> tc.shanekanterman.dev /api/v1/*
   -> roadmap-homelab Tunnel
   -> cloudflared (LXC loopback)
-  -> roadmap.service at 127.0.0.1:8080
+  -> helm.service at 127.0.0.1:8080
   -> /var/lib/roadmap/data/roadmap.db
 ```
 
@@ -20,7 +20,7 @@ connector use loopback while cloudflared makes the outbound tunnel connection.
 
 ## Local development and image checks
 
-The Compose file runs exactly one unprivileged Roadmap container. It publishes
+The Compose file runs exactly one unprivileged Helm container. It publishes
 only `127.0.0.1:8080`, mounts a persistent `/data` volume, drops all Linux
 capabilities, uses a read-only root filesystem, and has a `/healthz`
 healthcheck.
@@ -36,8 +36,8 @@ docker compose down
 ```
 
 The local defaults use local authentication and demo seed data. Never use
-`ROADMAP_AUTH_MODE=disabled` outside a disposable development environment.
-Production uses the immutable `dist/roadmap` binary from a release bundle;
+`HELM_AUTH_MODE=disabled` outside a disposable development environment.
+Production uses the immutable `dist/helm` binary from a release bundle;
 the Compose image is also built in CI as the container packaging check and is
 available for self-hosting.
 
@@ -47,18 +47,18 @@ Create a deploy-only key that is unrelated to the operator's login key, then
 install its public half on the Proxmox host from a trusted shell:
 
 ```sh
-ssh-keygen -t ed25519 -C roadmap-deploy -f ./roadmap-deploy-key
-openssl genpkey -algorithm ED25519 -out ./roadmap-release-signing-private.pem
-openssl pkey -in ./roadmap-release-signing-private.pem -pubout \
-  -out ./roadmap-release-signing-public.pem
-chmod 0600 ./roadmap-release-signing-private.pem
-cp .tc-deploy.env.example .tc-deploy.env
-./deploy/bootstrap-proxmox.sh ./roadmap-deploy-key.pub \
-  ./roadmap-release-signing-public.pem
+ssh-keygen -t ed25519 -C roadmap-deploy -f ./helm-deploy-key
+openssl genpkey -algorithm ED25519 -out ./helm-release-signing-private.pem
+openssl pkey -in ./helm-release-signing-private.pem -pubout \
+  -out ./helm-release-signing-public.pem
+chmod 0600 ./helm-release-signing-private.pem
+cp .helm-deploy.env.example .helm-deploy.env
+./deploy/bootstrap-proxmox.sh ./helm-deploy-key.pub \
+  ./helm-release-signing-public.pem
 ```
 
 The installer creates `roadmap-deploy` with one forced SSH command that runs
-only `sudo -n /usr/local/sbin/roadmap-deploy-gateway`, with no agent, X11,
+only `sudo -n /usr/local/sbin/helm-deploy-gateway`, with no agent, X11,
 port, PTY, or user-rc forwarding. Its only sudo rule permits that exact
 root-owned command (and preserves only the SSH original-command variables).
 The gateway accepts only a deployment, rollback, or status request with a
@@ -115,9 +115,9 @@ these resources:
   policy);
 * an exact-owner Allow policy on each application using the restricted
   Cloudflare identity provider;
-* a `Roadmap agents` service token (with a future expiry no longer than one
+* a `Helm agents` service token (with a future expiry no longer than one
   year) and a
-  `Roadmap agents Service Auth` (`non_identity`) policy on the API application;
+  `Helm agents Service Auth` (`non_identity`) policy on the API application;
 * the remote-managed `roadmap-homelab` tunnel, with both application audience
   tags in `originRequest.access.audTag` and `required: true`.
 
@@ -128,19 +128,19 @@ export CLOUDFLARE_API_TOKEN='provided by the approved secret manager'
 ./deploy/cloudflare.sh prepare \
   dist/cloudflared.token \
   dist/owner.env \
-  dist/roadmap-access-token.env
+  dist/helm-access-token.env
 ```
 
 The first bootstrap must be run from a trusted, persistent operator shell
 before enabling the GitHub workflow. The service-token secret is returned only
 once; a mode-0600 file on an ephemeral CI runner is not a durable capture.
-Copy `dist/roadmap-access-token.env` into the approved secret manager (or an
+Copy `dist/helm-access-token.env` into the approved secret manager (or an
 equivalent encrypted operator vault) immediately after this first run, and
 verify that the working-tree path is ignored. Later CI runs find the existing
-`Roadmap agents` token and reconcile its policy without needing to read its
+`Helm agents` token and reconcile its policy without needing to read its
 one-time secret again.
 
-CI sets `ROADMAP_REQUIRE_DURABLE_SERVICE_TOKEN_CAPTURE=1`, so it refuses to
+CI sets `HELM_REQUIRE_DURABLE_SERVICE_TOKEN_CAPTURE=1`, so it refuses to
 create this token when the one-time secret would be written only to the runner.
 Manual `prepare` leaves this guard disabled and remains the supported way to
 perform the first bootstrap.
@@ -161,14 +161,14 @@ Subsequent runs find the existing named token and do not require its secret;
 if the local output is present, its client ID is checked against Cloudflare.
 Do not print, upload, or commit either secret.
 
-The generated `dist/owner.env` pins Roadmap's Cloudflare mode to the Access
-team issuer and both application audience tags (`ROADMAP_CF_ACCESS_AUDIENCES`):
-the owner UI application and the `/api/v1/*` application. Roadmap validates
+The generated `dist/owner.env` pins Helm's Cloudflare mode to the Access
+team issuer and both application audience tags (`HELM_CF_ACCESS_AUDIENCES`):
+the owner UI application and the `/api/v1/*` application. Helm validates
 the RS256 `Cf-Access-Jwt-Assertion` against the team's `/cdn-cgi/access/certs`
 endpoint and does not authorize from ordinary identity headers.
 
 `prepare` never removes an existing one-time-PIN provider. Such providers may
-remain in the account for other applications, but Roadmap's applications are
+remain in the account for other applications, but Helm's applications are
 bound only to the restricted Cloudflare provider. A missing provider is
 created with the exact API shape above; duplicate or nonconforming Cloudflare
 providers stop the bootstrap instead of being guessed at or silently changed.
@@ -188,7 +188,7 @@ configured service-auth 401 for the API path). In CI, the validator also sends
 `CF_ACCESS_CLIENT_ID` and `CF_ACCESS_CLIENT_SECRET` to `/api/v1/roadmap`
 without an application bearer token and requires the origin's JSON
 `unauthorized` response with the echoed `X-Request-ID`; this distinguishes the
-Roadmap service from an Access edge error. A local health check through the
+Helm service from an Access edge error. A local health check through the
 LXC loopback is part of every install and rollback.
 
 ### Service-token rotation
@@ -263,14 +263,14 @@ touching its source database, run the explicit command against a verified
 standalone backup:
 
 ```sh
-/var/lib/roadmap/current/roadmap schema-preflight \
+/var/lib/roadmap/current/helm schema-preflight \
   /var/lib/roadmap/backups/roadmap-<timestamp>-<sha-or-manual>.db
 ```
 
 `migration-preflight` is an equivalent command name. Both copy the supplied
 file into a mode-0600 temporary sibling, run migrations and integrity checks on
 that copy, report the final schema version/digest, and remove the copy. They
-reject a live WAL source; use `roadmap-backup` for an online database. The
+reject a live WAL source; use `helm-backup` for an online database. The
 one-shot `migration-info` command reports only the embedded version and digest.
 During the rollback window, the new backup helper may be paired with an older
 retained binary that has no `migration-info`; it reuses the newest complete
@@ -283,7 +283,7 @@ To make an explicit backup (for example before an operator migration):
 ssh roadmap-deploy@10.0.0.20 \
   'status'
 # Run from a PVE console or approved pct wrapper:
-pct exec 103 -- /usr/local/sbin/roadmap-backup manual
+pct exec 103 -- /usr/local/sbin/helm-backup manual
 ```
 
 To roll back to a retained release from CI or an approved operator shell:
@@ -294,7 +294,7 @@ To roll back to a retained release from CI or an approved operator shell:
 
 The workflow also exposes this as a `workflow_dispatch` `rollback_sha` input.
 Rollback validates that the release is retained, uses the same atomic link
-switch, and health-checks both Roadmap and cloudflared. An application-health
+switch, and health-checks both Helm and cloudflared. An application-health
 or connector start/active failure restores the release that was active before
 the request, restarts and verifies both prior services, and returns failure so
 the requested rollback is never reported as successful. If that recovery also
@@ -305,7 +305,7 @@ For a manual database restore, use only the root-owned helper with one
 explicit retained backup path:
 
 ```sh
-pct exec 103 -- /usr/local/sbin/roadmap-restore \
+pct exec 103 -- /usr/local/sbin/helm-restore \
   /var/lib/roadmap/backups/roadmap-20260827T120000Z-<sha-or-manual>.db
 ```
 
@@ -331,7 +331,7 @@ Useful read-only checks from the PVE host are:
 
 ```sh
 pct status 103
-pct exec 103 -- systemctl is-active roadmap.service cloudflared.service
+pct exec 103 -- systemctl is-active helm.service roadmap.service cloudflared.service
 pct exec 103 -- ss -ltn
 pct exec 103 -- curl --fail http://127.0.0.1:8080/healthz
 pct exec 103 -- nft list ruleset

@@ -1,4 +1,4 @@
-APP := roadmap
+APP := helm
 ROOT_DIR := $(abspath $(dir $(lastword $(MAKEFILE_LIST))))
 WEB_DIR := $(ROOT_DIR)/web
 DIST_DIR := $(ROOT_DIR)/dist
@@ -39,6 +39,7 @@ frontend:
 	cd $(WEB_DIR) && $(NPM) run check
 	cd $(WEB_DIR) && $(NPM) test
 	cd $(WEB_DIR) && $(NPM) run build
+	rm -rf $(FRONTEND_DIST) $(FRONTEND_COMPAT_DIST)
 	install -d $(FRONTEND_DIST)
 	cp -a $(WEB_DIR)/dist/. $(FRONTEND_DIST)/
 	install -d $(FRONTEND_COMPAT_DIST)
@@ -57,7 +58,7 @@ vet:
 lint:
 	@test -z "$$(gofmt -l cmd internal)" || { echo 'gofmt required' >&2; exit 1; }
 	@cd $(WEB_DIR) && $(NPM) run openapi:check
-	@bash -n deploy/*.sh deploy/roadmap-deploy-gateway
+	@bash -n deploy/*.sh deploy/helm-deploy-gateway
 	@./deploy/test-deployment-security.sh
 
 docker-build:

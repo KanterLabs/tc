@@ -21,9 +21,9 @@ import (
 	"testing"
 	"time"
 
-	"roadmap/internal/config"
-	"roadmap/internal/db"
-	"roadmap/internal/store"
+	"github.com/KanterLabs/helm/internal/config"
+	"github.com/KanterLabs/helm/internal/db"
+	"github.com/KanterLabs/helm/internal/store"
 )
 
 type testSigningKey struct {

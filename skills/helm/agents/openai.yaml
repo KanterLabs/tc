@@ -1,0 +1,7 @@
+interface:
+  display_name: "Helm"
+  short_description: "Track agent work, progress, and goals in Helm"
+  default_prompt: "Use $helm to track this work and keep its progress current."
+
+policy:
+  allow_implicit_invocation: true

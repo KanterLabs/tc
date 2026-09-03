@@ -155,7 +155,7 @@ export function collectionFrom<T>(payload: Collection<T> | T[]): Collection<T> {
 
 function key(): string {
   if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') return crypto.randomUUID();
-  return `roadmap-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+  return `helm-${Date.now()}-${Math.random().toString(36).slice(2)}`;
 }
 
 async function collectPages<T>(load: (cursor?: string) => Promise<Collection<T>>, startCursor?: string): Promise<Collection<T>> {

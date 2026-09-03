@@ -24,7 +24,7 @@ COPY --from=frontend /src/web/dist ./internal/webassets/dist
 # asset loader imports internal/webassets; older build tooling expects the
 # internal/frontend path, and having both prevents a stale embedded UI.
 COPY --from=frontend /src/web/dist ./internal/frontend/dist
-RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/roadmap ./cmd/roadmap \
+RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/helm ./cmd/helm \
     && install -d -m 0750 -o 65532 -g 65532 /out/data
 
 # Keep the runtime small and unprivileged. The static binary and Go-native
@@ -34,22 +34,22 @@ RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/roadmap ./cmd/road
 FROM scratch
 
 COPY --from=build /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
-COPY --from=build --chown=65532:65532 /out/roadmap /usr/local/bin/roadmap
+COPY --from=build --chown=65532:65532 /out/helm /usr/local/bin/helm
 COPY --from=build --chown=65532:65532 /out/data /data
 
 WORKDIR /data
 VOLUME ["/data"]
 EXPOSE 8080
-ENV ROADMAP_ADDR=0.0.0.0:8080 \
-    ROADMAP_DB=/data/roadmap.db \
-    ROADMAP_PUBLIC_ORIGIN=http://localhost:8080 \
-    ROADMAP_ADMIN_EMAIL= \
-    ROADMAP_SECURE_COOKIES=true \
-    ROADMAP_DEMO_SEED=false \
+ENV HELM_ADDR=0.0.0.0:8080 \
+    HELM_DB=/data/roadmap.db \
+    HELM_PUBLIC_ORIGIN=http://localhost:8080 \
+    HELM_ADMIN_EMAIL= \
+    HELM_SECURE_COOKIES=true \
+    HELM_DEMO_SEED=false \
     SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt
 USER 65532:65532
 
 HEALTHCHECK --interval=30s --timeout=3s --start-period=10s --retries=5 \
-    CMD ["/usr/local/bin/roadmap", "healthcheck"]
+    CMD ["/usr/local/bin/helm", "healthcheck"]
 
-ENTRYPOINT ["/usr/local/bin/roadmap"]
+ENTRYPOINT ["/usr/local/bin/helm"]

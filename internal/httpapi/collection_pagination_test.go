@@ -8,7 +8,7 @@ import (
 	"reflect"
 	"testing"
 
-	"roadmap/internal/store"
+	"github.com/KanterLabs/helm/internal/store"
 )
 
 func TestProjectCollectionPaginationHasNoGaps(t *testing.T) {

@@ -9,8 +9,8 @@ import (
 	"testing"
 	"time"
 
-	"roadmap/internal/auth"
-	"roadmap/internal/store"
+	"github.com/KanterLabs/helm/internal/auth"
+	"github.com/KanterLabs/helm/internal/store"
 )
 
 func progressFixture(t *testing.T) (*Server, *store.Store, store.Project, store.Task) {

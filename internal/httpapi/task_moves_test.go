@@ -9,8 +9,8 @@ import (
 	"strings"
 	"testing"
 
-	"roadmap/internal/auth"
-	"roadmap/internal/store"
+	"github.com/KanterLabs/helm/internal/auth"
+	"github.com/KanterLabs/helm/internal/store"
 )
 
 func TestDecodeTaskMoveInputRequiresBoundedFields(t *testing.T) {

@@ -6,7 +6,7 @@ import (
 	"net/http"
 	"testing"
 
-	"roadmap/internal/store"
+	"github.com/KanterLabs/helm/internal/store"
 )
 
 func TestIssueLifecycleHTTP(t *testing.T) {

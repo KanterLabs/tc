@@ -7,8 +7,8 @@ import (
 	"strings"
 	"unicode/utf8"
 
-	"roadmap/internal/auth"
-	"roadmap/internal/store"
+	"github.com/KanterLabs/helm/internal/auth"
+	"github.com/KanterLabs/helm/internal/store"
 )
 
 // dependencyFilters is shared by project task collections and My Work.  The

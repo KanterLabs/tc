@@ -2,13 +2,13 @@
 
 ## Goal
 
-Let a task declare that one or more other tasks must finish first. Roadmap
+Let a task declare that one or more other tasks must finish first. Helm
 should make the order visible, prevent work from starting out of sequence, and
 preserve the existing board, claim, audit, and optimistic-concurrency rules.
 
 Recommended branch name: `feature/card-dependencies`.
 
-## Roadmap delivery
+## Helm delivery
 
 TC-9 is the existing high-level feature card. Keep it as the umbrella intent
 and deliver it through these unclaimed implementation slices:

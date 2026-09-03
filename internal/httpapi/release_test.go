@@ -11,7 +11,12 @@ func TestHealthAndAPIRootExposeConfiguredRevision(t *testing.T) {
 	const revision = "0123456789abcdef0123456789abcdef01234567"
 	server.Cfg.ReleaseSHA = revision
 
-	for _, target := range []string{"/healthz", "/api/v1"} {
+	for _, testCase := range []struct {
+		target string
+		field  string
+		value  string
+	}{{"/healthz", "service", "helm"}, {"/api/v1", "name", "helm"}} {
+		target := testCase.target
 		response := request(t, server, http.MethodGet, target, nil, nil)
 		if response.Code != http.StatusOK {
 			t.Fatalf("GET %s status = %d, body=%s", target, response.Code, response.Body.String())
@@ -22,6 +27,9 @@ func TestHealthAndAPIRootExposeConfiguredRevision(t *testing.T) {
 		}
 		if payload["revision"] != revision {
 			t.Fatalf("GET %s revision = %#v", target, payload["revision"])
+		}
+		if payload[testCase.field] != testCase.value {
+			t.Fatalf("GET %s %s = %#v, want %q", target, testCase.field, payload[testCase.field], testCase.value)
 		}
 		if got := response.Header().Get("X-Roadmap-Revision"); got != revision {
 			t.Fatalf("GET %s X-Roadmap-Revision = %q", target, got)

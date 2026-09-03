@@ -11,8 +11,17 @@ CONFIG_DIR=/etc/roadmap
 LOCK_PATH="$STATE_DIR/deploy.lock"
 SERVICE_STOP_TIMEOUT=30
 
-log() { printf '[roadmap-install] %s\n' "$*"; }
+log() { printf '[helm-install] %s\n' "$*"; }
 fail() { log "$*" >&2; exit 1; }
+
+compat_env() {
+	local canonical=$1 legacy=$2 default_value=${3:-} canonical_value legacy_value
+	canonical_value=${!canonical:-}
+	legacy_value=${!legacy:-}
+	[[ -z "$canonical_value" || -z "$legacy_value" || "$canonical_value" = "$legacy_value" ]] ||
+		fail "$canonical and $legacy must match when both are set"
+	printf '%s' "${canonical_value:-${legacy_value:-$default_value}}"
+}
 
 unit_state() {
 	systemctl is-active "$1" 2>/dev/null || true
@@ -42,12 +51,39 @@ stop_unit() {
 }
 
 release_revision() {
-	local path=$1 count revision
+	local path=$1 helm_count roadmap_count helm_revision roadmap_revision revision
 	[[ -f "$path" && ! -L "$path" ]] || return 1
-	count=$(awk -F= '$1 == "ROADMAP_RELEASE_SHA" { count++ } END { print count + 0 }' "$path") || return 1
-	revision=$(awk -F= '$1 == "ROADMAP_RELEASE_SHA" { print substr($0, index($0, "=") + 1) }' "$path") || return 1
-	[[ "$count" = 1 && "$revision" =~ ^[0-9a-f]{40}$ ]] || return 1
+	helm_count=$(awk -F= '$1 == "HELM_RELEASE_SHA" { count++ } END { print count + 0 }' "$path") || return 1
+	roadmap_count=$(awk -F= '$1 == "ROADMAP_RELEASE_SHA" { count++ } END { print count + 0 }' "$path") || return 1
+	helm_revision=$(awk -F= '$1 == "HELM_RELEASE_SHA" { print substr($0, index($0, "=") + 1) }' "$path") || return 1
+	roadmap_revision=$(awk -F= '$1 == "ROADMAP_RELEASE_SHA" { print substr($0, index($0, "=") + 1) }' "$path") || return 1
+	[[ "$helm_count" -le 1 && "$roadmap_count" -le 1 ]] || return 1
+	[[ "$helm_count" -eq 1 || "$roadmap_count" -eq 1 ]] || return 1
+	if [[ "$helm_count" -eq 1 && "$roadmap_count" -eq 1 ]]; then
+		[[ "$helm_revision" = "$roadmap_revision" ]] || return 1
+	fi
+	revision=${helm_revision:-$roadmap_revision}
+	[[ "$revision" =~ ^[0-9a-f]{40}$ ]] || return 1
 	printf '%s' "$revision"
+}
+
+release_binary_name() {
+	local target=$1
+	if [[ -x "$target/helm" && ! -L "$target/helm" && -f "$target/helm.sha256" && ! -L "$target/helm.sha256" ]]; then
+		printf 'helm'
+		return 0
+	fi
+	if [[ -x "$target/roadmap" && ! -L "$target/roadmap" && -f "$target/roadmap.sha256" && ! -L "$target/roadmap.sha256" ]]; then
+		printf 'roadmap'
+		return 0
+	fi
+	return 1
+}
+
+verify_release_binary() {
+	local target=$1 binary
+	binary=$(release_binary_name "$target") || return 1
+	(cd "$target" && sha256sum --check --strict "$binary.sha256" >/dev/null)
 }
 
 validate_release_env() {
@@ -96,7 +132,7 @@ single_output_value() {
 # shellcheck disable=SC1091
 source /etc/os-release
 [[ "$ID" = debian && "${VERSION_ID%%.*}" = 12 ]] \
-	|| fail 'Roadmap production requires Debian 12'
+	|| fail 'Helm production requires Debian 12'
 
 for file in roadmap cloudflared cloudflared.token roadmap.env roadmap.service cloudflared.service roadmap-backup.service roadmap-backup.timer nftables.conf compose.yaml roadmap-backup.sh roadmap-restore.sh roadmap-rollback.sh release.sha roadmap.sha256 release.manifest release.manifest.sig; do
 	[[ -f "$RELEASE_DIR/$file" && ! -L "$RELEASE_DIR/$file" ]] || fail "release member is missing: $file"
@@ -189,15 +225,15 @@ migrate_previous_env() {
 		[[ -f "$previous_env" && ! -L "$previous_env" ]] || fail 'current release environment path is invalid'
 	else
 		local current_env="$CONFIG_DIR/roadmap.env"
-		local current_count current_revision migration
+		local helm_count roadmap_count current_revision migration
 		[[ -f "$current_env" && ! -L "$current_env" ]] || fail 'current release environment is unavailable'
-		current_count=$(awk -F= '$1 == "ROADMAP_RELEASE_SHA" { count++ } END { print count + 0 }' "$current_env") || fail 'cannot inspect current release environment'
-		current_revision=$(awk -F= '$1 == "ROADMAP_RELEASE_SHA" { print substr($0, index($0, "=") + 1) }' "$current_env") || fail 'cannot inspect current release environment'
-		if [[ "$current_count" = 1 ]]; then
+		helm_count=$(awk -F= '$1 == "HELM_RELEASE_SHA" { count++ } END { print count + 0 }' "$current_env") || fail 'cannot inspect current release environment'
+		roadmap_count=$(awk -F= '$1 == "ROADMAP_RELEASE_SHA" { count++ } END { print count + 0 }' "$current_env") || fail 'cannot inspect current release environment'
+		if current_revision=$(release_revision "$current_env"); then
 			[[ "$current_revision" = "$previous_sha" ]] || fail 'current release environment revision does not match the current release'
 		else
-			[[ "$current_count" = 0 ]] || fail 'current release environment has duplicate release revisions'
-			migration="$STATE_DIR/.roadmap-env-$previous_sha.$$"
+			[[ "$helm_count" = 0 && "$roadmap_count" = 0 ]] || fail 'current release environment has invalid release revisions'
+			migration="$STATE_DIR/.helm-env-$previous_sha.$$"
 			[[ ! -e "$migration" && ! -L "$migration" ]] || fail 'temporary current release environment path already exists'
 			install -m 0640 -o root -g root "$current_env" "$migration"
 			printf '\nROADMAP_RELEASE_SHA=%s\n' "$previous_sha" >> "$migration"
@@ -207,15 +243,14 @@ migrate_previous_env() {
 	validate_release_env "$previous_env" "$previous_sha"
 }
 
-new_target="$RELEASES_DIR/.roadmap-$SHA.$$"
+new_target="$RELEASES_DIR/.helm-$SHA.$$"
 if [[ -e "$RELEASES_DIR/$SHA" || -L "$RELEASES_DIR/$SHA" ]]; then
 	[[ -d "$RELEASES_DIR/$SHA" && ! -L "$RELEASES_DIR/$SHA" ]] || fail 'retained release is not a directory'
-	[[ -x "$RELEASES_DIR/$SHA/roadmap" && ! -L "$RELEASES_DIR/$SHA/roadmap" ]] || fail 'retained release binary is invalid'
-	[[ -f "$RELEASES_DIR/$SHA/roadmap.sha256" && ! -L "$RELEASES_DIR/$SHA/roadmap.sha256" ]] || fail 'retained release has no binary checksum'
+	retained_binary=$(release_binary_name "$RELEASES_DIR/$SHA") || fail 'retained release binary is invalid'
 	[[ -f "$RELEASES_DIR/$SHA/release.manifest" && ! -L "$RELEASES_DIR/$SHA/release.manifest" ]] || fail 'retained release has no signed manifest'
 	[[ -f "$RELEASES_DIR/$SHA/release.manifest.sig" && ! -L "$RELEASES_DIR/$SHA/release.manifest.sig" ]] || fail 'retained release has no manifest signature'
-	(cd "$RELEASES_DIR/$SHA" && sha256sum --check --strict roadmap.sha256 >/dev/null) || fail 'retained release checksum failed'
-	if [[ "$(sha256sum "$RELEASES_DIR/$SHA/roadmap" | awk '{print $1}')" != "$(sha256sum "$RELEASE_DIR/roadmap" | awk '{print $1}')" ]]; then
+	verify_release_binary "$RELEASES_DIR/$SHA" || fail 'retained release checksum failed'
+	if [[ "$(sha256sum "$RELEASES_DIR/$SHA/$retained_binary" | awk '{print $1}')" != "$(sha256sum "$RELEASE_DIR/roadmap" | awk '{print $1}')" ]]; then
 		fail 'same SHA was previously retained with different bytes'
 	fi
 	if [[ -e "$RELEASES_DIR/$SHA/roadmap.env" || -L "$RELEASES_DIR/$SHA/roadmap.env" ]]; then
@@ -230,13 +265,14 @@ if [[ -e "$RELEASES_DIR/$SHA" || -L "$RELEASES_DIR/$SHA" ]]; then
 	release_target="$RELEASES_DIR/$SHA"
 else
 	install -d -m 0755 -o root -g root "$new_target"
-	install -m 0755 -o root -g root "$RELEASE_DIR/roadmap" "$new_target/roadmap"
+	install -m 0755 -o root -g root "$RELEASE_DIR/roadmap" "$new_target/helm"
 	install -m 0644 -o root -g root "$RELEASE_DIR/release.sha" "$new_target/release.sha"
-	install -m 0644 -o root -g root "$RELEASE_DIR/roadmap.sha256" "$new_target/roadmap.sha256"
+	(cd "$new_target" && sha256sum helm > helm.sha256)
+	chmod 0644 "$new_target/helm.sha256"
 	install -m 0644 -o root -g root "$RELEASE_DIR/release.manifest" "$new_target/release.manifest"
 	install -m 0644 -o root -g root "$RELEASE_DIR/release.manifest.sig" "$new_target/release.manifest.sig"
 	install -m 0640 -o root -g root "$RELEASE_DIR/roadmap.env" "$new_target/roadmap.env"
-	(cd "$new_target" && sha256sum --check --strict roadmap.sha256 >/dev/null) || fail 'new release binary checksum failed'
+	verify_release_binary "$new_target" || fail 'new release binary checksum failed'
 	mv -T -- "$new_target" "$RELEASES_DIR/$SHA"
 	release_target="$RELEASES_DIR/$SHA"
 fi
@@ -247,6 +283,73 @@ atomic_switch() {
 	ln -s -- "$target" "$tmp" || return 1
 	if ! mv -T -- "$tmp" "$CURRENT_LINK"; then
 		rm -f -- "$tmp"
+		return 1
+	fi
+}
+
+install_helm_runner() {
+	local temporary=/usr/local/sbin/helm-run-current.new
+	[[ ! -e "$temporary" && ! -L "$temporary" ]] || return 1
+	# Retained Roadmap releases remain immutable and executable during the
+	# transition. The fixed-path runner selects the canonical Helm binary for
+	# new releases and the legacy binary for a verified rollback target.
+	cat > "$temporary" <<'RUNNER'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+STATE_DIR=/var/lib/roadmap
+RELEASES_DIR="$STATE_DIR/releases"
+CURRENT_LINK="$STATE_DIR/current"
+
+fail() {
+	printf '[helm-run-current] %s\n' "$*" >&2
+	exit 1
+}
+
+[[ -L "$CURRENT_LINK" ]] || fail 'current release link is unavailable'
+target=$(readlink "$CURRENT_LINK") || fail 'current release link cannot be read'
+[[ "$target" = "$RELEASES_DIR"/* ]] || fail 'current release link escapes release directory'
+[[ -d "$target" && ! -L "$target" ]] || fail 'current release target is invalid'
+sha=${target##*/}
+[[ "$sha" =~ ^[0-9a-f]{40}$ ]] || fail 'current release directory name is invalid'
+
+if [[ -x "$target/helm" && ! -L "$target/helm" ]]; then
+	binary="$target/helm"
+	checksum="$target/helm.sha256"
+elif [[ -x "$target/roadmap" && ! -L "$target/roadmap" ]]; then
+	binary="$target/roadmap"
+	checksum="$target/roadmap.sha256"
+else
+	fail 'current release has no executable Helm-compatible binary'
+fi
+[[ -f "$checksum" && ! -L "$checksum" ]] || fail 'current release has no binary checksum'
+(cd "$target" && sha256sum --check --strict "${checksum##*/}" >/dev/null) ||
+	fail 'current release binary checksum failed'
+exec "$binary" "$@"
+RUNNER
+	chown root:root "$temporary" || return 1
+	chmod 0755 "$temporary" || return 1
+	mv -T -- "$temporary" /usr/local/sbin/helm-run-current
+}
+
+install_compat_symlink() {
+	local canonical=$1 legacy=$2 temporary="/usr/local/sbin/.${legacy}.new.$$"
+	[[ "$canonical" =~ ^helm-[a-z-]+$ && "$legacy" =~ ^roadmap-[a-z-]+$ ]] || return 1
+	[[ ! -e "$temporary" && ! -L "$temporary" ]] || return 1
+	ln -s -- "$canonical" "$temporary" || return 1
+	if ! mv -T -- "$temporary" "/usr/local/sbin/$legacy"; then
+		rm -f -- "$temporary"
+		return 1
+	fi
+}
+
+install_unit_alias() {
+	local canonical=$1 legacy=$2 temporary="/etc/systemd/system/.${legacy}.new.$$"
+	[[ "$canonical" =~ ^helm[-a-z]*\.(service|timer)$ && "$legacy" =~ ^roadmap[-a-z]*\.(service|timer)$ ]] || return 1
+	[[ ! -e "$temporary" && ! -L "$temporary" ]] || return 1
+	ln -s -- "$canonical" "$temporary" || return 1
+	if ! mv -T -- "$temporary" "/etc/systemd/system/$legacy"; then
+		rm -f -- "$temporary"
 		return 1
 	fi
 }
@@ -334,10 +437,12 @@ restore_previous() {
 	[[ -n "$previous_target" ]] || return 1
 	stop_unit cloudflared.service || return 1
 	stop_unit roadmap.service || return 1
+	stop_unit helm.service || return 1
 	install_release_env "$previous_target" "$previous_sha" || return 1
 	atomic_switch "$previous_target" || return 1
-	systemctl start roadmap.service || return 1
+	systemctl start helm.service || return 1
 	healthy_revision "$previous_sha" || return 1
+	systemctl is-active --quiet helm.service || return 1
 	systemctl is-active --quiet roadmap.service || return 1
 	systemctl start cloudflared.service || return 1
 	systemctl is-active --quiet cloudflared.service
@@ -354,6 +459,7 @@ on_exit() {
 	# Recovery itself must not recursively invoke this EXIT transaction.
 	trap - EXIT
 	rm -f -- "$CONFIG_DIR/roadmap.env.new" || true
+	rm -f -- /usr/local/sbin/helm-run-current.new || true
 	if [[ -n "${fresh_preflight_source:-}" ]]; then
 		rm -f -- "$fresh_preflight_source" || true
 	fi
@@ -381,7 +487,7 @@ if [[ -e "$STATE_DIR/roadmap.db" ]]; then
 	fail 'legacy database layout requires an explicit offline maintenance migration; no services were stopped'
 fi
 
-# Take and verify the pre-upgrade backup while Roadmap is still online. The
+# Take and verify the pre-upgrade backup while Helm is still online. The
 # helper records the source schema version and migration digest, then the new
 # binary migrates a private copy of that exact backup before any service stop
 # or release-link switch.
@@ -400,8 +506,9 @@ if [[ -f "$DATA_DIR/roadmap.db" && ! -L "$DATA_DIR/roadmap.db" ]]; then
 	# The candidate binary owns the metadata format. A retained prior binary
 	# may predate migration-info, especially on the first TC-33 deployment.
 	migration_info_binary="$RELEASE_DIR/roadmap"
-	backup_output=$(ROADMAP_STATE_DIR="$STATE_DIR" ROADMAP_DATA_DIR="$DATA_DIR" ROADMAP_DB_PATH="$DATA_DIR/roadmap.db" ROADMAP_BACKUP_DIR="$BACKUPS_DIR" ROADMAP_DEPLOY_LOCK_HELD=1 \
-		ROADMAP_BACKUP_RETENTION="${ROADMAP_BACKUP_RETENTION:-14}" ROADMAP_MIGRATION_INFO_BINARY="$migration_info_binary" ROADMAP_MIGRATION_DIGEST= \
+	backup_retention=$(compat_env HELM_BACKUP_RETENTION ROADMAP_BACKUP_RETENTION 14)
+	backup_output=$(HELM_STATE_DIR="$STATE_DIR" HELM_DATA_DIR="$DATA_DIR" HELM_DB_PATH="$DATA_DIR/roadmap.db" HELM_BACKUP_DIR="$BACKUPS_DIR" HELM_DEPLOY_LOCK_HELD=1 \
+		HELM_BACKUP_RETENTION="$backup_retention" HELM_MIGRATION_INFO_BINARY="$migration_info_binary" HELM_MIGRATION_DIGEST= \
 		"$RELEASE_DIR/roadmap-backup.sh" "$SHA") \
 		|| fail 'could not create the verified pre-upgrade backup'
 	[[ "$(grep -Ec '^backup=/[^[:cntrl:]]+$' <<<"$backup_output")" = 1 ]] \
@@ -475,7 +582,7 @@ else
 	# A fresh guest has no online source to back up. Exercise the same candidate
 	# migration/preflight gate against a disposable empty SQLite database so the
 	# proof still records the candidate schema, digest, and integrity predicates.
-	fresh_preflight_source=$(mktemp "$STATE_DIR/.roadmap-preflight.XXXXXX") \
+	fresh_preflight_source=$(mktemp "$STATE_DIR/.helm-preflight.XXXXXX") \
 		|| fail 'could not create fresh-install preflight source'
 	chmod 0600 "$fresh_preflight_source"
 	sqlite3 "$fresh_preflight_source" 'VACUUM;' \
@@ -530,18 +637,32 @@ printf 'pre_upgrade_backup=%s source_schema=%s candidate_schema=%s latest_schema
 log 'Stopping the application before the atomic release switch'
 upgrade_transaction_started=1
 stop_unit cloudflared.service || fail 'could not stop cloudflared.service and verify it is inactive'
+stop_unit roadmap-backup.timer || fail 'could not stop roadmap-backup.timer and verify it is inactive'
+stop_unit helm-backup.timer || fail 'could not stop helm-backup.timer and verify it is inactive'
 stop_unit roadmap.service || fail 'could not stop roadmap.service and verify it is inactive'
+stop_unit helm.service || fail 'could not stop helm.service and verify it is inactive'
 
 # Configuration and helpers are installed atomically.  The tunnel token is
 # copied only into the LXC's root-owned configuration directory and is never
 # retained in a release directory.
-install -m 0755 -o root -g root "$RELEASE_DIR/roadmap-backup.sh" /usr/local/sbin/roadmap-backup
-install -m 0755 -o root -g root "$RELEASE_DIR/roadmap-restore.sh" /usr/local/sbin/roadmap-restore
-install -m 0755 -o root -g root "$RELEASE_DIR/roadmap-rollback.sh" /usr/local/sbin/roadmap-rollback
-install -m 0644 -o root -g root "$RELEASE_DIR/roadmap.service" /etc/systemd/system/roadmap.service
+install -m 0755 -o root -g root "$RELEASE_DIR/roadmap-backup.sh" /usr/local/sbin/helm-backup
+install -m 0755 -o root -g root "$RELEASE_DIR/roadmap-restore.sh" /usr/local/sbin/helm-restore
+install -m 0755 -o root -g root "$RELEASE_DIR/roadmap-rollback.sh" /usr/local/sbin/helm-rollback
+install_helm_runner || fail 'could not install the dual-generation Helm runner'
+install_compat_symlink helm-backup roadmap-backup || fail 'could not install roadmap-backup compatibility alias'
+install_compat_symlink helm-restore roadmap-restore || fail 'could not install roadmap-restore compatibility alias'
+install_compat_symlink helm-rollback roadmap-rollback || fail 'could not install roadmap-rollback compatibility alias'
+install -m 0644 -o root -g root "$RELEASE_DIR/roadmap.service" /etc/systemd/system/helm.service
 install -m 0644 -o root -g root "$RELEASE_DIR/cloudflared.service" /etc/systemd/system/cloudflared.service
-install -m 0644 -o root -g root "$RELEASE_DIR/roadmap-backup.service" /etc/systemd/system/roadmap-backup.service
-install -m 0644 -o root -g root "$RELEASE_DIR/roadmap-backup.timer" /etc/systemd/system/roadmap-backup.timer
+install -m 0644 -o root -g root "$RELEASE_DIR/roadmap-backup.service" /etc/systemd/system/helm-backup.service
+install -m 0644 -o root -g root "$RELEASE_DIR/roadmap-backup.timer" /etc/systemd/system/helm-backup.timer
+for legacy_unit in roadmap.service roadmap-backup.service roadmap-backup.timer; do
+	[[ ! -d "/etc/systemd/system/$legacy_unit" ]] || fail "legacy unit alias path is a directory: $legacy_unit"
+	rm -f -- "/etc/systemd/system/$legacy_unit"
+done
+install_unit_alias helm.service roadmap.service || fail 'could not install roadmap.service compatibility alias'
+install_unit_alias helm-backup.service roadmap-backup.service || fail 'could not install roadmap-backup.service compatibility alias'
+install_unit_alias helm-backup.timer roadmap-backup.timer || fail 'could not install roadmap-backup.timer compatibility alias'
 install -m 0644 -o root -g root "$RELEASE_DIR/nftables.conf" /etc/nftables.conf
 install_release_env "$release_target" "$SHA" || fail 'could not install requested release environment'
 install -m 0640 -o root -g cloudflared "$RELEASE_DIR/cloudflared.token" "$CONFIG_DIR/cloudflared.token.new"
@@ -556,13 +677,13 @@ disable_unused_postfix
 nft -c -f /etc/nftables.conf
 atomic_switch "$release_target" || fail 'could not switch to requested release'
 systemctl daemon-reload
-systemd-analyze verify /etc/systemd/system/roadmap.service /etc/systemd/system/cloudflared.service /etc/systemd/system/roadmap-backup.service /etc/systemd/system/roadmap-backup.timer
+systemd-analyze verify /etc/systemd/system/helm.service /etc/systemd/system/cloudflared.service /etc/systemd/system/helm-backup.service /etc/systemd/system/helm-backup.timer
 systemctl enable nftables.service
 systemctl restart nftables.service
-systemctl enable roadmap.service cloudflared.service
-systemctl enable --now roadmap-backup.timer
+systemctl enable helm.service cloudflared.service
+systemctl enable --now helm-backup.timer
 
-systemctl start roadmap.service
+systemctl start helm.service
 if ! healthy_revision "$SHA"; then
 	log 'new release failed the local health check; attempting automatic rollback'
 	if restore_previous; then
@@ -571,7 +692,8 @@ if ! healthy_revision "$SHA"; then
 	fi
 	fail 'new release failed health and the previous release could not be restored'
 fi
-systemctl is-active --quiet roadmap.service || fail 'roadmap.service is not active after health check'
+systemctl is-active --quiet helm.service || fail 'helm.service is not active after health check'
+systemctl is-active --quiet roadmap.service || fail 'roadmap.service compatibility alias is not active after health check'
 
 systemctl start cloudflared.service
 if ! systemctl is-active --quiet cloudflared.service; then
@@ -584,12 +706,12 @@ if ! systemctl is-active --quiet cloudflared.service; then
 fi
 
 if command -v ss >/dev/null 2>&1; then
-	loopback_listener || fail 'Roadmap is not listening on loopback port 8080'
+	loopback_listener || fail 'Helm is not listening on loopback port 8080'
 fi
 
 # Retain the active release plus the newest previous releases.  Do not prune
 # backups here; the backup helper owns their independent retention policy.
-RETENTION=${ROADMAP_RELEASE_RETENTION:-5}
+RETENTION=$(compat_env HELM_RELEASE_RETENTION ROADMAP_RELEASE_RETENTION 5)
 [[ "$RETENTION" =~ ^[1-9][0-9]*$ ]] || fail 'release retention must be a positive integer'
 mapfile -t releases < <(find "$RELEASES_DIR" -mindepth 1 -maxdepth 1 -type d -name '[0-9a-f]*' -printf '%T@ %p\n' | sort -nr)
 if (( ${#releases[@]} > RETENTION )); then

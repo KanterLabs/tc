@@ -1,0 +1,25 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 48 48" role="img" aria-labelledby="helm-favicon-title">
+  <title id="helm-favicon-title">Helm</title>
+  <g fill="none" stroke="#6d5efc" stroke-width="3" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M24 24V4" />
+    <path d="M24 24V44" />
+    <path d="M24 24H4" />
+    <path d="M24 24H44" />
+    <path d="M24 24 9.86 9.86" />
+    <path d="M24 24 38.14 9.86" />
+    <path d="M24 24 9.86 38.14" />
+    <path d="M24 24 38.14 38.14" />
+    <circle cx="24" cy="24" r="14" />
+  </g>
+  <g fill="#6d5efc">
+    <circle cx="24" cy="4" r="2.6" />
+    <circle cx="24" cy="44" r="2.6" />
+    <circle cx="4" cy="24" r="2.6" />
+    <circle cx="44" cy="24" r="2.6" />
+    <circle cx="9.86" cy="9.86" r="2.6" />
+    <circle cx="38.14" cy="9.86" r="2.6" />
+    <circle cx="9.86" cy="38.14" r="2.6" />
+    <circle cx="38.14" cy="38.14" r="2.6" />
+    <circle cx="24" cy="24" r="4.8" />
+  </g>
+</svg>

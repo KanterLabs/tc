@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Verify a Roadmap release archive before any guest extraction or Proxmox
+# Verify a Helm release using the retained Roadmap v1 envelope before any guest extraction or Proxmox
 # state change.  This file is installed root-owned on the PVE host by
 # bootstrap-proxmox.sh; the same implementation is exercised locally by the
 # deployment security regression tests.
@@ -64,7 +64,7 @@ ALL_MEMBERS=(
 ARCHIVE_MAX_MEMBERS=${#ALL_MEMBERS[@]}
 
 fail() {
-	printf '[roadmap-verify-release] %s\n' "$*" >&2
+	printf '[helm-verify-release] %s\n' "$*" >&2
 	exit 1
 }
 

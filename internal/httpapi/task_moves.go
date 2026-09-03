@@ -6,8 +6,8 @@ import (
 	"strings"
 	"unicode/utf8"
 
-	"roadmap/internal/auth"
-	"roadmap/internal/store"
+	"github.com/KanterLabs/helm/internal/auth"
+	"github.com/KanterLabs/helm/internal/store"
 )
 
 const (

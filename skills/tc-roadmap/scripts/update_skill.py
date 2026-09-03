@@ -20,8 +20,10 @@ except ImportError:  # pragma: no cover - retained for older partial installs
     install_hooks = None  # type: ignore[assignment]
 
 
-DEFAULT_REPOSITORY = "https://github.com/KanterLabs/tc.git"
-SKILL_SUBDIRECTORY = Path("skills/tc-roadmap")
+DEFAULT_REPOSITORY = "https://github.com/KanterLabs/helm.git"
+SKILL_SUBDIRECTORY = Path("skills/helm")
+CANONICAL_SKILL_NAME = "helm"
+LEGACY_SKILL_NAME = "tc-roadmap"
 
 
 class UpdateError(RuntimeError):
@@ -55,12 +57,12 @@ def _run(command: list[str], *, cwd: Path | None = None) -> str:
 
 def _validate_source(source: Path) -> None:
     skill = source / "SKILL.md"
-    helper = source / "scripts" / "tc_roadmap.py"
+    helper = source / "scripts" / "helm.py"
     if not skill.is_file() or not helper.is_file():
-        raise UpdateError("GitHub checkout does not contain the expected TC Roadmap skill")
+        raise UpdateError("GitHub checkout does not contain the expected Helm skill")
     header = skill.read_text(encoding="utf-8")[:4096]
-    if "name: tc-roadmap" not in header:
-        raise UpdateError("GitHub checkout contains an invalid TC Roadmap skill")
+    if "name: helm" not in header:
+        raise UpdateError("GitHub checkout contains an invalid Helm skill")
 
 
 def _read_installed_revision(target: Path) -> str:
@@ -139,22 +141,31 @@ def _remote_revision(repository: str) -> str:
     return matches[0]
 
 
+def _canonical_target(target: Path) -> Path:
+    """Map an explicit legacy target to the canonical sibling without deleting it."""
+
+    target = target.expanduser()
+    if target.name == LEGACY_SKILL_NAME and target.parent.name == "skills":
+        return target.with_name(CANONICAL_SKILL_NAME)
+    return target
+
+
 def install_from_source(source: Path, target: Path, *, revision: str = "") -> None:
     _validate_source(source)
     if revision and (
         len(revision) not in {40, 64} or any(character not in string.hexdigits for character in revision)
     ):
         raise UpdateError("refusing to record an invalid source revision")
-    target = target.expanduser().absolute()
+    target = _canonical_target(target).absolute()
     parent = target.parent
-    if target.name != "tc-roadmap" or parent.name != "skills":
+    if target.name != CANONICAL_SKILL_NAME or parent.name != "skills":
         raise UpdateError("refusing to replace an unexpected skill target")
     _prepare_install_parent(parent)
     if target.is_symlink():
         raise UpdateError("refusing to replace a symlinked skill target")
     with tempfile.TemporaryDirectory(prefix=".tc-roadmap-stage-", dir=parent) as raw_stage:
         stage_root = Path(raw_stage)
-        stage = stage_root / "tc-roadmap"
+        stage = stage_root / CANONICAL_SKILL_NAME
         shutil.copytree(source, stage)
         if revision:
             (stage / ".source-revision").write_text(revision + "\n", encoding="utf-8")
@@ -216,6 +227,7 @@ def _reconcile_hooks_safely(target: Path) -> None:
 def update(repository: str, target: Path) -> tuple[bool, str]:
     if repository != DEFAULT_REPOSITORY:
         raise UpdateError("refusing to update from an untrusted repository")
+    target = _canonical_target(target)
     remote_revision = _remote_revision(repository)
     if _read_installed_revision(target) == remote_revision:
         _reconcile_hooks_safely(target)
@@ -248,7 +260,7 @@ def update(repository: str, target: Path) -> tuple[bool, str]:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--repository", default=DEFAULT_REPOSITORY)
-    parser.add_argument("--target", type=Path, default=codex_home() / "skills" / "tc-roadmap")
+    parser.add_argument("--target", type=Path, default=codex_home() / "skills" / "helm")
     return parser
 
 

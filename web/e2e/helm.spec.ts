@@ -4,12 +4,42 @@ function escapeRegExp(value: string): string {
   return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
 
-test.describe('Roadmap workspace', () => {
+test.describe('Helm workspace', () => {
+  test('renders the Helm identity and preserves retained browser preferences', async ({ page, request }) => {
+    await page.addInitScript(() => {
+      localStorage.setItem('roadmap.theme', 'dark');
+      localStorage.removeItem('helm.theme');
+    });
+    await page.emulateMedia({ reducedMotion: 'reduce' });
+    await page.goto('/');
+
+    await expect(page).toHaveTitle('Helm');
+    await expect(page.locator('meta[name="description"]')).toHaveAttribute('content', /Helm/);
+    await expect(page.locator('link[rel="icon"]')).toHaveAttribute('href', '/favicon.svg');
+    await expect(page.getByRole('navigation', { name: 'Primary navigation' })).toBeVisible();
+    await expect(page.locator('svg.helm-mark').filter({ visible: true }).first()).toBeVisible();
+    await expect(page.locator('.app-shell')).toHaveClass(/dark-mode/);
+
+    const preferences = await page.evaluate(() => ({
+      canonical: localStorage.getItem('helm.theme'),
+      retained: localStorage.getItem('roadmap.theme')
+    }));
+    expect(preferences).toEqual({ canonical: 'dark', retained: 'dark' });
+    expect(await page.locator('.new-project-button').evaluate((element) => getComputedStyle(element).transitionDuration)).toBe('0s');
+
+    for (const asset of ['/favicon.svg', '/helm-mark.svg']) {
+      const response = await request.get(asset);
+      expect(response.status()).toBe(200);
+      expect(response.headers()['content-type']).toContain('image/svg+xml');
+    }
+    expect((await request.get('/assets/missing-helm-asset.svg')).status()).toBe(404);
+  });
+
   test('loads in disabled-auth mode and manages a task from the board', async ({ page, request }) => {
     const statusResponse = await request.get('/api/v1/auth/status');
     expect(statusResponse.ok()).toBeTruthy();
     const status = (await statusResponse.json()) as { mode?: string };
-    expect(status.mode, 'The E2E server must run with ROADMAP_AUTH_MODE=disabled').toBe('disabled');
+    expect(status.mode, 'The E2E server must run with HELM_AUTH_MODE=disabled').toBe('disabled');
 
     const runId = `${Date.now().toString(36)}${Math.random().toString(36).slice(2, 7)}`.toUpperCase();
     const projectName = `Browser E2E ${runId}`;
@@ -133,7 +163,7 @@ test.describe('Roadmap workspace', () => {
 
     const commandTrigger = page.getByRole('button', { name: 'Search anything', exact: true });
     await commandTrigger.click();
-    const commandDialog = page.getByRole('dialog', { name: 'Search Roadmap' });
+    const commandDialog = page.getByRole('dialog', { name: 'Search Helm' });
     const commandInput = commandDialog.getByRole('textbox', { name: 'Search projects and views' });
     await expect(commandInput).toBeFocused();
     await page.keyboard.press('Shift+Tab');
@@ -158,7 +188,7 @@ test.describe('Roadmap workspace', () => {
   test('reports, triages, resolves, and reopens a bug', async ({ page }) => {
     const statusResponse = await page.request.get('/api/v1/auth/status');
     const status = (await statusResponse.json()) as { mode?: string };
-    expect(status.mode, 'The E2E server must run with ROADMAP_AUTH_MODE=disabled').toBe('disabled');
+    expect(status.mode, 'The E2E server must run with HELM_AUTH_MODE=disabled').toBe('disabled');
 
     const runId = `${Date.now().toString(36)}${Math.random().toString(36).slice(2, 7)}`.toUpperCase();
     const projectName = `Issue E2E ${runId}`;
@@ -217,7 +247,7 @@ test.describe('Roadmap workspace', () => {
 
     await drawer.getByRole('button', { name: 'Close task details', exact: true }).click();
     await page.getByRole('button', { name: 'Search anything', exact: true }).click();
-    const commandDialog = page.getByRole('dialog', { name: 'Search Roadmap' });
+    const commandDialog = page.getByRole('dialog', { name: 'Search Helm' });
     await commandDialog.getByRole('textbox', { name: 'Search projects and views' }).fill(bugTitle);
     await commandDialog.getByRole('button', { name: new RegExp(escapeRegExp(bugTitle)) }).click();
     await expect(drawer.getByLabel('Task title')).toHaveValue(bugTitle);
