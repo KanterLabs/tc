@@ -1135,7 +1135,7 @@ legend { margin-bottom: 8px; color: var(--ink-soft); font-size: 11px; font-weigh
   .clear-filters { min-height: 44px; padding: 0 8px; }
   .board { grid-template-columns: none; grid-auto-flow: column; grid-auto-columns: minmax(82vw, 1fr); gap: 12px; margin-right: -14px; overflow-x: auto; padding: 2px 14px 16px 0; scroll-snap-type: x mandatory; }
   .board-column { min-height: 305px; scroll-margin-top: calc(70px + env(safe-area-inset-top)); scroll-snap-align: start; }
-  .column-header { position: sticky; top: calc(57px + env(safe-area-inset-top)); z-index: 2; min-height: 52px; border-radius: 12px 12px 0 0; background: color-mix(in srgb, var(--surface-muted) 94%, transparent); backdrop-filter: blur(10px); }
+  .column-header { position: relative; z-index: 2; min-height: 52px; border-radius: 12px 12px 0 0; background: color-mix(in srgb, var(--surface-muted) 94%, transparent); backdrop-filter: blur(10px); }
   .column-cards { min-height: 0; }
   .column-empty { min-height: 104px; }
   .task-main { min-height: 44px; padding: 13px 12px 10px; }

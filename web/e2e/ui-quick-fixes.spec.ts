@@ -140,18 +140,10 @@ test.describe('UI quick fixes', () => {
     await openBoard(page);
 
     const board = page.locator('section.board');
-    const styles = await board.evaluate((element) => {
-      const column = element.querySelector<HTMLElement>('.board-column');
-      const boardStyle = getComputedStyle(element);
-      return {
-        snapType: boardStyle.scrollSnapType,
-        scrollBehavior: boardStyle.scrollBehavior,
-        columnSnapAlign: column ? getComputedStyle(column).scrollSnapAlign : ''
-      };
-    });
-    expect(styles.snapType).toMatch(/x/);
-    expect(styles.snapType).toMatch(/mandatory/);
-    expect(styles.columnSnapAlign).toMatch(/start/);
-    expect(styles.scrollBehavior).toBe('auto');
+    // Poll the current DOM: a live refresh can replace the board between an
+    // initial visibility assertion and a one-shot computed-style read.
+    await expect(board).toHaveCSS('scroll-snap-type', /x.*mandatory/);
+    await expect(board.locator('.board-column').first()).toHaveCSS('scroll-snap-align', 'start');
+    await expect(board).toHaveCSS('scroll-behavior', 'auto');
   });
 });
