@@ -297,6 +297,9 @@
   let authView: AuthView = 'login';
   let authSubmitting = false;
   let authError = '';
+  let authBootstrapFailed = false;
+  let bootstrapController: AbortController | undefined;
+  let bootstrapRequest = 0;
   let loginEmail = '';
   let loginPassword = '';
   let setupName = '';
@@ -305,6 +308,7 @@
 
   const accessBootstrapKey = 'helm.cloudflare-access-bootstrap';
   const legacyAccessBootstrapKey = 'roadmap.cloudflare-access-bootstrap';
+  const bootstrapTimeoutMs = 12_000;
 
   let theme: 'light' | 'dark' = 'light';
   let view: View = 'board';
@@ -1185,6 +1189,7 @@
       if (boardFilterTimer) window.clearTimeout(boardFilterTimer);
       window.removeEventListener('online', onlineHandler);
       window.removeEventListener('offline', offlineHandler);
+      bootstrapController?.abort();
     };
     void bootstrap();
     const keyHandler = (event: KeyboardEvent) => handleKeydown(event);
@@ -1214,11 +1219,18 @@
   }
 
   async function bootstrap() {
+    const requestId = ++bootstrapRequest;
+    bootstrapController?.abort();
+    const controller = new AbortController();
+    bootstrapController = controller;
+    const timeout = window.setTimeout(() => controller.abort(), bootstrapTimeoutMs);
     booting = true;
     authError = '';
+    authBootstrapFailed = false;
     let authStatusLoaded = false;
     try {
-      authStatus = await api.authStatus();
+      authStatus = await api.authStatus(controller.signal);
+      if (requestId !== bootstrapRequest) return;
       authStatusLoaded = true;
       sessionStorage.removeItem(accessBootstrapKey);
       sessionStorage.removeItem(legacyAccessBootstrapKey);
@@ -1233,7 +1245,8 @@
         return;
       }
       try {
-        user = authStatus.user || authStatus.actor || (await api.authMe());
+        user = authStatus.user || authStatus.actor || (await api.authMe(controller.signal));
+        if (requestId !== bootstrapRequest) return;
       } catch (error) {
         // Development's disabled mode intentionally has no session actor.
         if (authStatus.mode === 'disabled') {
@@ -1248,6 +1261,7 @@
       }
       await finishAuthentication();
     } catch (error) {
+      if (requestId !== bootstrapRequest) return;
       // Cloudflare Access protects the browser UI and API as distinct
       // applications so agents can use Service Auth on /api/v1/*. A browser
       // therefore needs one top-level API navigation to receive the API-path
@@ -1264,9 +1278,16 @@
         window.location.assign(`${API_PREFIX}/auth/status`);
         return;
       }
-      authError = friendlyError(error, 'Helm could not connect to the server.');
+      authBootstrapFailed = true;
+      authError = controller.signal.aborted
+        ? 'Helm took too long to respond. Check your connection and try again.'
+        : friendlyError(error, 'Helm could not connect to the server.');
     } finally {
-      booting = false;
+      window.clearTimeout(timeout);
+      if (requestId === bootstrapRequest) {
+        bootstrapController = undefined;
+        booting = false;
+      }
     }
   }
 
@@ -1276,6 +1297,11 @@
     // check even when the browser logs back in as the same actor.
     sessionGeneration += 1;
     const requestedSession = sessionGeneration;
+    // Authentication is enough to reveal the application chrome. Project and
+    // board reads can be noticeably slower on a remote self-hosted instance;
+    // render their in-context skeleton instead of holding the user on the
+    // full-screen bootstrap splash until every request has completed.
+    booting = false;
     await loadProjects();
     if (sessionGeneration !== requestedSession || !user) return;
     startPolling();
@@ -5542,7 +5568,7 @@
           <p>{authView === 'setup' ? 'Set up the first administrator account.' : 'Sign in to pick up where you left off.'}</p>
         </div>
         {#if authError}
-          <div class="inline-alert error" role="alert"><span>!</span>{authError}</div>
+          <div class="inline-alert error" role="alert"><span>!</span><span>{authError}</span>{#if authBootstrapFailed}<button class="text-button" type="button" on:click={bootstrap}>Retry</button>{/if}</div>
         {/if}
         {#if authView === 'setup'}
           <label>Full name<input bind:value={setupName} autocomplete="name" placeholder="Alex Morgan" /></label>
@@ -5664,7 +5690,17 @@
 
       <main class="content" class:my-work-live={view === 'my-work' && myWorkView === 'live'} tabindex="-1" data-destructive-focus-target>
         {#if view === 'board' || view === 'timeline'}
-          {#if activeProject}
+          {#if projectsLoading && !projects.length}
+            <section class="workspace-loading" role="status" aria-label="Loading workspace" aria-live="polite" aria-busy="true">
+              <span class="sr-only">Loading projects and board…</span>
+              <div class="workspace-loading-heading" aria-hidden="true">
+                <span class="loading-line loading-line-short"></span>
+                <span class="loading-line loading-line-title"></span>
+                <span class="loading-line loading-line-copy"></span>
+              </div>
+              <div class="board board-loading" aria-hidden="true">{#each [1, 2, 3, 4] as item}<div class="column-skeleton"><div></div><div></div><div></div></div>{/each}</div>
+            </section>
+          {:else if activeProject}
             <section class="page-heading board-heading">
               <div><div class="breadcrumbs"><span>Workspace</span><span>/</span><span>{activeProject.key}</span></div><div class="heading-title-row"><span class="heading-project-dot" style={`--project-color: ${activeProject.color || '#6d5efc'}`}></span><h1>{activeProject.name}</h1><button class="icon-button favorite-heading" class:starred={activeProject.favorite} type="button" aria-label={activeProject.favorite ? 'Remove from favorites' : 'Add to favorites'} on:click={(event) => toggleFavorite(event, activeProject)}>{activeProject.favorite ? '★' : '☆'}</button></div><p>{view === 'timeline' ? 'Everything recently worked on in this board, in one chronological view.' : activeProject.description || 'A focused space for turning ideas into shipped work.'}</p></div>
               <div class="heading-actions"><button class="button quiet-button" type="button" disabled={portableBusy} on:click={() => void exportActiveProject()}><span aria-hidden="true">⇩</span> Export</button><button class="button quiet-button" type="button" disabled={portableBusy} on:click={() => portableFileInput?.click()}><span aria-hidden="true">⇧</span> Import</button><button class="button quiet-button" type="button" on:click={openProjectRoadmap}><span aria-hidden="true">◒</span> Progress</button><button class="button quiet-button" type="button" on:click={openProjectAudits}><span aria-hidden="true">◎</span> Audits</button><button class="button quiet-button" type="button" data-report-bug-trigger on:click={openBugModal}><span aria-hidden="true">⚠</span> Report bug</button><button class="button primary" type="button" data-task-modal-trigger on:click={() => openTaskModal()}><span aria-hidden="true">＋</span> New task</button><input class="sr-only" bind:this={portableFileInput} type="file" accept=".json,application/json" aria-label="Import a Helm portable archive" on:change={handlePortableFile} /></div>
@@ -5689,7 +5725,7 @@
             {#if boardReconciliationNotice}<div class="inline-alert info content-alert" role="status"><span aria-hidden="true">↻</span><span>{boardReconciliationNotice}</span><button class="text-button" type="button" on:click={() => loadBoard()}>Refresh</button></div>{/if}
             {#if boardLoading && tasks.length}<div class="board-loading-note" role="status" aria-live="polite">Loading the latest board pages…</div>{/if}
             {#if boardLoading && !tasks.length}
-              <div class="board board-loading" aria-label="Loading board">{#each [1, 2, 3, 4] as item}<div class="column-skeleton"><div></div><div></div><div></div></div>{/each}</div>
+              <div class="board board-loading" role="status" aria-label="Loading board" aria-live="polite" aria-busy="true"><span class="sr-only">Loading board…</span>{#each [1, 2, 3, 4] as item}<div class="column-skeleton" aria-hidden="true"><div></div><div></div><div></div></div>{/each}</div>
             {:else if !sortedColumns.length}
               <div class="empty-state board-empty"><div class="empty-icon">◇</div><h2>Your board is almost ready</h2><p>Columns will appear here once this project has been initialized.</p><button class="button primary" type="button" on:click={() => loadBoard()}>Refresh board</button></div>
             {:else}
