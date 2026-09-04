@@ -253,10 +253,14 @@ test.describe('Helm workspace', () => {
         .map((column) => column.getBoundingClientRect());
       const search = document.querySelector('.filter-search')?.getBoundingClientRect();
       const newTask = document.querySelector<HTMLElement>('.board-heading .button.primary')?.getBoundingClientRect();
+      const board = document.querySelector<HTMLElement>('section.board');
       return {
         viewportWidth: window.innerWidth,
         documentWidth: document.documentElement.scrollWidth,
         bodyWidth: document.body.scrollWidth,
+        boardClientWidth: board?.clientWidth,
+        boardScrollWidth: board?.scrollWidth,
+        boardSnapType: board ? getComputedStyle(board).scrollSnapType : '',
         navBottom: nav?.bottom,
         navButtonHeight: document.querySelector('.mobile-nav button')?.getBoundingClientRect().height,
         searchHeight: search?.height,
@@ -271,11 +275,13 @@ test.describe('Helm workspace', () => {
     expect(layout.navButtonHeight).toBeGreaterThanOrEqual(44);
     expect(layout.searchHeight).toBeGreaterThanOrEqual(44);
     expect(layout.newTaskHeight).toBeGreaterThanOrEqual(44);
+    expect(layout.boardScrollWidth).toBeGreaterThan(layout.boardClientWidth!);
+    expect(layout.boardSnapType).toMatch(/x/);
+    expect(layout.boardSnapType).toMatch(/mandatory/);
     expect(layout.firstColumn).not.toBeNull();
     expect(layout.secondColumn).not.toBeNull();
-    expect(layout.secondColumn!.top).toBeGreaterThanOrEqual(layout.firstColumn!.bottom);
-    expect(layout.secondColumn!.left).toBeCloseTo(layout.firstColumn!.left, 0);
-    expect(layout.secondColumn!.right).toBeCloseTo(layout.firstColumn!.right, 0);
+    expect(layout.secondColumn!.top).toBeCloseTo(layout.firstColumn!.top, 0);
+    expect(layout.secondColumn!.left).toBeGreaterThan(layout.firstColumn!.right);
   });
 
   test('lets an administrator manage project metadata and columns with confirmations', async ({ page, request }) => {
