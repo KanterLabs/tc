@@ -367,6 +367,12 @@ back production; neither environment's job can select the other gateway.
 
 ## Backups and rollback
 
+For moving live project data between Helm installations, use the versioned
+[portable export/import format](docs/PORTABILITY.md). Portable imports are
+validated, dry-runnable, conflict-aware, additive, and transactional; they do
+not replace the database. The separate backup/restore workflow below remains
+the disaster-recovery path for exact SQLite state.
+
 Before each install, the host takes a SQLite online backup, verifies its
 checksum and `PRAGMA integrity_check`, and stores it under
 `/var/lib/roadmap/backups`. A pre-upgrade backup is complete only when its

@@ -4,12 +4,38 @@ export type TaskKind = 'task' | 'bug';
 export type BugSeverity = 's1' | 's2' | 's3' | 's4';
 export type BugResolution = 'fixed' | 'duplicate' | 'not_planned' | 'cannot_reproduce' | 'works_as_designed';
 export type ActorKind = 'human' | 'agent';
+export type ChecklistCompletionPolicy = 'warn' | 'require';
 export type Scope = 'projects:read' | 'projects:write' | 'tasks:read' | 'tasks:write' | 'tasks:claim' | 'events:read';
 
 /** States published by an agent while it is actively working a task. */
 export type AgentWorkState = 'working' | 'waiting' | 'verifying' | 'handoff';
 /** Published states plus server-derived collection filters. */
 export type AgentWorkStateFilter = AgentWorkState | 'stale' | 'missing';
+
+/** Stable ordering terms accepted by global search and saved views. */
+export interface SearchSort {
+  field: 'updated_at' | 'created_at' | 'due_at' | 'title' | 'key' | 'priority' | 'state' | 'position' | string;
+  direction: 'asc' | 'desc';
+}
+
+export interface SavedView {
+  id: string;
+  owner_id: string;
+  name: string;
+  description?: string;
+  filters: Record<string, unknown>;
+  sort: SearchSort[];
+  shared: boolean;
+  created_at?: string;
+  updated_at?: string;
+}
+
+export interface SearchResponse {
+  data: Task[];
+  next_cursor?: string | null;
+  projects?: Project[];
+  views?: SavedView[];
+}
 
 /**
  * The server's current, structured progress for an agent-owned task.
@@ -99,11 +125,13 @@ export interface Project {
   color: string;
   favorite: boolean;
   archived_at?: string;
+  checklist_completion_policy?: ChecklistCompletionPolicy;
   created_at?: string;
   updated_at?: string;
   task_count?: number;
   completed_task_count?: number;
   completed_count?: number;
+  version?: number;
 }
 
 /** Runtime task JSON uses actor IDs; the partial shape keeps old board fixtures compatible. */
@@ -115,6 +143,10 @@ export interface Column {
   name: string;
   semantic_state: SemanticState;
   position: number;
+  archived_at?: string;
+  version?: number;
+  /** Incremented whenever a card order in this column changes. */
+  ordering_version?: number;
   created_at?: string;
   updated_at?: string;
 }
@@ -189,6 +221,83 @@ export interface TaskDependencies {
   dependents: TaskReference[];
 }
 
+export interface TaskChecklistItem {
+  id: string;
+  task_id: string;
+  text: string;
+  position: number;
+  completed: boolean;
+  completed_at?: string | null;
+  completed_by?: string | null;
+  created_at?: string;
+  updated_at?: string;
+}
+
+export interface TaskChecklistSummary {
+  total: number;
+  completed: number;
+  open: number;
+  percent: number;
+  completion_policy: ChecklistCompletionPolicy;
+  warning: boolean;
+}
+
+export interface TaskChecklistCollection {
+  task_id: string;
+  version: number;
+  data: TaskChecklistItem[];
+  summary: TaskChecklistSummary;
+}
+
+export interface TaskChecklistItemInput {
+  text: string;
+  completed?: boolean;
+  position?: number;
+}
+
+export interface TaskChecklistItemPatch {
+  text?: string;
+  completed?: boolean;
+  position?: number;
+}
+
+/** A bounded parent/child relation reference returned by hierarchy reads. */
+export interface TaskHierarchyReference {
+  id: string;
+  number: number;
+  key: string;
+  project_id: string;
+  title: string;
+  kind?: TaskKind;
+  column_id: string;
+  semantic_state: SemanticState | string;
+  state?: SemanticState | string;
+  version: number;
+  parent_id?: string | null;
+  completed_at?: string | null;
+  agent_work?: AgentWork | null;
+}
+
+/** Server-derived direct-child rollups. */
+export interface HierarchySummary {
+  child_count: number;
+  completed_child_count: number;
+  completion_percent: number;
+  state_counts: Record<string, number>;
+  blocked_child_count: number;
+  live_agent_work_count: number;
+  action_needed_count: number;
+  stale_agent_work_count: number;
+}
+
+export interface TaskHierarchy {
+  parent?: TaskHierarchyReference | null;
+  children: TaskHierarchyReference[];
+  ancestors: TaskHierarchyReference[];
+  descendants: TaskHierarchyReference[];
+  summary: HierarchySummary;
+}
+
 export interface Task {
   id: string;
   number: number;
@@ -217,6 +326,13 @@ export interface Task {
   agent_work?: AgentWork | null;
   /** Present on current servers; optional keeps retained-server fixtures usable. */
   dependency_summary?: DependencySummary;
+  /** Ordered acceptance criteria; omitted by retained-server fixtures. */
+  checklist?: TaskChecklistItem[];
+  checklist_summary?: TaskChecklistSummary;
+  parent_task_id?: string | null;
+  parent_id?: string | null;
+  parent?: TaskHierarchyReference | null;
+  hierarchy_summary?: HierarchySummary;
 }
 
 export interface Comment {
@@ -224,8 +340,12 @@ export interface Comment {
   task_id: string;
   actor_id: string;
   body: string;
+  /** Optimistic-concurrency version used by edit/delete mutations. */
+  version?: number;
   created_at: string;
   updated_at: string;
+  /** Tombstones are retained by the server but omitted from active reads. */
+  deleted_at?: string;
   /** @deprecated The runtime response has no author object. */
   author?: Pick<Actor, 'name'> | string;
   /** @deprecated The runtime response has no actor object. */
@@ -321,6 +441,21 @@ export interface RoadmapSummary {
   upcoming_tasks?: Task[];
 }
 
+/** Server-authoritative issue health aggregate used by the Issues view. */
+export interface IssueMetrics {
+  reopened: number;
+  window_days: number;
+  since: string;
+  as_of: string;
+}
+
+/** Scalar navigation counts; no task rows are returned by this endpoint. */
+export interface SidebarCounts {
+  issues: number;
+  my_work: number;
+  view: 'live' | 'assigned';
+}
+
 export interface RoadmapProject {
   project: Project;
   total_tasks: number;
@@ -373,6 +508,62 @@ export interface Collection<T> {
   next_cursor?: string | null;
 }
 
+/** Versioned archive returned by the portable export endpoint. */
+export interface PortableArchive {
+  format: 'helm.portable' | string;
+  version: number;
+  exported_at?: string;
+  source?: { product?: string; api?: string };
+  projects: Array<Record<string, unknown>>;
+  columns?: Array<Record<string, unknown>>;
+  tasks?: Array<Record<string, unknown>>;
+  labels?: Array<Record<string, unknown>>;
+  actors?: Array<Record<string, unknown>>;
+  relationships?: Record<string, unknown>;
+  activity?: Record<string, unknown>;
+  comments?: Array<Record<string, unknown>>;
+  [key: string]: unknown;
+}
+
+export interface PortableImportCounts {
+  [key: string]: number;
+}
+
+export interface PortableImportRemap {
+  entity: string;
+  source: string;
+  target: string;
+  field?: string;
+  reason: string;
+}
+
+export interface PortableImportIssue {
+  entity: string;
+  id?: string;
+  field?: string;
+  message: string;
+}
+
+export interface PortableImportReport {
+  format: string;
+  version: number;
+  dry_run: boolean;
+  conflict: string;
+  counts: PortableImportCounts;
+  remaps: PortableImportRemap[];
+  warnings: string[];
+  errors: PortableImportIssue[];
+}
+
+export interface BoardDescriptor {
+  id: string;
+  project_id: string;
+  name: string;
+  slug: string;
+  default: boolean;
+  enabled: boolean;
+}
+
 export interface ApiErrorShape {
   error: {
     code: string;
@@ -403,6 +594,9 @@ export type TaskPatch = Partial<Pick<Task, 'title' | 'description' | 'priority' 
   assignee?: string | null;
   labels?: string[] | null;
   label_ids?: string[] | null;
+  parent?: string | null;
+  parent_id?: string | null;
+  parent_task_id?: string | null;
 };
 
 /** A server-owned board audit lifecycle state. */
@@ -473,15 +667,21 @@ export interface AuditFindingPatch {
   proposed_semantic_destination?: SemanticState | null;
 }
 
-/**
- * Explicit task reconciliation intent. `position` is accepted by the client
- * for forward-compatible servers but the current guarded move contract lets
- * the server allocate it atomically.
- */
+/** Explicit task reconciliation or precise board placement intent. */
 export interface TaskMoveInput {
   destination_column_id: string;
   expected_source_column_id: string;
   source: string;
   reason?: string;
+  before_task_id?: string;
+  after_task_id?: string;
+  placement?: 'first' | 'before' | 'between' | 'after' | 'last';
+  expected_ordering_version?: number;
+  expected_source_ordering_version?: number;
+  expected_destination_ordering_version?: number;
+  /** @deprecated The server allocates positions; use anchors instead. */
   position?: number;
 }
+
+/** Precise card placement intent used by the board drag and keyboard paths. */
+export type TaskReorderInput = TaskMoveInput;

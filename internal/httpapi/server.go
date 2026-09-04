@@ -559,13 +559,29 @@ func (s *Server) dispatchAuthed(w http.ResponseWriter, r *http.Request, identity
 			s.roadmap(w, r, identity, "", false)
 		case "my-work":
 			s.myWork(w, r, identity)
+		case "sidebar-counts":
+			s.sidebarCounts(w, r, identity)
+		case "search":
+			s.search(w, r, identity, "")
+		case "views":
+			s.savedViews(w, r, identity)
+		case "saved-views":
+			s.savedViews(w, r, identity)
 		case "issues":
 			s.issues(w, r, identity)
 		case "agents":
 			s.agents(w, r, identity)
+		case "export":
+			s.exportPortable(w, r, identity, "", false)
+		case "import":
+			s.importPortable(w, r, identity, "", false)
 		default:
 			s.writeError(w, http.StatusNotFound, "not_found", "route not found", nil)
 		}
+		return
+	}
+	if parts[0] == "issues" && len(parts) == 2 && parts[1] == "metrics" {
+		s.issueMetrics(w, r, identity)
 		return
 	}
 	if parts[0] == "projects" {
@@ -591,6 +607,12 @@ func (s *Server) dispatchAuthed(w http.ResponseWriter, r *http.Request, identity
 				s.roadmap(w, r, identity, parts[1], true)
 			case "audits":
 				s.audits(w, r, identity, parts[1], true)
+			case "export":
+				s.exportPortable(w, r, identity, parts[1], true)
+			case "import":
+				s.importPortable(w, r, identity, parts[1], true)
+			case "boards":
+				s.boards(w, r, identity, parts[1])
 			default:
 				s.writeError(w, http.StatusNotFound, "not_found", "route not found", nil)
 			}
@@ -599,6 +621,10 @@ func (s *Server) dispatchAuthed(w http.ResponseWriter, r *http.Request, identity
 	}
 	if parts[0] == "codex" {
 		s.codexAccount(w, r, identity, parts[1:])
+		return
+	}
+	if parts[0] == "import" && len(parts) == 2 && parts[1] == "trello" {
+		s.importTrello(w, r, identity)
 		return
 	}
 	if parts[0] == "columns" && len(parts) == 2 {
@@ -618,12 +644,20 @@ func (s *Server) dispatchAuthed(w http.ResponseWriter, r *http.Request, identity
 				s.taskTimeline(w, r, identity, parts[1])
 			case "dependencies":
 				s.taskDependencies(w, r, identity, parts[1], "")
+			case "checklist", "checklists":
+				s.taskChecklist(w, r, identity, parts[1], "")
+			case "hierarchy", "children", "ancestors", "descendants", "parent":
+				s.taskHierarchy(w, r, identity, parts[1], parts[2], "")
 			case "progress":
 				s.taskProgress(w, r, identity, parts[1])
 			case "heartbeat":
 				s.taskHeartbeat(w, r, identity, parts[1])
 			case "move":
 				s.taskMove(w, r, identity, parts[1])
+			case "restore":
+				s.restoreTask(w, r, identity, parts[1])
+			case "reorder":
+				s.taskReorder(w, r, identity, parts[1])
 			case "claim":
 				s.taskAction(w, r, identity, parts[1], "claim")
 			case "renew":
@@ -645,6 +679,22 @@ func (s *Server) dispatchAuthed(w http.ResponseWriter, r *http.Request, identity
 			s.taskDependencies(w, r, identity, parts[1], parts[3])
 			return
 		}
+		if len(parts) == 4 && (parts[2] == "checklist" || parts[2] == "checklists") {
+			if parts[3] == "reorder" {
+				s.taskChecklistReorder(w, r, identity, parts[1])
+			} else {
+				s.taskChecklist(w, r, identity, parts[1], parts[3])
+			}
+			return
+		}
+		if len(parts) == 4 && parts[2] == "comments" {
+			s.commentMutation(w, r, identity, parts[1], parts[3])
+			return
+		}
+		if len(parts) == 4 && parts[2] == "children" {
+			s.taskHierarchy(w, r, identity, parts[1], parts[2], parts[3])
+			return
+		}
 	}
 	if parts[0] == "audits" && len(parts) >= 2 {
 		if len(parts) == 2 {
@@ -662,6 +712,30 @@ func (s *Server) dispatchAuthed(w http.ResponseWriter, r *http.Request, identity
 			}
 			return
 		}
+	}
+	if parts[0] == "views" && len(parts) >= 2 {
+		if len(parts) == 2 {
+			s.savedView(w, r, identity, parts[1])
+			return
+		}
+		if len(parts) == 3 && (parts[2] == "search" || parts[2] == "tasks") {
+			s.search(w, r, identity, parts[1])
+			return
+		}
+	}
+	if parts[0] == "saved-views" && len(parts) >= 2 {
+		if len(parts) == 2 {
+			s.savedView(w, r, identity, parts[1])
+			return
+		}
+		if len(parts) == 3 && (parts[2] == "search" || parts[2] == "tasks") {
+			s.search(w, r, identity, parts[1])
+			return
+		}
+	}
+	if parts[0] == "search" && len(parts) == 2 && (parts[1] == "tasks" || parts[1] == "projects" || parts[1] == "views") {
+		s.search(w, r, identity, "")
+		return
 	}
 	if parts[0] == "audit-findings" && len(parts) == 2 {
 		s.auditFinding(w, r, identity, parts[1])
@@ -1066,6 +1140,28 @@ func bodyBytes(r *http.Request) []byte {
 	return nil
 }
 
+// idempotencyRequestHash includes import query options in the request
+// identity. Import behavior is selected by dry_run, conflict, and
+// target_project query values, so hashing only the JSON body could replay a
+// report for a different operation under the same Idempotency-Key.
+func idempotencyRequestHash(r *http.Request) string {
+	hash := sha256.New()
+	_, _ = hash.Write(bodyBytes(r))
+	if isPortableImportRequestPath(r.URL.Path) {
+		_, _ = hash.Write([]byte{0})
+		_, _ = hash.Write([]byte(r.URL.Query().Encode()))
+	}
+	return hex.EncodeToString(hash.Sum(nil))
+}
+
+func isPortableImportRequestPath(path string) bool {
+	if path == "/api/v1/import" || path == "/api/v1/import/trello" {
+		return true
+	}
+	parts := splitPath(strings.TrimPrefix(path, "/api/v1"))
+	return len(parts) == 3 && parts[0] == "projects" && parts[2] == "import"
+}
+
 func isBodyBearingMethod(method string) bool {
 	switch method {
 	case http.MethodPost, http.MethodPut, http.MethodPatch, http.MethodDelete:
@@ -1105,8 +1201,7 @@ func (s *Server) mutationWithAdmission(w http.ResponseWriter, r *http.Request, i
 		s.writeError(w, http.StatusBadRequest, "invalid_idempotency_key", "Idempotency-Key is too long", nil)
 		return
 	}
-	hash := sha256.Sum256(bodyBytes(r))
-	requestHash := hex.EncodeToString(hash[:])
+	requestHash := idempotencyRequestHash(r)
 	storeKey := idempotencyStoreKey(identity, key)
 	s.idemMu.Lock()
 	defer s.idemMu.Unlock()
@@ -1162,8 +1257,7 @@ func (s *Server) idempotencyReplay(w http.ResponseWriter, r *http.Request, ident
 		s.writeError(w, http.StatusBadRequest, "invalid_idempotency_key", "Idempotency-Key is too long", nil)
 		return true
 	}
-	hash := sha256.Sum256(bodyBytes(r))
-	requestHash := hex.EncodeToString(hash[:])
+	requestHash := idempotencyRequestHash(r)
 	storeKey := idempotencyStoreKey(identity, key)
 	s.idemMu.Lock()
 	record, found, err := s.Store.GetIdempotency(r.Context(), identity.Actor.ID, storeKey, r.Method, r.URL.Path, requestHash)
@@ -1239,10 +1333,32 @@ func (s *Server) writeStoreErrorForIdentity(w http.ResponseWriter, identity auth
 		status, code, message = http.StatusConflict, "unmet_dependencies", err.Error()
 	case errors.Is(err, store.ErrDependencyInUse):
 		status, code, message = http.StatusConflict, "dependency_in_use", err.Error()
+	case errors.Is(err, store.ErrChecklistLimitExceeded):
+		status, code, message = http.StatusBadRequest, "checklist_limit_exceeded", "checklist payload exceeds the configured limit"
+	case errors.Is(err, store.ErrChecklistIncomplete):
+		status, code, message = http.StatusConflict, "checklist_incomplete", err.Error()
+	case errors.Is(err, store.ErrHierarchySelfReference):
+		status, code, message = http.StatusBadRequest, "hierarchy_self_reference", err.Error()
+	case errors.Is(err, store.ErrHierarchyCrossProject):
+		status, code, message = http.StatusBadRequest, "hierarchy_cross_project", err.Error()
+	case errors.Is(err, store.ErrHierarchyAlreadyExists):
+		status, code, message = http.StatusConflict, "hierarchy_already_exists", err.Error()
+	case errors.Is(err, store.ErrHierarchyFanoutExceeded), errors.Is(err, store.ErrHierarchyLimitExceeded):
+		status, code, message = http.StatusBadRequest, "hierarchy_limit_exceeded", err.Error()
+	case errors.Is(err, store.ErrHierarchyDepthExceeded):
+		status, code, message = http.StatusBadRequest, "hierarchy_depth_exceeded", err.Error()
+	case errors.Is(err, store.ErrHierarchyCycle):
+		status, code, message = http.StatusConflict, "hierarchy_cycle", err.Error()
+	case errors.Is(err, store.ErrHierarchyNotFound):
+		status, code, message = http.StatusNotFound, "hierarchy_not_found", err.Error()
+	case errors.Is(err, store.ErrHierarchyInUse):
+		status, code, message = http.StatusConflict, "hierarchy_in_use", err.Error()
 	case errors.Is(err, store.ErrInvalid):
 		status, code, message = http.StatusBadRequest, "invalid_request", err.Error()
 	case errors.Is(err, store.ErrNotFound):
 		status, code, message = http.StatusNotFound, "not_found", err.Error()
+	case errors.Is(err, store.ErrTaskCollectionChanged):
+		status, code, message = http.StatusConflict, "task_collection_changed", err.Error()
 	case errors.Is(err, store.ErrConflict):
 		status, code, message = http.StatusConflict, "conflict", err.Error()
 	case errors.Is(err, store.ErrAlreadyExists):
@@ -1285,7 +1401,7 @@ func (s *Server) writeStoreErrorForIdentity(w http.ResponseWriter, identity auth
 // deliberately fails closed because a write-only token has no read contract
 // for either side of the relation.
 func redactDependencyDetails(identity auth.Identity, err error, details any) any {
-	if !identity.IsToken || identity.HasScope("tasks:read") || !isDependencyError(err) {
+	if !identity.IsToken || identity.HasScope("tasks:read") || (!isDependencyError(err) && !isHierarchyError(err)) {
 		return details
 	}
 	// Store error details are intentionally small maps today, but future
@@ -1321,13 +1437,32 @@ func isDependencyError(err error) bool {
 	return false
 }
 
+func isHierarchyError(err error) bool {
+	for _, candidate := range []error{
+		store.ErrHierarchySelfReference,
+		store.ErrHierarchyCrossProject,
+		store.ErrHierarchyAlreadyExists,
+		store.ErrHierarchyLimitExceeded,
+		store.ErrHierarchyFanoutExceeded,
+		store.ErrHierarchyDepthExceeded,
+		store.ErrHierarchyCycle,
+		store.ErrHierarchyNotFound,
+		store.ErrHierarchyInUse,
+	} {
+		if errors.Is(err, candidate) {
+			return true
+		}
+	}
+	return false
+}
+
 func redactDependencyValue(value any) any {
 	switch typed := value.(type) {
 	case map[string]any:
 		redacted := make(map[string]any, len(typed))
 		for key, child := range typed {
 			switch key {
-			case "id", "key", "title", "completed_at", "satisfied", "task_id", "prerequisite_id", "dependent_id", "prerequisite_task_id", "task_key", "task_title", "prerequisite_key", "dependent_key", "column_id", "path", "path_ids", "task_project_id", "prerequisite_project_id":
+			case "id", "key", "title", "completed_at", "satisfied", "task_id", "prerequisite_id", "dependent_id", "prerequisite_task_id", "task_key", "task_title", "prerequisite_key", "dependent_key", "column_id", "path", "path_ids", "task_project_id", "prerequisite_project_id", "parent_id", "parent_task_id", "child_id", "child_task_id", "parent_key", "child_key", "parent_project_id", "child_project_id":
 				continue
 			default:
 				redacted[key] = redactDependencyValue(child)

@@ -64,15 +64,61 @@ test('previews and selectively applies a Luna task draft', async ({ page }) => {
   await dialog.getByRole('button', { name: /Assist with Luna/ }).click();
   await expect(dialog.getByRole('heading', { name: 'Review before applying' })).toBeVisible();
 
-  await dialog.locator('.luna-preview-field').filter({ hasText: 'Priority' }).getByRole('button', { name: 'Apply' }).click();
-  await expect(dialog.getByLabel('Priority')).toHaveValue('high');
+  const titleSuggestion = dialog.locator('[data-luna-field="title"]');
+  const titleApply = titleSuggestion.getByRole('button');
+  await titleApply.click();
+  await expect(titleApply).toHaveText('✓ Applied');
+  await expect(titleApply).toBeDisabled();
+  await expect(dialog.getByRole('status')).toContainText('Title suggestion applied');
+  await dialog.getByLabel('Task title').fill('Edited before applying all');
+  await expect(titleSuggestion.getByRole('button', { name: /Apply title suggestion/ })).toHaveText('Apply');
+
+  const prioritySuggestion = dialog.locator('[data-luna-field="priority"]');
+  await prioritySuggestion.getByRole('button', { name: /Apply priority suggestion/ }).click();
+  await expect(dialog.locator('.task-details-fields').getByLabel('Priority')).toHaveValue('high');
   await dialog.getByRole('button', { name: 'Apply all' }).click();
+  await expect(dialog.getByRole('status')).toContainText('Luna applied all suggested fields');
+  await expect(dialog.getByRole('button', { name: '✓ All applied' })).toBeDisabled();
+  await expect(dialog.locator('#luna-suggestion-details')).toBeHidden();
+  const reviewSuggestion = dialog.getByRole('button', { name: 'Review suggestion', exact: true });
+  await expect(reviewSuggestion).toHaveAttribute('aria-expanded', 'false');
   await expect(dialog.getByLabel('Task title')).toHaveValue('Connect personal Codex subscriptions');
-  await expect(dialog.getByLabel(/Description/)).toHaveValue(/## Acceptance criteria/);
+  await expect(dialog.locator('.task-details-fields').getByLabel(/Description/)).toHaveValue(/## Acceptance criteria/);
+  await reviewSuggestion.click();
+  await expect(dialog.locator('#luna-suggestion-details')).toBeVisible();
+  await expect(dialog.getByRole('button', { name: 'Hide suggestion', exact: true })).toHaveAttribute('aria-expanded', 'true');
   await dialog.getByLabel('Task title').fill('Editable after Luna');
+  await expect(titleSuggestion.getByRole('button', { name: /Apply title suggestion/ })).toHaveText('Apply');
+  await expect(dialog.getByRole('status')).toContainText('Task details changed after applying');
+  await expect(dialog.getByRole('button', { name: 'Reapply all' })).toBeEnabled();
   await expect(dialog.getByRole('button', { name: 'Create task' })).toBeEnabled();
 
   await page.keyboard.press('Escape');
   await expect(dialog).toBeHidden();
   await expect(trigger).toBeFocused();
+});
+
+test('keeps the task modal within the viewport on desktop and mobile', async ({ page }) => {
+  for (const viewport of [{ width: 1280, height: 900 }, { width: 390, height: 844 }]) {
+    await page.setViewportSize(viewport);
+    await page.goto('/');
+    const trigger = page.getByRole('button', { name: 'New task', exact: true });
+    await trigger.click();
+    const dialog = page.getByRole('dialog', { name: 'Create a task' });
+    await expect(dialog).toBeVisible();
+    const geometry = await dialog.evaluate((element) => {
+      const box = element.getBoundingClientRect();
+      return {
+        left: box.left,
+        right: box.right,
+        viewportWidth: window.innerWidth,
+        hasHorizontalOverflow: element.scrollWidth > element.clientWidth + 1
+      };
+    });
+    expect(geometry.left).toBeGreaterThanOrEqual(0);
+    expect(geometry.right).toBeLessThanOrEqual(geometry.viewportWidth + 1);
+    expect(geometry.hasHorizontalOverflow).toBeFalsy();
+    await page.keyboard.press('Escape');
+    await expect(dialog).toBeHidden();
+  }
 });

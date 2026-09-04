@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"testing"
 	"time"
 
@@ -293,5 +294,81 @@ func TestProjectTimelineMergesNonDeletedTaskActivity(t *testing.T) {
 
 	if _, _, err := data.ListProjectTimeline(ctx, "missing-project", TaskTimelineFilter{}); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("missing project timeline error = %v, want ErrNotFound", err)
+	}
+}
+
+func TestTimelineSourceReadsAndPagesRespectBoundedLimits(t *testing.T) {
+	ctx := context.Background()
+	database, err := db.Open(ctx, ":memory:")
+	if err != nil {
+		t.Fatalf("open database: %v", err)
+	}
+	defer database.Close()
+	data := New(database)
+	actor, project, task := createAgentWorkFixture(t, data, ctx, "TIMELIMIT")
+	for index := 0; index < 205; index++ {
+		if _, err := data.CreateComment(ctx, task.ID, actor.ID, fmt.Sprintf("bounded comment %03d", index)); err != nil {
+			t.Fatalf("create comment %d: %v", index, err)
+		}
+	}
+	for index := 0; index < 205; index++ {
+		createdAt := time.Date(2026, 1, 2, 0, 0, index, 0, time.UTC).Format(time.RFC3339Nano)
+		if _, err := database.ExecContext(ctx, `INSERT INTO events(id, type, actor_id, project_id, task_id, payload, created_at) VALUES (?, 'task.updated', ?, ?, ?, '{}', ?)`, fmt.Sprintf("bounded-event-%03d", index), actor.ID, project.ID, task.ID, createdAt); err != nil {
+			t.Fatalf("create event %d: %v", index, err)
+		}
+	}
+
+	const sourceLimit = 4
+	boundary := timelineSortKey{}
+	histories, err := data.listTimelineHistory(ctx, task.ID, boundary, sourceLimit)
+	if err != nil {
+		t.Fatalf("read bounded task histories: %v", err)
+	}
+	comments, err := data.listTimelineComments(ctx, task.ID, boundary, sourceLimit)
+	if err != nil {
+		t.Fatalf("read bounded task comments: %v", err)
+	}
+	events, err := data.listTimelineEvents(ctx, task.ID, boundary, sourceLimit)
+	if err != nil {
+		t.Fatalf("read bounded task events: %v", err)
+	}
+	projectHistories, err := data.listProjectTimelineHistory(ctx, project.ID, boundary, sourceLimit)
+	if err != nil {
+		t.Fatalf("read bounded project histories: %v", err)
+	}
+	projectComments, err := data.listProjectTimelineComments(ctx, project.ID, boundary, sourceLimit)
+	if err != nil {
+		t.Fatalf("read bounded project comments: %v", err)
+	}
+	projectEvents, err := data.listProjectTimelineEvents(ctx, project.ID, boundary, sourceLimit)
+	if err != nil {
+		t.Fatalf("read bounded project events: %v", err)
+	}
+	for name, count := range map[string]int{
+		"task histories":    len(histories),
+		"task comments":     len(comments),
+		"task events":       len(events),
+		"project histories": len(projectHistories),
+		"project comments":  len(projectComments),
+		"project events":    len(projectEvents),
+	} {
+		if count > sourceLimit {
+			t.Fatalf("%s materialized %d rows, want at most %d", name, count, sourceLimit)
+		}
+	}
+
+	taskPage, taskMore, err := data.ListTaskTimeline(ctx, task.ID, TaskTimelineFilter{Limit: 10000})
+	if err != nil {
+		t.Fatalf("read capped task timeline: %v", err)
+	}
+	if len(taskPage) != 200 || !taskMore {
+		t.Fatalf("capped task timeline = %d rows, more=%v; want 200 rows and more", len(taskPage), taskMore)
+	}
+	projectPage, projectMore, err := data.ListProjectTimeline(ctx, project.ID, TaskTimelineFilter{Limit: 10000})
+	if err != nil {
+		t.Fatalf("read capped project timeline: %v", err)
+	}
+	if len(projectPage) != 200 || !projectMore {
+		t.Fatalf("capped project timeline = %d rows, more=%v; want 200 rows and more", len(projectPage), projectMore)
 	}
 }

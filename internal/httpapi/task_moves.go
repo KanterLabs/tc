@@ -85,7 +85,9 @@ func decodeTaskMoveInput(r *http.Request) (store.TaskMoveInput, error) {
 		switch name {
 		case "destination_column_id", "destination_column", "to_column_id", "to_column", "column_id", "column",
 			"expected_source_column_id", "source_column_id", "from_column_id", "expected_column_id", "source_column", "from_column",
-			"source", "reason":
+			"source", "reason", "before_task_id", "before_task", "before", "after_task_id", "after_task", "after",
+			"placement", "expected_ordering_version", "ordering_version", "expected_source_ordering_version", "source_ordering_version",
+			"expected_destination_ordering_version", "destination_ordering_version":
 		default:
 			return store.TaskMoveInput{}, taskInputError("unknown task move field: " + name)
 		}
@@ -107,12 +109,68 @@ func decodeTaskMoveInput(r *http.Request) (store.TaskMoveInput, error) {
 	if err != nil {
 		return store.TaskMoveInput{}, err
 	}
+	before, err := parseTaskMoveIdentifier(fields, "before task", []string{"before_task_id", "before_task", "before"}, false)
+	if err != nil {
+		return store.TaskMoveInput{}, err
+	}
+	after, err := parseTaskMoveIdentifier(fields, "after task", []string{"after_task_id", "after_task", "after"}, false)
+	if err != nil {
+		return store.TaskMoveInput{}, err
+	}
+	placement, err := parseTaskMoveMoveText(fields, "placement", maxTaskMoveHTTPIdentifierLength, false)
+	if err != nil {
+		return store.TaskMoveInput{}, err
+	}
+	expectedOrderingVersion, err := parseTaskMoveInt64Aliases(fields, "ordering version", []string{"expected_ordering_version", "ordering_version"})
+	if err != nil {
+		return store.TaskMoveInput{}, err
+	}
+	expectedSourceOrderingVersion, err := parseTaskMoveInt64Aliases(fields, "source ordering version", []string{"expected_source_ordering_version", "source_ordering_version"})
+	if err != nil {
+		return store.TaskMoveInput{}, err
+	}
+	expectedDestinationOrderingVersion, err := parseTaskMoveInt64Aliases(fields, "destination ordering version", []string{"expected_destination_ordering_version", "destination_ordering_version"})
+	if err != nil {
+		return store.TaskMoveInput{}, err
+	}
 	return store.TaskMoveInput{
-		DestinationColumnID:    destination,
-		ExpectedSourceColumnID: expectedSource,
-		Source:                 source,
-		Reason:                 reason,
+		DestinationColumnID:                destination,
+		ExpectedSourceColumnID:             expectedSource,
+		Source:                             source,
+		Reason:                             reason,
+		BeforeTaskID:                       before,
+		AfterTaskID:                        after,
+		Placement:                          strings.ToLower(strings.TrimSpace(placement)),
+		ExpectedOrderingVersion:            expectedOrderingVersion,
+		ExpectedSourceOrderingVersion:      expectedSourceOrderingVersion,
+		ExpectedDestinationOrderingVersion: expectedDestinationOrderingVersion,
 	}, nil
+}
+
+func parseTaskMoveInt64Aliases(fields map[string]json.RawMessage, label string, names []string) (int64, error) {
+	var value int64
+	found := false
+	for _, name := range names {
+		raw, present := fields[name]
+		if !present {
+			continue
+		}
+		if isJSONNull(raw) {
+			return 0, taskInputError(label + " cannot be null")
+		}
+		var parsed int64
+		if err := json.Unmarshal(raw, &parsed); err != nil {
+			return 0, taskInputError(label + " must be an integer")
+		}
+		if found && parsed != value {
+			return 0, taskInputError(label + " aliases must agree")
+		}
+		value, found = parsed, true
+	}
+	if value < 0 {
+		return 0, taskInputError(label + " must be non-negative")
+	}
+	return value, nil
 }
 
 func parseTaskMoveIdentifier(fields map[string]json.RawMessage, label string, names []string, required bool) (string, error) {

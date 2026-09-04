@@ -1,6 +1,6 @@
 <script context="module" lang="ts">
   import type { AgentWork } from '../types';
-  export { agentPulseAccessibleLabel } from './agentPulseText';
+  export { agentPulseAccessibleLabel, agentPulseExactTimestamp, agentPulseRelativeTimestamp } from './agentPulseText';
 
   export type AgentWorkState = AgentWork['state'];
   export type AgentWorkLike = Partial<AgentWork>;
@@ -8,7 +8,10 @@
 
 <script lang="ts">
   import type { Task } from '../types';
-  import { agentPulseAccessibleLabel } from './agentPulseText';
+  import {
+    agentPulseExactTimestamp,
+    agentPulseRelativeTimestamp
+  } from './agentPulseText';
 
   export let task: Task;
   export let now = Date.now();
@@ -39,6 +42,11 @@
   $: claimExpiry = task.claim_expires_at || '';
   $: claimExpired = Boolean(claimExpiry && parseDate(claimExpiry) <= now);
   $: claimCountdown = claimExpiry ? formatCountdown(claimExpiry, now) : '';
+  $: claimExpiringSoon = Boolean(
+    claimExpiry
+    && !claimExpired
+    && parseDate(claimExpiry) - now <= 5 * 60 * 1000
+  );
   $: claimOwner = actorFromTask(task) || '';
   $: stale = Boolean(work && (work.stale || staleByAge(state, updatedAt, now)));
   $: actionNeeded = Boolean(work && (work.action_needed || stale || state === 'waiting' || state === 'handoff'));
@@ -46,8 +54,6 @@
   // icon so a busy board reads as moving without flashing attention states.
   $: live = Boolean(work && !stale && !actionNeeded && state === 'working');
   $: stateLabel = stale && state !== 'waiting' ? 'Stale' : baseStateLabel;
-  $: label = agentPulseAccessibleLabel(task, now, actorLabel || work?.actor_id || '');
-
   function readWork(value: Task): AgentWorkLike | null {
     const candidate = (value as Task & { agent_work?: unknown }).agent_work;
     return candidate && typeof candidate === 'object' ? candidate as AgentWorkLike : null;
@@ -93,58 +99,46 @@
     return `${days}d${hours % 24 ? ` ${hours % 24}h` : ''} left`;
   }
 
-  function formatRelative(value: string, timestamp: number): string {
-    const parsed = parseDate(value);
-    if (!Number.isFinite(parsed)) return 'Unknown update time';
-    const difference = Math.round((parsed - timestamp) / 60000);
-    const absolute = Math.abs(difference);
-    if (absolute < 1) return 'just now';
-    if (absolute < 60) return `${absolute}m ${difference < 0 ? 'ago' : 'from now'}`;
-    const hours = Math.round(absolute / 60);
-    if (hours < 24) return `${hours}h ${difference < 0 ? 'ago' : 'from now'}`;
-    const days = Math.round(hours / 24);
-    return `${days}d ${difference < 0 ? 'ago' : 'from now'}`;
-  }
-
   function staleByAge(_currentState: string, value: string, timestamp: number): boolean {
     if (!value) return false;
     const age = timestamp - parseDate(value);
     return Number.isFinite(age) && age >= 15 * 60 * 1000;
   }
-
-  function formatExact(value: string): string {
-    const parsed = new Date(value);
-    if (Number.isNaN(parsed.getTime())) return value;
-    return new Intl.DateTimeFormat(undefined, {
-      year: 'numeric',
-      month: 'short',
-      day: 'numeric',
-      hour: 'numeric',
-      minute: '2-digit',
-      timeZoneName: 'short'
-    }).format(parsed);
-  }
 </script>
 
-<div class:compact class:missing class:stale class:live class:needsAction={actionNeeded} class="agent-pulse" role="img" aria-label={label}>
+<div
+  class:compact
+  class:missing
+  class:stale
+  class:live
+  class:needsAction={actionNeeded}
+  class="agent-pulse"
+  role="group"
+  aria-labelledby={`agent-pulse-${task.id}-state`}
+  aria-describedby={`agent-pulse-${task.id}-details`}
+  data-agent-pulse
+>
   <span class="agent-pulse-icon" aria-hidden="true">{missing ? '?' : stateIcons[state] || '•'}</span>
-  <span class="agent-pulse-copy">
-    <strong>{stateLabel}</strong>
+  <span class="agent-pulse-copy" id={`agent-pulse-${task.id}-details`}>
+    <strong id={`agent-pulse-${task.id}-state`}>{stateLabel}</strong>
     {#if stale && state === 'waiting'}<span class="agent-pulse-secondary">Stale update</span>{:else if stale && baseStateLabel !== stateLabel}<span class="agent-pulse-secondary">{baseStateLabel} update is stale</span>{:else if actionNeeded}<span class="agent-pulse-secondary">Action needed</span>{/if}
     {#if work?.actor_id || actorLabel}<span class="agent-pulse-agent">Agent {actorLabel || work?.actor_id}</span>{/if}
     {#if work?.phase}<span class="agent-pulse-phase">{work.phase}</span>{/if}
     {#if missing}<span class="agent-pulse-missing-copy">{task.claimed_by ? 'Claimed work has no live update' : 'No live agent update yet'}</span>{/if}
     {#if progress}
-      <span class="agent-pulse-progress" aria-label={`${progress.completed} of ${progress.total} checkpoints complete`}>
-        <span class="agent-pulse-track"><span style={`width: ${progress.percent}%`}></span></span>
-        <small>{progress.completed}/{progress.total}</small>
+      <span class="agent-pulse-progress">
+        <span class="agent-pulse-progress-label">Progress: {progress.completed} of {progress.total} checkpoints ({progress.percent}%)</span>
+        <span class="agent-pulse-track" aria-hidden="true"><span style={`width: ${progress.percent}%`}></span></span>
       </span>
+    {:else}{#if !updatedAt && !claimExpiry}<span class="agent-pulse-details">No timestamped agent details</span>{/if}
     {/if}
-    {#if updatedAt}<time datetime={updatedAt}>Updated {formatRelative(updatedAt, now)}</time>{/if}
-    {#if claimExpiry}
-      <span class:expired={claimExpired} class="agent-pulse-claim">
+    {#if updatedAt}<time datetime={updatedAt} title={agentPulseExactTimestamp(updatedAt)}>Updated {agentPulseRelativeTimestamp(updatedAt, now)} · {agentPulseExactTimestamp(updatedAt)}</time>{/if}
+    {#if task.claimed_by || claimExpiry}
+      <span class:expired={claimExpired} class:claimExpiringSoon={claimExpiringSoon} class="agent-pulse-claim">
         <span>{claimOwner ? `Claimed by ${claimOwner}` : 'Claimed'}</span>
-        <time datetime={claimExpiry}>· {claimExpired ? 'Expired' : claimCountdown} · {formatExact(claimExpiry)}</time>
+        {#if claimExpiry}<time datetime={claimExpiry} title={agentPulseExactTimestamp(claimExpiry)}>· {claimExpired ? 'Expired' : claimCountdown} · {agentPulseExactTimestamp(claimExpiry)}</time>{:else}<span>· no expiry reported</span>{/if}
+        {#if task.version}<span>· task version v{task.version}</span>{/if}
+        {#if claimExpiringSoon}<strong>· expiring soon</strong>{/if}
       </span>
     {/if}
   </span>

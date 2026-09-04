@@ -1,4 +1,6 @@
 <script lang="ts">
+  import { renderMarkdown } from '../markdown';
+  import { sortTimelineItems } from '../timeline';
   import type {
     Task,
     TaskTimelineFilter,
@@ -41,10 +43,7 @@
   $: touchedTaskCount = new Set(visibleItems.map((item) => item.task_id)).size;
 
   function sortItems(source: TaskTimelineItem[]): TaskTimelineItem[] {
-    return source
-      .map((item, index) => ({ item, index, timestamp: timestampFor(item.created_at) }))
-      .sort((left, right) => right.timestamp - left.timestamp || left.index - right.index)
-      .map(({ item }) => item);
+    return sortTimelineItems(source);
   }
 
   function timestampFor(value: string): number {
@@ -175,7 +174,9 @@
       'bug.triaged': 'triaged the bug',
       'bug.resolved': 'resolved the bug',
       'bug.reopened': 'reopened the bug',
-      'bug.duplicated': 'marked the bug as a duplicate'
+      'bug.duplicated': 'marked the bug as a duplicate',
+      'comment.updated': 'edited a comment',
+      'comment.deleted': 'deleted a comment'
     };
     return labels[type] || type.replace(/[._-]+/g, ' ').replace(/\b\w/g, (letter) => letter.toUpperCase());
   }
@@ -337,7 +338,7 @@
                         <b>Checkpoints</b> {checkpointLabel(item)}{#if checkpointPreview(item)}<span> · {checkpointPreview(item)}</span>{/if}
                       </span>
                     {:else if item.kind === 'comment' && item.comment}
-                      <span class="board-timeline-comment">{item.comment.body || 'Comment added.'}</span>
+                      <span class="board-timeline-comment">{@html renderMarkdown(item.comment.body || 'Comment added.')}</span>
                     {:else if item.kind === 'task_change'}
                       <span class="board-timeline-change"><strong>{changeLabel(item)}</strong>{#if changeContext(item)}<span> · {changeContext(item)}</span>{/if}</span>
                     {/if}

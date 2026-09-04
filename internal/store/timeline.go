@@ -5,7 +5,6 @@ import (
 	"database/sql"
 	"encoding/base64"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"sort"
 	"strings"
@@ -152,10 +151,6 @@ func decodeTaskTimelineCursor(value string) (timelineSortKey, error) {
 	return newTimelineSortKey(payload.CreatedAt, payload.Kind, payload.ID, payload.EventCursor), nil
 }
 
-func timelineCandidateBefore(candidate, boundary timelineSortKey) bool {
-	return compareTimelineKeys(candidate, boundary) < 0
-}
-
 type timelineActorRow struct {
 	id   string
 	kind string
@@ -190,16 +185,19 @@ type timelineHistoryRow struct {
 	startedAt, createdAt                                                string
 	generatedCommentID                                                  sql.NullString
 	progressEventCursor                                                 sql.NullInt64
+	timelineEventCursor                                                 int64
 	actorKind, actorName                                                sql.NullString
 }
 
 type timelineCommentRow struct {
 	comment                       Comment
+	timelineEventCursor           int64
 	actorID, actorKind, actorName sql.NullString
 }
 
 type timelineEventRow struct {
-	event Event
+	event                         Event
+	actorID, actorKind, actorName sql.NullString
 }
 
 type timelineProjectEventRow struct {
@@ -208,9 +206,9 @@ type timelineProjectEventRow struct {
 }
 
 // ListTaskTimeline returns one stable newest-first page of the unified task
-// activity stream. It deliberately reads the three durable sources separately
-// and merges their typed rows in Go: this keeps legacy comments/events visible
-// without pretending they contain fields that were never persisted.
+// activity stream. Each durable source is read with the same keyset boundary
+// and a limit-sized lookahead before the typed rows are merged in Go. This
+// keeps legacy comments/events visible without materializing the full history.
 func (s *Store) ListTaskTimeline(ctx context.Context, taskID string, filter TaskTimelineFilter) ([]TaskTimelineItem, bool, error) {
 	if filter.Limit <= 0 {
 		filter.Limit = 50
@@ -238,169 +236,11 @@ func (s *Store) ListTaskTimeline(ctx context.Context, taskID string, filter Task
 		return nil, false, notFound("task not found")
 	}
 
-	histories, err := s.listTimelineHistory(ctx, taskID)
+	candidates, err := s.listTaskTimelineCandidates(ctx, taskID, filter, boundary)
 	if err != nil {
 		return nil, false, err
 	}
-	generatedComments := make(map[string]struct{}, len(histories))
-	historyEvents := make(map[int64]struct{}, len(histories))
-	candidates := make([]timelineCandidate, 0, len(histories))
-	for _, row := range histories {
-		refs, err := decodeTimelineCheckpointRefs(row.refsJSON)
-		if err != nil {
-			return nil, false, err
-		}
-		progress := &TaskTimelineProgress{
-			OperationID:    row.operationID,
-			ActorID:        row.actorID,
-			State:          row.state,
-			Phase:          row.phase,
-			Summary:        row.summary,
-			NextAction:     row.nextAction,
-			CheckpointRefs: refs,
-			StartedAt:      row.startedAt,
-		}
-		if row.completed.Valid {
-			value := int(row.completed.Int64)
-			progress.CheckpointCompleted = &value
-		}
-		if row.total.Valid {
-			value := int(row.total.Int64)
-			progress.CheckpointTotal = &value
-		}
-		if row.generatedCommentID.Valid && row.generatedCommentID.String != "" {
-			generatedComments[row.generatedCommentID.String] = struct{}{}
-		}
-		eventCursor := int64(0)
-		if row.progressEventCursor.Valid {
-			eventCursor = row.progressEventCursor.Int64
-			if eventCursor > 0 {
-				historyEvents[eventCursor] = struct{}{}
-			}
-		}
-		item := TaskTimelineItem{
-			ID:        row.id,
-			Kind:      "agent_progress",
-			TaskID:    row.taskID,
-			Actor:     timelineActor(sql.NullString{String: row.actorID, Valid: row.actorID != ""}, row.actorKind, row.actorName),
-			CreatedAt: row.createdAt,
-			Progress:  progress,
-			Comment:   nil,
-			Change:    nil,
-		}
-		candidates = append(candidates, timelineCandidate{item: item, key: newTimelineSortKey(row.createdAt, item.Kind, item.ID, eventCursor)})
-	}
-
-	comments, err := s.listTimelineComments(ctx, taskID)
-	if err != nil {
-		return nil, false, err
-	}
-	commentEventCursors := make(map[string]int64, len(comments))
-	for _, row := range comments {
-		if _, generated := generatedComments[row.comment.ID]; generated {
-			continue
-		}
-		item := TaskTimelineItem{
-			ID:        row.comment.ID,
-			Kind:      "comment",
-			TaskID:    row.comment.TaskID,
-			Actor:     timelineActor(row.actorID, row.actorKind, row.actorName),
-			CreatedAt: row.comment.CreatedAt,
-			Progress:  nil,
-			Comment:   &row.comment,
-			Change:    nil,
-		}
-		// The matching comment.created event, when present, gives this comment
-		// the same stable append sequence as task changes. Legacy comments that
-		// predate the event feed remain usable through timestamp/id ordering.
-		candidates = append(candidates, timelineCandidate{item: item, key: newTimelineSortKey(row.comment.CreatedAt, item.Kind, item.ID, 0)})
-		commentEventCursors[row.comment.ID] = 0
-	}
-
-	events, err := s.listTimelineEvents(ctx, taskID)
-	if err != nil {
-		return nil, false, err
-	}
-	for _, row := range events {
-		event := row.event
-		commentID := timelineCommentID(event)
-		if event.Type == "comment.created" && commentID != "" {
-			if _, generated := generatedComments[commentID]; generated {
-				continue
-			}
-			if _, exists := commentEventCursors[commentID]; exists {
-				// The comment itself is the timeline item; do not emit a second
-				// system row for its comment.created event.
-				commentEventCursors[commentID] = event.Cursor
-				for index := range candidates {
-					if candidates[index].item.Kind == "comment" && candidates[index].item.ID == commentID {
-						candidates[index].key.eventCursor = event.Cursor
-						break
-					}
-				}
-				continue
-			}
-			// A malformed or orphaned comment event remains visible as a
-			// generic task change rather than disappearing from legacy history.
-		}
-		if event.Type == "task.progressed" {
-			if _, linked := historyEvents[event.Cursor]; linked {
-				continue
-			}
-			// An event written before migration 011 has no structured history
-			// row. Keep it as a generic change; never infer rich progress data.
-		}
-		actorID := sql.NullString{}
-		if event.ActorID != nil {
-			actorID = sql.NullString{String: *event.ActorID, Valid: true}
-		}
-		actor := s.timelineActorForID(ctx, actorID)
-		item := TaskTimelineItem{
-			ID:        event.ID,
-			Kind:      "task_change",
-			TaskID:    taskID,
-			Actor:     actor,
-			CreatedAt: event.CreatedAt,
-			Progress:  nil,
-			Comment:   nil,
-			Change: &TaskTimelineChange{
-				EventID:   event.ID,
-				EventType: event.Type,
-				Payload:   event.Payload,
-			},
-		}
-		candidates = append(candidates, timelineCandidate{item: item, key: newTimelineSortKey(event.CreatedAt, item.Kind, item.ID, event.Cursor)})
-	}
-
-	filtered := candidates[:0]
-	for _, candidate := range candidates {
-		if filter.Kind != "" && candidate.item.Kind != filter.Kind {
-			continue
-		}
-		if filter.Before != "" && !timelineCandidateBefore(candidate.key, boundary) {
-			continue
-		}
-		filtered = append(filtered, candidate)
-	}
-	sort.SliceStable(filtered, func(i, j int) bool {
-		return compareTimelineKeys(filtered[i].key, filtered[j].key) > 0
-	})
-	for index := range filtered {
-		cursor, err := encodeTaskTimelineCursor(filtered[index].key)
-		if err != nil {
-			return nil, false, err
-		}
-		filtered[index].item.Cursor = cursor
-	}
-	hasMore := len(filtered) > filter.Limit
-	if hasMore {
-		filtered = filtered[:filter.Limit]
-	}
-	result := make([]TaskTimelineItem, len(filtered))
-	for index := range filtered {
-		result[index] = filtered[index].item
-	}
-	return result, hasMore, nil
+	return finishTimelinePage(candidates, filter.Limit)
 }
 
 // ListProjectTimeline returns one stable newest-first page containing the
@@ -433,40 +273,11 @@ func (s *Store) ListProjectTimeline(ctx context.Context, projectID string, filte
 		return nil, false, notFound("project not found")
 	}
 
-	candidates, err := s.listProjectTimelineCandidates(ctx, projectID)
+	candidates, err := s.listProjectTimelineCandidates(ctx, projectID, filter, boundary)
 	if err != nil {
 		return nil, false, err
 	}
-
-	filtered := candidates[:0]
-	for _, candidate := range candidates {
-		if filter.Kind != "" && candidate.item.Kind != filter.Kind {
-			continue
-		}
-		if filter.Before != "" && !timelineCandidateBefore(candidate.key, boundary) {
-			continue
-		}
-		filtered = append(filtered, candidate)
-	}
-	sort.SliceStable(filtered, func(i, j int) bool {
-		return compareTimelineKeys(filtered[i].key, filtered[j].key) > 0
-	})
-	for index := range filtered {
-		cursor, err := encodeTaskTimelineCursor(filtered[index].key)
-		if err != nil {
-			return nil, false, err
-		}
-		filtered[index].item.Cursor = cursor
-	}
-	hasMore := len(filtered) > filter.Limit
-	if hasMore {
-		filtered = filtered[:filter.Limit]
-	}
-	result := make([]TaskTimelineItem, len(filtered))
-	for index := range filtered {
-		result[index] = filtered[index].item
-	}
-	return result, hasMore, nil
+	return finishTimelinePage(candidates, filter.Limit)
 }
 
 // ListTimeline is a concise alias for callers that do not need the task
@@ -475,70 +286,188 @@ func (s *Store) ListTimeline(ctx context.Context, taskID string, filter Timeline
 	return s.ListTaskTimeline(ctx, taskID, filter)
 }
 
-func (s *Store) listTimelineHistory(ctx context.Context, taskID string) ([]timelineHistoryRow, error) {
-	rows, err := s.DB.QueryContext(ctx, `SELECT h.id, h.task_id, h.operation_id, h.actor_id, h.state, h.phase, h.summary, h.next_action, h.checkpoint_refs, h.checkpoint_completed, h.checkpoint_total, h.started_at, h.created_at, h.generated_comment_id, h.progress_event_cursor, a.kind, a.name FROM task_agent_work_history h LEFT JOIN actors a ON a.id=h.actor_id WHERE h.task_id=? ORDER BY h.created_at DESC, h.id DESC`, taskID)
-	if err != nil {
-		return nil, err
+// timelineKeysetPredicate mirrors compareTimelineKeys for one fixed source.
+// A source has one kind/rank, so the final kind/id comparison is constant for
+// all rows except when the boundary has that same kind. Persisted activity
+// timestamps are UTC RFC3339Nano strings, which lets the indexed text ordering
+// match the normalized cursor ordering without loading rows into Go first.
+func timelineKeysetPredicate(createdExpr, eventCursorExpr, idExpr, kind string, boundary timelineSortKey) (string, []any) {
+	if boundary.createdRaw == "" {
+		return "", nil
 	}
-	defer rows.Close()
-	result := make([]timelineHistoryRow, 0)
-	for rows.Next() {
-		var row timelineHistoryRow
-		if err := rows.Scan(&row.id, &row.taskID, &row.operationID, &row.actorID, &row.state, &row.phase, &row.summary, &row.nextAction, &row.refsJSON, &row.completed, &row.total, &row.startedAt, &row.createdAt, &row.generatedCommentID, &row.progressEventCursor, &row.actorKind, &row.actorName); err != nil {
-			return nil, err
-		}
-		result = append(result, row)
+	predicate := fmt.Sprintf("%s < ? OR (%s = ? AND %s < ?)", createdExpr, createdExpr, eventCursorExpr)
+	args := []any{boundary.createdRaw, boundary.createdRaw, boundary.eventCursor}
+	sourceRank := timelineKindRank(kind)
+	switch {
+	case sourceRank < boundary.kindRank:
+		predicate += fmt.Sprintf(" OR (%s = ? AND %s = ?)", createdExpr, eventCursorExpr)
+		args = append(args, boundary.createdRaw, boundary.eventCursor)
+	case sourceRank == boundary.kindRank:
+		predicate += fmt.Sprintf(" OR (%s = ? AND %s = ? AND %s < ?)", createdExpr, eventCursorExpr, idExpr)
+		args = append(args, boundary.createdRaw, boundary.eventCursor, boundary.id)
 	}
-	return result, rows.Err()
+	return "(" + predicate + ")", args
 }
 
-func (s *Store) listTimelineComments(ctx context.Context, taskID string) ([]timelineCommentRow, error) {
-	rows, err := s.DB.QueryContext(ctx, `SELECT c.id, c.task_id, c.actor_id, c.body, c.created_at, c.updated_at, a.id, a.kind, a.name FROM comments c LEFT JOIN actors a ON a.id=c.actor_id WHERE c.task_id=? ORDER BY c.created_at DESC, c.id DESC`, taskID)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	result := make([]timelineCommentRow, 0)
-	for rows.Next() {
-		var row timelineCommentRow
-		if err := rows.Scan(&row.comment.ID, &row.comment.TaskID, &row.comment.ActorID, &row.comment.Body, &row.comment.CreatedAt, &row.comment.UpdatedAt, &row.actorID, &row.actorKind, &row.actorName); err != nil {
-			return nil, err
+func finishTimelinePage(candidates []timelineCandidate, limit int) ([]TaskTimelineItem, bool, error) {
+	sort.SliceStable(candidates, func(i, j int) bool {
+		return compareTimelineKeys(candidates[i].key, candidates[j].key) > 0
+	})
+	for index := range candidates {
+		cursor, err := encodeTaskTimelineCursor(candidates[index].key)
+		if err != nil {
+			return nil, false, err
 		}
-		result = append(result, row)
+		candidates[index].item.Cursor = cursor
 	}
-	return result, rows.Err()
+	hasMore := len(candidates) > limit
+	if hasMore {
+		candidates = candidates[:limit]
+	}
+	result := make([]TaskTimelineItem, len(candidates))
+	for index := range candidates {
+		result[index] = candidates[index].item
+	}
+	return result, hasMore, nil
 }
 
-func (s *Store) listTimelineEvents(ctx context.Context, taskID string) ([]timelineEventRow, error) {
-	rows, err := s.DB.QueryContext(ctx, `SELECT cursor, id, type, actor_id, project_id, task_id, payload, created_at FROM events WHERE task_id=? ORDER BY created_at DESC, type DESC, cursor DESC`, taskID)
+func timelineHistoryCandidate(row timelineHistoryRow) (timelineCandidate, error) {
+	refs, err := decodeTimelineCheckpointRefs(row.refsJSON)
 	if err != nil {
-		return nil, err
+		return timelineCandidate{}, err
 	}
-	defer rows.Close()
-	result := make([]timelineEventRow, 0)
-	for rows.Next() {
-		event, err := scanEvent(rows)
+	progress := &TaskTimelineProgress{
+		OperationID:    row.operationID,
+		ActorID:        row.actorID,
+		State:          row.state,
+		Phase:          row.phase,
+		Summary:        row.summary,
+		NextAction:     row.nextAction,
+		CheckpointRefs: refs,
+		StartedAt:      row.startedAt,
+	}
+	if row.completed.Valid {
+		value := int(row.completed.Int64)
+		progress.CheckpointCompleted = &value
+	}
+	if row.total.Valid {
+		value := int(row.total.Int64)
+		progress.CheckpointTotal = &value
+	}
+	item := TaskTimelineItem{
+		ID:        row.id,
+		Kind:      "agent_progress",
+		TaskID:    row.taskID,
+		Actor:     timelineActor(sql.NullString{String: row.actorID, Valid: row.actorID != ""}, row.actorKind, row.actorName),
+		CreatedAt: row.createdAt,
+		Progress:  progress,
+		Comment:   nil,
+		Change:    nil,
+	}
+	return timelineCandidate{item: item, key: newTimelineSortKey(row.createdAt, item.Kind, item.ID, row.timelineEventCursor)}, nil
+}
+
+func timelineCommentCandidate(row timelineCommentRow) timelineCandidate {
+	item := TaskTimelineItem{
+		ID:        row.comment.ID,
+		Kind:      "comment",
+		TaskID:    row.comment.TaskID,
+		Actor:     timelineActor(row.actorID, row.actorKind, row.actorName),
+		CreatedAt: row.comment.CreatedAt,
+		Progress:  nil,
+		Comment:   &row.comment,
+		Change:    nil,
+	}
+	return timelineCandidate{item: item, key: newTimelineSortKey(row.comment.CreatedAt, item.Kind, item.ID, row.timelineEventCursor)}
+}
+
+func timelineEventCandidate(event Event, actorID, actorKind, actorName sql.NullString, taskID string) timelineCandidate {
+	item := TaskTimelineItem{
+		ID:        event.ID,
+		Kind:      "task_change",
+		TaskID:    taskID,
+		Actor:     timelineActor(actorID, actorKind, actorName),
+		CreatedAt: event.CreatedAt,
+		Progress:  nil,
+		Comment:   nil,
+		Change: &TaskTimelineChange{
+			EventID:   event.ID,
+			EventType: event.Type,
+			Payload:   event.Payload,
+		},
+	}
+	return timelineCandidate{item: item, key: newTimelineSortKey(event.CreatedAt, item.Kind, item.ID, event.Cursor)}
+}
+
+func (s *Store) listTaskTimelineCandidates(ctx context.Context, taskID string, filter TaskTimelineFilter, boundary timelineSortKey) ([]timelineCandidate, error) {
+	sourceLimit := filter.Limit + 1
+	candidates := make([]timelineCandidate, 0, sourceLimit*3)
+	if filter.Kind == "" || filter.Kind == "agent_progress" {
+		histories, err := s.listTimelineHistory(ctx, taskID, boundary, sourceLimit)
 		if err != nil {
 			return nil, err
 		}
-		result = append(result, timelineEventRow{event: event})
+		for _, row := range histories {
+			candidate, err := timelineHistoryCandidate(row)
+			if err != nil {
+				return nil, err
+			}
+			candidates = append(candidates, candidate)
+		}
 	}
-	return result, rows.Err()
+	if filter.Kind == "" || filter.Kind == "comment" {
+		comments, err := s.listTimelineComments(ctx, taskID, boundary, sourceLimit)
+		if err != nil {
+			return nil, err
+		}
+		for _, row := range comments {
+			candidates = append(candidates, timelineCommentCandidate(row))
+		}
+	}
+	if filter.Kind == "" || filter.Kind == "task_change" {
+		events, err := s.listTimelineEvents(ctx, taskID, boundary, sourceLimit)
+		if err != nil {
+			return nil, err
+		}
+		for _, row := range events {
+			candidates = append(candidates, timelineEventCandidate(row.event, row.actorID, row.actorKind, row.actorName, taskID))
+		}
+	}
+	return candidates, nil
 }
 
-// The project-scoped source readers intentionally use one query per durable
-// source. The JOIN on live tasks excludes soft-deleted task activity while
-// retaining the item task_id needed by the merged response.
-func (s *Store) listProjectTimelineHistory(ctx context.Context, projectID string) ([]timelineHistoryRow, error) {
-	rows, err := s.DB.QueryContext(ctx, `SELECT h.id, h.task_id, h.operation_id, h.actor_id, h.state, h.phase, h.summary, h.next_action, h.checkpoint_refs, h.checkpoint_completed, h.checkpoint_total, h.started_at, h.created_at, h.generated_comment_id, h.progress_event_cursor, a.kind, a.name FROM task_agent_work_history h JOIN tasks t ON t.id=h.task_id LEFT JOIN actors a ON a.id=h.actor_id WHERE t.project_id=? AND t.deleted_at IS NULL ORDER BY h.created_at DESC, h.id DESC`, projectID)
+func (s *Store) listTimelineHistory(ctx context.Context, taskID string, boundary timelineSortKey, limit int) ([]timelineHistoryRow, error) {
+	predicate, predicateArgs := timelineKeysetPredicate("created_at", "timeline_event_cursor", "id", "agent_progress", boundary)
+	query := `WITH source AS (
+		SELECT h.id, h.task_id, h.operation_id, h.actor_id, h.state, h.phase, h.summary,
+			h.next_action, h.checkpoint_refs, h.checkpoint_completed, h.checkpoint_total,
+			h.started_at, h.created_at, h.generated_comment_id, h.progress_event_cursor,
+			COALESCE(h.progress_event_cursor, 0) AS timeline_event_cursor,
+			a.kind AS actor_kind, a.name AS actor_name
+		FROM task_agent_work_history h
+		LEFT JOIN actors a ON a.id=h.actor_id
+		WHERE h.task_id=?
+	)
+	SELECT id, task_id, operation_id, actor_id, state, phase, summary, next_action,
+		checkpoint_refs, checkpoint_completed, checkpoint_total, started_at, created_at,
+		generated_comment_id, progress_event_cursor, timeline_event_cursor, actor_kind, actor_name
+	FROM source`
+	args := []any{taskID}
+	if predicate != "" {
+		query += " WHERE " + predicate
+		args = append(args, predicateArgs...)
+	}
+	query += ` ORDER BY created_at DESC, timeline_event_cursor DESC, id DESC LIMIT ?`
+	args = append(args, limit)
+	rows, err := s.DB.QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-	result := make([]timelineHistoryRow, 0)
+	result := make([]timelineHistoryRow, 0, limit)
 	for rows.Next() {
 		var row timelineHistoryRow
-		if err := rows.Scan(&row.id, &row.taskID, &row.operationID, &row.actorID, &row.state, &row.phase, &row.summary, &row.nextAction, &row.refsJSON, &row.completed, &row.total, &row.startedAt, &row.createdAt, &row.generatedCommentID, &row.progressEventCursor, &row.actorKind, &row.actorName); err != nil {
+		if err := rows.Scan(&row.id, &row.taskID, &row.operationID, &row.actorID, &row.state, &row.phase, &row.summary, &row.nextAction, &row.refsJSON, &row.completed, &row.total, &row.startedAt, &row.createdAt, &row.generatedCommentID, &row.progressEventCursor, &row.timelineEventCursor, &row.actorKind, &row.actorName); err != nil {
 			return nil, err
 		}
 		result = append(result, row)
@@ -546,21 +475,297 @@ func (s *Store) listProjectTimelineHistory(ctx context.Context, projectID string
 	return result, rows.Err()
 }
 
-func (s *Store) listProjectTimelineComments(ctx context.Context, projectID string) ([]timelineCommentRow, error) {
-	rows, err := s.DB.QueryContext(ctx, `SELECT c.id, c.task_id, c.actor_id, c.body, c.created_at, c.updated_at, a.id, a.kind, a.name FROM comments c JOIN tasks t ON t.id=c.task_id LEFT JOIN actors a ON a.id=c.actor_id WHERE t.project_id=? AND t.deleted_at IS NULL ORDER BY c.created_at DESC, c.id DESC`, projectID)
+func (s *Store) listTimelineComments(ctx context.Context, taskID string, boundary timelineSortKey, limit int) ([]timelineCommentRow, error) {
+	predicate, predicateArgs := timelineKeysetPredicate("created_at", "timeline_event_cursor", "id", "comment", boundary)
+	query := `WITH source AS (
+		SELECT c.id, c.task_id, c.actor_id, c.body, c.version, c.created_at, c.updated_at, c.deleted_at,
+			COALESCE((
+				SELECT MAX(ce.cursor)
+				FROM events ce
+				WHERE ce.task_id=c.task_id
+				  AND ce.type='comment.created'
+				  AND json_valid(ce.payload)
+				  AND json_extract(ce.payload, '$.comment_id')=c.id
+			), 0) AS timeline_event_cursor,
+			a.id AS timeline_actor_id, a.kind AS timeline_actor_kind, a.name AS timeline_actor_name
+		FROM comments c
+		LEFT JOIN actors a ON a.id=c.actor_id
+		WHERE c.task_id=?
+		  AND c.deleted_at IS NULL
+		  AND NOT EXISTS (
+			  SELECT 1 FROM task_agent_work_history h
+			  WHERE h.generated_comment_id=c.id
+		  )
+	)
+	SELECT id, task_id, actor_id, body, version, created_at, updated_at, deleted_at,
+		timeline_event_cursor, timeline_actor_id, timeline_actor_kind, timeline_actor_name
+	FROM source`
+	args := []any{taskID}
+	if predicate != "" {
+		query += " WHERE " + predicate
+		args = append(args, predicateArgs...)
+	}
+	query += ` ORDER BY created_at DESC, timeline_event_cursor DESC, id DESC LIMIT ?`
+	args = append(args, limit)
+	rows, err := s.DB.QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-	result := make([]timelineCommentRow, 0)
+	result := make([]timelineCommentRow, 0, limit)
 	for rows.Next() {
 		var row timelineCommentRow
-		if err := rows.Scan(&row.comment.ID, &row.comment.TaskID, &row.comment.ActorID, &row.comment.Body, &row.comment.CreatedAt, &row.comment.UpdatedAt, &row.actorID, &row.actorKind, &row.actorName); err != nil {
+		var deletedAt sql.NullString
+		if err := rows.Scan(&row.comment.ID, &row.comment.TaskID, &row.comment.ActorID, &row.comment.Body, &row.comment.Version, &row.comment.CreatedAt, &row.comment.UpdatedAt, &deletedAt, &row.timelineEventCursor, &row.actorID, &row.actorKind, &row.actorName); err != nil {
+			return nil, err
+		}
+		row.comment.DeletedAt = nullableString(deletedAt)
+		result = append(result, row)
+	}
+	return result, rows.Err()
+}
+
+func (s *Store) listTimelineEvents(ctx context.Context, taskID string, boundary timelineSortKey, limit int) ([]timelineEventRow, error) {
+	predicate, predicateArgs := timelineKeysetPredicate("created_at", "cursor", "id", "task_change", boundary)
+	query := `WITH source AS (
+		SELECT e.cursor, e.id, e.type, e.actor_id, e.project_id, e.task_id, e.payload, e.created_at,
+			a.id AS timeline_actor_id, a.kind AS timeline_actor_kind, a.name AS timeline_actor_name
+		FROM events e
+		LEFT JOIN actors a ON a.id=e.actor_id
+		WHERE e.task_id=?
+		  AND NOT EXISTS (
+			  SELECT 1 FROM task_agent_work_history h
+			  WHERE h.progress_event_cursor=e.cursor
+		  )
+		  AND NOT (
+			  e.type='comment.created'
+			  AND (
+				  EXISTS (
+					  SELECT 1 FROM comments c
+					  WHERE c.id=CASE WHEN json_valid(e.payload) THEN json_extract(e.payload, '$.comment_id') END
+						AND c.task_id=e.task_id
+				  )
+				  OR EXISTS (
+					  SELECT 1 FROM task_agent_work_history h
+					  WHERE h.generated_comment_id=CASE WHEN json_valid(e.payload) THEN json_extract(e.payload, '$.comment_id') END
+						AND h.task_id=e.task_id
+				  )
+			  )
+		  )
+	)
+	SELECT cursor, id, type, actor_id, project_id, task_id, payload, created_at,
+		timeline_actor_id, timeline_actor_kind, timeline_actor_name
+	FROM source`
+	args := []any{taskID}
+	if predicate != "" {
+		query += " WHERE " + predicate
+		args = append(args, predicateArgs...)
+	}
+	query += ` ORDER BY created_at DESC, cursor DESC, id DESC LIMIT ?`
+	args = append(args, limit)
+	rows, err := s.DB.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	result := make([]timelineEventRow, 0, limit)
+	for rows.Next() {
+		var row timelineEventRow
+		event, err := scanEventWithActor(rows, &row.actorID, &row.actorKind, &row.actorName)
+		if err != nil {
+			return nil, err
+		}
+		row.event = event
+		result = append(result, row)
+	}
+	return result, rows.Err()
+}
+
+func (s *Store) listProjectTimelineHistory(ctx context.Context, projectID string, boundary timelineSortKey, limit int) ([]timelineHistoryRow, error) {
+	predicate, predicateArgs := timelineKeysetPredicate("created_at", "timeline_event_cursor", "id", "agent_progress", boundary)
+	query := `WITH source AS (
+		SELECT h.id, h.task_id, h.operation_id, h.actor_id, h.state, h.phase, h.summary,
+			h.next_action, h.checkpoint_refs, h.checkpoint_completed, h.checkpoint_total,
+			h.started_at, h.created_at, h.generated_comment_id, h.progress_event_cursor,
+			COALESCE(h.progress_event_cursor, 0) AS timeline_event_cursor,
+			a.kind AS actor_kind, a.name AS actor_name
+		FROM task_agent_work_history h
+		JOIN tasks t ON t.id=h.task_id
+		LEFT JOIN actors a ON a.id=h.actor_id
+		WHERE t.project_id=? AND t.deleted_at IS NULL
+	)
+	SELECT id, task_id, operation_id, actor_id, state, phase, summary, next_action,
+		checkpoint_refs, checkpoint_completed, checkpoint_total, started_at, created_at,
+		generated_comment_id, progress_event_cursor, timeline_event_cursor, actor_kind, actor_name
+	FROM source`
+	args := []any{projectID}
+	if predicate != "" {
+		query += " WHERE " + predicate
+		args = append(args, predicateArgs...)
+	}
+	query += ` ORDER BY created_at DESC, timeline_event_cursor DESC, id DESC LIMIT ?`
+	args = append(args, limit)
+	rows, err := s.DB.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	result := make([]timelineHistoryRow, 0, limit)
+	for rows.Next() {
+		var row timelineHistoryRow
+		if err := rows.Scan(&row.id, &row.taskID, &row.operationID, &row.actorID, &row.state, &row.phase, &row.summary, &row.nextAction, &row.refsJSON, &row.completed, &row.total, &row.startedAt, &row.createdAt, &row.generatedCommentID, &row.progressEventCursor, &row.timelineEventCursor, &row.actorKind, &row.actorName); err != nil {
 			return nil, err
 		}
 		result = append(result, row)
 	}
 	return result, rows.Err()
+}
+
+func (s *Store) listProjectTimelineComments(ctx context.Context, projectID string, boundary timelineSortKey, limit int) ([]timelineCommentRow, error) {
+	predicate, predicateArgs := timelineKeysetPredicate("created_at", "timeline_event_cursor", "id", "comment", boundary)
+	query := `WITH source AS (
+		SELECT c.id, c.task_id, c.actor_id, c.body, c.version, c.created_at, c.updated_at, c.deleted_at,
+			COALESCE((
+				SELECT MAX(ce.cursor)
+				FROM events ce
+				WHERE ce.task_id=c.task_id
+				  AND ce.type='comment.created'
+				  AND json_valid(ce.payload)
+				  AND json_extract(ce.payload, '$.comment_id')=c.id
+			), 0) AS timeline_event_cursor,
+			a.id AS timeline_actor_id, a.kind AS timeline_actor_kind, a.name AS timeline_actor_name
+		FROM comments c
+		JOIN tasks t ON t.id=c.task_id
+		LEFT JOIN actors a ON a.id=c.actor_id
+		WHERE t.project_id=? AND t.deleted_at IS NULL
+		  AND c.deleted_at IS NULL
+		  AND NOT EXISTS (
+			  SELECT 1 FROM task_agent_work_history h
+			  WHERE h.generated_comment_id=c.id
+		  )
+	)
+	SELECT id, task_id, actor_id, body, version, created_at, updated_at, deleted_at,
+		timeline_event_cursor, timeline_actor_id, timeline_actor_kind, timeline_actor_name
+	FROM source`
+	args := []any{projectID}
+	if predicate != "" {
+		query += " WHERE " + predicate
+		args = append(args, predicateArgs...)
+	}
+	query += ` ORDER BY created_at DESC, timeline_event_cursor DESC, id DESC LIMIT ?`
+	args = append(args, limit)
+	rows, err := s.DB.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	result := make([]timelineCommentRow, 0, limit)
+	for rows.Next() {
+		var row timelineCommentRow
+		var deletedAt sql.NullString
+		if err := rows.Scan(&row.comment.ID, &row.comment.TaskID, &row.comment.ActorID, &row.comment.Body, &row.comment.Version, &row.comment.CreatedAt, &row.comment.UpdatedAt, &deletedAt, &row.timelineEventCursor, &row.actorID, &row.actorKind, &row.actorName); err != nil {
+			return nil, err
+		}
+		row.comment.DeletedAt = nullableString(deletedAt)
+		result = append(result, row)
+	}
+	return result, rows.Err()
+}
+
+func (s *Store) listProjectTimelineEvents(ctx context.Context, projectID string, boundary timelineSortKey, limit int) ([]timelineProjectEventRow, error) {
+	predicate, predicateArgs := timelineKeysetPredicate("created_at", "cursor", "id", "task_change", boundary)
+	query := `WITH source AS (
+		SELECT e.cursor, e.id, e.type, e.actor_id, e.project_id, e.task_id, e.payload, e.created_at,
+			a.id AS timeline_actor_id, a.kind AS timeline_actor_kind, a.name AS timeline_actor_name
+		FROM events e
+		JOIN tasks t ON t.id=e.task_id
+		LEFT JOIN actors a ON a.id=e.actor_id
+		WHERE t.project_id=? AND t.deleted_at IS NULL
+		  AND NOT EXISTS (
+			  SELECT 1 FROM task_agent_work_history h
+			  WHERE h.progress_event_cursor=e.cursor
+		  )
+		  AND NOT (
+			  e.type='comment.created'
+			  AND (
+				  EXISTS (
+					  SELECT 1 FROM comments c
+					  WHERE c.id=CASE WHEN json_valid(e.payload) THEN json_extract(e.payload, '$.comment_id') END
+						AND c.task_id=e.task_id
+				  )
+				  OR EXISTS (
+					  SELECT 1 FROM task_agent_work_history h
+					  WHERE h.generated_comment_id=CASE WHEN json_valid(e.payload) THEN json_extract(e.payload, '$.comment_id') END
+						AND h.task_id=e.task_id
+				  )
+			  )
+		  )
+	)
+	SELECT cursor, id, type, actor_id, project_id, task_id, payload, created_at,
+		timeline_actor_id, timeline_actor_kind, timeline_actor_name
+	FROM source`
+	args := []any{projectID}
+	if predicate != "" {
+		query += " WHERE " + predicate
+		args = append(args, predicateArgs...)
+	}
+	query += ` ORDER BY created_at DESC, cursor DESC, id DESC LIMIT ?`
+	args = append(args, limit)
+	rows, err := s.DB.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	result := make([]timelineProjectEventRow, 0, limit)
+	for rows.Next() {
+		row, err := scanProjectTimelineEvent(rows)
+		if err != nil {
+			return nil, err
+		}
+		result = append(result, row)
+	}
+	return result, rows.Err()
+}
+
+func (s *Store) listProjectTimelineCandidates(ctx context.Context, projectID string, filter TaskTimelineFilter, boundary timelineSortKey) ([]timelineCandidate, error) {
+	sourceLimit := filter.Limit + 1
+	candidates := make([]timelineCandidate, 0, sourceLimit*3)
+	if filter.Kind == "" || filter.Kind == "agent_progress" {
+		histories, err := s.listProjectTimelineHistory(ctx, projectID, boundary, sourceLimit)
+		if err != nil {
+			return nil, err
+		}
+		for _, row := range histories {
+			candidate, err := timelineHistoryCandidate(row)
+			if err != nil {
+				return nil, err
+			}
+			candidates = append(candidates, candidate)
+		}
+	}
+	if filter.Kind == "" || filter.Kind == "comment" {
+		comments, err := s.listProjectTimelineComments(ctx, projectID, boundary, sourceLimit)
+		if err != nil {
+			return nil, err
+		}
+		for _, row := range comments {
+			candidates = append(candidates, timelineCommentCandidate(row))
+		}
+	}
+	if filter.Kind == "" || filter.Kind == "task_change" {
+		events, err := s.listProjectTimelineEvents(ctx, projectID, boundary, sourceLimit)
+		if err != nil {
+			return nil, err
+		}
+		for _, row := range events {
+			taskID := ""
+			if row.event.TaskID != nil {
+				taskID = *row.event.TaskID
+			}
+			candidates = append(candidates, timelineEventCandidate(row.event, row.actorID, row.actorKind, row.actorName, taskID))
+		}
+	}
+	return candidates, nil
 }
 
 func scanProjectTimelineEvent(scanner interface{ Scan(...any) error }) (timelineProjectEventRow, error) {
@@ -578,156 +783,6 @@ func scanProjectTimelineEvent(scanner interface{ Scan(...any) error }) (timeline
 	return row, nil
 }
 
-func (s *Store) listProjectTimelineEvents(ctx context.Context, projectID string) ([]timelineProjectEventRow, error) {
-	rows, err := s.DB.QueryContext(ctx, `SELECT e.cursor, e.id, e.type, e.actor_id, e.project_id, e.task_id, e.payload, e.created_at, a.id, a.kind, a.name FROM events e JOIN tasks t ON t.id=e.task_id LEFT JOIN actors a ON a.id=e.actor_id WHERE t.project_id=? AND t.deleted_at IS NULL ORDER BY e.created_at DESC, e.type DESC, e.cursor DESC`, projectID)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	result := make([]timelineProjectEventRow, 0)
-	for rows.Next() {
-		row, err := scanProjectTimelineEvent(rows)
-		if err != nil {
-			return nil, err
-		}
-		result = append(result, row)
-	}
-	return result, rows.Err()
-}
-
-func (s *Store) listProjectTimelineCandidates(ctx context.Context, projectID string) ([]timelineCandidate, error) {
-	histories, err := s.listProjectTimelineHistory(ctx, projectID)
-	if err != nil {
-		return nil, err
-	}
-	generatedComments := make(map[string]struct{}, len(histories))
-	historyEvents := make(map[int64]struct{}, len(histories))
-	candidates := make([]timelineCandidate, 0, len(histories))
-	for _, row := range histories {
-		refs, err := decodeTimelineCheckpointRefs(row.refsJSON)
-		if err != nil {
-			return nil, err
-		}
-		progress := &TaskTimelineProgress{
-			OperationID:    row.operationID,
-			ActorID:        row.actorID,
-			State:          row.state,
-			Phase:          row.phase,
-			Summary:        row.summary,
-			NextAction:     row.nextAction,
-			CheckpointRefs: refs,
-			StartedAt:      row.startedAt,
-		}
-		if row.completed.Valid {
-			value := int(row.completed.Int64)
-			progress.CheckpointCompleted = &value
-		}
-		if row.total.Valid {
-			value := int(row.total.Int64)
-			progress.CheckpointTotal = &value
-		}
-		if row.generatedCommentID.Valid && row.generatedCommentID.String != "" {
-			generatedComments[row.generatedCommentID.String] = struct{}{}
-		}
-		eventCursor := int64(0)
-		if row.progressEventCursor.Valid {
-			eventCursor = row.progressEventCursor.Int64
-			if eventCursor > 0 {
-				historyEvents[eventCursor] = struct{}{}
-			}
-		}
-		item := TaskTimelineItem{
-			ID:        row.id,
-			Kind:      "agent_progress",
-			TaskID:    row.taskID,
-			Actor:     timelineActor(sql.NullString{String: row.actorID, Valid: row.actorID != ""}, row.actorKind, row.actorName),
-			CreatedAt: row.createdAt,
-			Progress:  progress,
-			Comment:   nil,
-			Change:    nil,
-		}
-		candidates = append(candidates, timelineCandidate{item: item, key: newTimelineSortKey(row.createdAt, item.Kind, item.ID, eventCursor)})
-	}
-
-	comments, err := s.listProjectTimelineComments(ctx, projectID)
-	if err != nil {
-		return nil, err
-	}
-	commentEventCursors := make(map[string]int64, len(comments))
-	for _, row := range comments {
-		if _, generated := generatedComments[row.comment.ID]; generated {
-			continue
-		}
-		item := TaskTimelineItem{
-			ID:        row.comment.ID,
-			Kind:      "comment",
-			TaskID:    row.comment.TaskID,
-			Actor:     timelineActor(row.actorID, row.actorKind, row.actorName),
-			CreatedAt: row.comment.CreatedAt,
-			Progress:  nil,
-			Comment:   &row.comment,
-			Change:    nil,
-		}
-		candidates = append(candidates, timelineCandidate{item: item, key: newTimelineSortKey(row.comment.CreatedAt, item.Kind, item.ID, 0)})
-		commentEventCursors[row.comment.ID] = 0
-	}
-
-	events, err := s.listProjectTimelineEvents(ctx, projectID)
-	if err != nil {
-		return nil, err
-	}
-	for _, row := range events {
-		event := row.event
-		commentID := timelineCommentID(event)
-		if event.Type == "comment.created" && commentID != "" {
-			if _, generated := generatedComments[commentID]; generated {
-				continue
-			}
-			if _, exists := commentEventCursors[commentID]; exists {
-				// The comment itself is the timeline item; do not emit a second
-				// system row for its comment.created event.
-				commentEventCursors[commentID] = event.Cursor
-				for index := range candidates {
-					if candidates[index].item.Kind == "comment" && candidates[index].item.ID == commentID {
-						candidates[index].key.eventCursor = event.Cursor
-						break
-					}
-				}
-				continue
-			}
-			// A malformed or orphaned comment event remains visible as a
-			// generic task change rather than disappearing from legacy history.
-		}
-		if event.Type == "task.progressed" {
-			if _, linked := historyEvents[event.Cursor]; linked {
-				continue
-			}
-			// An event written before migration 011 has no structured history
-			// row. Keep it as a generic change; never infer rich progress data.
-		}
-		taskID := ""
-		if event.TaskID != nil {
-			taskID = *event.TaskID
-		}
-		item := TaskTimelineItem{
-			ID:        event.ID,
-			Kind:      "task_change",
-			TaskID:    taskID,
-			Actor:     timelineActor(row.actorID, row.actorKind, row.actorName),
-			CreatedAt: event.CreatedAt,
-			Progress:  nil,
-			Comment:   nil,
-			Change: &TaskTimelineChange{
-				EventID:   event.ID,
-				EventType: event.Type,
-				Payload:   event.Payload,
-			},
-		}
-		candidates = append(candidates, timelineCandidate{item: item, key: newTimelineSortKey(event.CreatedAt, item.Kind, item.ID, event.Cursor)})
-	}
-	return candidates, nil
-}
-
 func timelineCommentID(event Event) string {
 	if event.Type != "comment.created" || len(event.Payload) == 0 {
 		return ""
@@ -741,20 +796,19 @@ func timelineCommentID(event Event) string {
 	return strings.TrimSpace(payload.CommentID)
 }
 
-func (s *Store) timelineActorForID(ctx context.Context, actorID sql.NullString) *TimelineActor {
-	if !actorID.Valid || actorID.String == "" {
-		return nil
+func scanEventWithActor(scanner interface{ Scan(...any) error }, actorID, actorKind, actorName *sql.NullString) (Event, error) {
+	var event Event
+	var actor, project, task, payload sql.NullString
+	if err := scanner.Scan(&event.Cursor, &event.ID, &event.Type, &actor, &project, &task, &payload, &event.CreatedAt, actorID, actorKind, actorName); err != nil {
+		return Event{}, err
 	}
-	var kind, name string
-	if err := s.DB.QueryRowContext(ctx, `SELECT kind, name FROM actors WHERE id=?`, actorID.String).Scan(&kind, &name); err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			return nil
-		}
-		// Actor enrichment is best effort for event rows. The event itself is
-		// still safe and useful if an actor disappears during a read.
-		return nil
+	event.ActorID, event.ProjectID, event.TaskID = nullableString(actor), nullableString(project), nullableString(task)
+	if payload.Valid {
+		event.Payload = json.RawMessage(payload.String)
+	} else {
+		event.Payload = json.RawMessage(`{}`)
 	}
-	return &TimelineActor{ID: actorID.String, Kind: kind, Name: name}
+	return event, nil
 }
 
 // TimelineCursorForTest exposes the opaque encoding to package-local tests

@@ -127,15 +127,15 @@ func (s *Store) ListCommentsPage(ctx context.Context, taskID string, limit, offs
 	if limit > 200 {
 		limit = 200
 	}
-	rows, err := s.DB.QueryContext(ctx, `SELECT id, task_id, actor_id, body, created_at, updated_at FROM comments WHERE task_id=? ORDER BY created_at, id LIMIT ? OFFSET ?`, taskID, limit+1, offset)
+	rows, err := s.DB.QueryContext(ctx, `SELECT id, task_id, actor_id, body, version, created_at, updated_at, deleted_at FROM comments WHERE task_id=? AND deleted_at IS NULL ORDER BY created_at, id LIMIT ? OFFSET ?`, taskID, limit+1, offset)
 	if err != nil {
 		return nil, false, err
 	}
 	defer rows.Close()
 	result := make([]Comment, 0)
 	for rows.Next() {
-		var comment Comment
-		if err := rows.Scan(&comment.ID, &comment.TaskID, &comment.ActorID, &comment.Body, &comment.CreatedAt, &comment.UpdatedAt); err != nil {
+		comment, err := scanComment(rows)
+		if err != nil {
 			return nil, false, err
 		}
 		result = append(result, comment)
@@ -175,7 +175,128 @@ func (s *Store) CreateComment(ctx context.Context, taskID, actorID, body string)
 	if err != nil {
 		return Comment{}, err
 	}
+	return s.GetComment(ctx, id)
+}
+
+// scanComment keeps comment reads compatible with the additive lifecycle
+// columns. DeletedAt is populated for internal callers that need to inspect a
+// tombstone; public reads use GetComment/ListCommentsPage and hide tombstones.
+func scanComment(scanner interface{ Scan(...any) error }) (Comment, error) {
 	var comment Comment
-	err = s.DB.QueryRowContext(ctx, `SELECT id, task_id, actor_id, body, created_at, updated_at FROM comments WHERE id=?`, id).Scan(&comment.ID, &comment.TaskID, &comment.ActorID, &comment.Body, &comment.CreatedAt, &comment.UpdatedAt)
+	var deletedAt sql.NullString
+	if err := scanner.Scan(&comment.ID, &comment.TaskID, &comment.ActorID, &comment.Body, &comment.Version, &comment.CreatedAt, &comment.UpdatedAt, &deletedAt); err != nil {
+		return Comment{}, err
+	}
+	comment.DeletedAt = nullableString(deletedAt)
+	return comment, nil
+}
+
+// GetComment returns one active comment. A deleted comment intentionally looks
+// like a missing resource to callers; the immutable comment.deleted event is
+// the retained audit representation.
+func (s *Store) GetComment(ctx context.Context, commentID string) (Comment, error) {
+	row := s.DB.QueryRowContext(ctx, `SELECT id, task_id, actor_id, body, version, created_at, updated_at, deleted_at FROM comments WHERE id=? AND deleted_at IS NULL`, commentID)
+	comment, err := scanComment(row)
+	if errors.Is(err, sql.ErrNoRows) {
+		return Comment{}, notFound("comment not found")
+	}
 	return comment, err
+}
+
+// UpdateComment edits only the current comment row while appending an
+// immutable event describing the edit in the same transaction. The author may
+// edit their own comment; an administrator may explicitly override that
+// ownership check. expectedVersion is guarded in SQL so concurrent edits are
+// never silently lost.
+func (s *Store) UpdateComment(ctx context.Context, taskID, commentID, actorID, body string, expectedVersion int64, allowAdmin bool) (Comment, error) {
+	body = strings.TrimSpace(body)
+	if body == "" {
+		return Comment{}, invalid("comment body is required", nil)
+	}
+	if len(body) > 20000 {
+		return Comment{}, invalid("comment is too long", nil)
+	}
+	if expectedVersion <= 0 {
+		return Comment{}, ErrPrecondition
+	}
+	var updatedVersion int64
+	err := s.withTx(ctx, func(tx *sql.Tx) error {
+		var currentActor string
+		var currentVersion int64
+		var projectID string
+		if err := tx.QueryRowContext(ctx, `SELECT c.actor_id, c.version, t.project_id FROM comments c JOIN tasks t ON t.id=c.task_id WHERE c.id=? AND c.task_id=? AND c.deleted_at IS NULL AND t.deleted_at IS NULL`, commentID, taskID).Scan(&currentActor, &currentVersion, &projectID); errors.Is(err, sql.ErrNoRows) {
+			return notFound("comment not found")
+		} else if err != nil {
+			return err
+		} else if currentActor != actorID && !allowAdmin {
+			return forbidden("only the comment author may edit this comment")
+		} else if currentVersion != expectedVersion {
+			return conflict("comment has changed", nil)
+		}
+		timestamp := now()
+		result, err := tx.ExecContext(ctx, `UPDATE comments SET body=?, version=version+1, updated_at=? WHERE id=? AND task_id=? AND version=? AND deleted_at IS NULL`, body, timestamp, commentID, taskID, expectedVersion)
+		if err != nil {
+			return err
+		}
+		changed, err := result.RowsAffected()
+		if err != nil {
+			return err
+		}
+		if changed != 1 {
+			return conflict("comment has changed", nil)
+		}
+		updatedVersion = expectedVersion + 1
+		_, err = insertEvent(ctx, tx, "comment.updated", actorID, projectID, taskID, map[string]any{
+			"comment_id":       commentID,
+			"version":          updatedVersion,
+			"previous_version": expectedVersion,
+		})
+		return err
+	})
+	if err != nil {
+		return Comment{}, err
+	}
+	return s.GetComment(ctx, commentID)
+}
+
+// DeleteComment tombstones a comment rather than removing it. Its original
+// body remains in the database for retention/integrity, while ordinary reads
+// hide it and the immutable comment.deleted event explains the change.
+func (s *Store) DeleteComment(ctx context.Context, taskID, commentID, actorID string, expectedVersion int64, allowAdmin bool) error {
+	if expectedVersion <= 0 {
+		return ErrPrecondition
+	}
+	err := s.withTx(ctx, func(tx *sql.Tx) error {
+		var currentActor string
+		var currentVersion int64
+		var projectID string
+		if err := tx.QueryRowContext(ctx, `SELECT c.actor_id, c.version, t.project_id FROM comments c JOIN tasks t ON t.id=c.task_id WHERE c.id=? AND c.task_id=? AND c.deleted_at IS NULL AND t.deleted_at IS NULL`, commentID, taskID).Scan(&currentActor, &currentVersion, &projectID); errors.Is(err, sql.ErrNoRows) {
+			return notFound("comment not found")
+		} else if err != nil {
+			return err
+		} else if currentActor != actorID && !allowAdmin {
+			return forbidden("only the comment author may delete this comment")
+		} else if currentVersion != expectedVersion {
+			return conflict("comment has changed", nil)
+		}
+		timestamp := now()
+		result, err := tx.ExecContext(ctx, `UPDATE comments SET version=version+1, updated_at=?, deleted_at=? WHERE id=? AND task_id=? AND version=? AND deleted_at IS NULL`, timestamp, timestamp, commentID, taskID, expectedVersion)
+		if err != nil {
+			return err
+		}
+		changed, err := result.RowsAffected()
+		if err != nil {
+			return err
+		}
+		if changed != 1 {
+			return conflict("comment has changed", nil)
+		}
+		_, err = insertEvent(ctx, tx, "comment.deleted", actorID, projectID, taskID, map[string]any{
+			"comment_id":       commentID,
+			"version":          expectedVersion + 1,
+			"previous_version": expectedVersion,
+		})
+		return err
+	})
+	return err
 }

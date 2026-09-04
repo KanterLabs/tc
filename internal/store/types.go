@@ -32,6 +32,8 @@ var (
 	ErrDependencyNotFound      = errors.New("dependency_not_found")
 	ErrUnmetDependencies       = errors.New("unmet_dependencies")
 	ErrDependencyInUse         = errors.New("dependency_in_use")
+	ErrChecklistLimitExceeded  = errors.New("checklist_limit_exceeded")
+	ErrChecklistIncomplete     = errors.New("checklist_incomplete")
 )
 
 type Error struct {
@@ -84,32 +86,37 @@ type Token struct {
 }
 
 type Project struct {
-	ID                 string  `json:"id"`
-	Key                string  `json:"key"`
-	Slug               string  `json:"slug"`
-	Name               string  `json:"name"`
-	Description        string  `json:"description"`
-	Color              string  `json:"color"`
-	Favorite           bool    `json:"favorite"`
-	ArchivedAt         *string `json:"archived_at,omitempty"`
-	CreatedAt          string  `json:"created_at"`
-	UpdatedAt          string  `json:"updated_at"`
-	TaskCount          int     `json:"task_count,omitempty"`
-	CompletedCount     int     `json:"completed_count,omitempty"`
-	CompletedTaskCount int     `json:"completed_task_count,omitempty"`
-	OpenTaskCount      int     `json:"open_task_count,omitempty"`
-	OverdueTaskCount   int     `json:"overdue_task_count,omitempty"`
-	ColumnCount        int     `json:"column_count,omitempty"`
+	ID                        string  `json:"id"`
+	Key                       string  `json:"key"`
+	Slug                      string  `json:"slug"`
+	Name                      string  `json:"name"`
+	Description               string  `json:"description"`
+	Color                     string  `json:"color"`
+	Favorite                  bool    `json:"favorite"`
+	ArchivedAt                *string `json:"archived_at,omitempty"`
+	ChecklistCompletionPolicy string  `json:"checklist_completion_policy"`
+	CreatedAt                 string  `json:"created_at"`
+	UpdatedAt                 string  `json:"updated_at"`
+	TaskCount                 int     `json:"task_count,omitempty"`
+	CompletedCount            int     `json:"completed_count,omitempty"`
+	CompletedTaskCount        int     `json:"completed_task_count,omitempty"`
+	OpenTaskCount             int     `json:"open_task_count,omitempty"`
+	OverdueTaskCount          int     `json:"overdue_task_count,omitempty"`
+	ColumnCount               int     `json:"column_count,omitempty"`
+	Version                   int64   `json:"version,omitempty"`
 }
 
 type Column struct {
-	ID            string `json:"id"`
-	ProjectID     string `json:"project_id"`
-	Name          string `json:"name"`
-	SemanticState string `json:"semantic_state"`
-	Position      int    `json:"position"`
-	CreatedAt     string `json:"created_at"`
-	UpdatedAt     string `json:"updated_at"`
+	ID              string  `json:"id"`
+	ProjectID       string  `json:"project_id"`
+	Name            string  `json:"name"`
+	SemanticState   string  `json:"semantic_state"`
+	Position        int     `json:"position"`
+	ArchivedAt      *string `json:"archived_at,omitempty"`
+	OrderingVersion int64   `json:"ordering_version,omitempty"`
+	CreatedAt       string  `json:"created_at"`
+	UpdatedAt       string  `json:"updated_at"`
+	Version         int64   `json:"version,omitempty"`
 }
 
 type Label struct {
@@ -122,29 +129,92 @@ type Label struct {
 }
 
 type Task struct {
-	ID                string            `json:"id"`
-	Number            int               `json:"number"`
-	Key               string            `json:"key"`
-	ProjectID         string            `json:"project_id"`
-	Kind              string            `json:"kind"`
-	ColumnID          string            `json:"column_id"`
-	Title             string            `json:"title"`
-	Description       string            `json:"description"`
-	Priority          string            `json:"priority"`
-	Position          float64           `json:"position"`
-	Assignee          *string           `json:"assignee,omitempty"`
-	ClaimedBy         *string           `json:"claimed_by,omitempty"`
-	ClaimExpiresAt    *string           `json:"claim_expires_at,omitempty"`
-	DueAt             *string           `json:"due_at,omitempty"`
-	Version           int64             `json:"version"`
-	CompletedAt       *string           `json:"completed_at,omitempty"`
-	CreatedAt         string            `json:"created_at"`
-	UpdatedAt         string            `json:"updated_at"`
-	Labels            []Label           `json:"labels"`
-	CommentCount      int               `json:"comment_count"`
-	Bug               *Bug              `json:"bug,omitempty"`
-	AgentWork         *AgentWork        `json:"agent_work,omitempty"`
-	DependencySummary DependencySummary `json:"dependency_summary"`
+	ID                string               `json:"id"`
+	Number            int                  `json:"number"`
+	Key               string               `json:"key"`
+	ProjectID         string               `json:"project_id"`
+	Kind              string               `json:"kind"`
+	ColumnID          string               `json:"column_id"`
+	Title             string               `json:"title"`
+	Description       string               `json:"description"`
+	Priority          string               `json:"priority"`
+	Position          float64              `json:"position"`
+	Assignee          *string              `json:"assignee,omitempty"`
+	ClaimedBy         *string              `json:"claimed_by,omitempty"`
+	ClaimExpiresAt    *string              `json:"claim_expires_at,omitempty"`
+	DueAt             *string              `json:"due_at,omitempty"`
+	Version           int64                `json:"version"`
+	CompletedAt       *string              `json:"completed_at,omitempty"`
+	CreatedAt         string               `json:"created_at"`
+	UpdatedAt         string               `json:"updated_at"`
+	Labels            []Label              `json:"labels"`
+	CommentCount      int                  `json:"comment_count"`
+	Bug               *Bug                 `json:"bug,omitempty"`
+	AgentWork         *AgentWork           `json:"agent_work,omitempty"`
+	DependencySummary DependencySummary    `json:"dependency_summary"`
+	Checklist         []TaskChecklistItem  `json:"checklist"`
+	ChecklistSummary  TaskChecklistSummary `json:"checklist_summary"`
+	// ParentTaskID is the persisted hierarchy edge. ParentID is a response
+	// alias retained for clients that use the shorter relation naming; both
+	// values are populated from the same live, same-project parent row.
+	ParentTaskID     *string                 `json:"parent_task_id,omitempty"`
+	ParentID         *string                 `json:"parent_id,omitempty"`
+	Parent           *TaskHierarchyReference `json:"parent,omitempty"`
+	HierarchySummary HierarchySummary        `json:"hierarchy_summary"`
+}
+
+// TaskChecklistItem is one ordered, actor-aware acceptance criterion on a
+// task. CompletedAt and CompletedBy are nullable so an item can be reopened
+// without losing its stable identity or creation timestamp.
+type TaskChecklistItem struct {
+	ID          string  `json:"id"`
+	TaskID      string  `json:"task_id"`
+	Text        string  `json:"text"`
+	Position    int     `json:"position"`
+	Completed   bool    `json:"completed"`
+	CompletedAt *string `json:"completed_at"`
+	CompletedBy *string `json:"completed_by"`
+	CreatedAt   string  `json:"created_at"`
+	UpdatedAt   string  `json:"updated_at"`
+}
+
+// TaskChecklistSummary is included on task reads and board collections. The
+// completion warning is true only when a completed task still has open items
+// under the project's default warn policy.
+type TaskChecklistSummary struct {
+	Total            int     `json:"total"`
+	Completed        int     `json:"completed"`
+	Open             int     `json:"open"`
+	Percent          float64 `json:"percent"`
+	CompletionPolicy string  `json:"completion_policy"`
+	Warning          bool    `json:"warning"`
+}
+
+// ChecklistItemInput is used for both create and partial update operations.
+// A nil field is omitted; CompletedSet and PositionSet distinguish explicit
+// false/zero values from omission.
+type ChecklistItemInput struct {
+	Text         *string
+	Completed    *bool
+	CompletedSet bool
+	Position     *int
+	PositionSet  bool
+}
+
+// ChecklistReorderInput is normalized by the HTTP layer to a complete list of
+// item IDs. Positions are allocated contiguously by the store.
+type ChecklistReorderInput struct {
+	ItemIDs []string
+}
+
+// ChecklistCollection is the public read shape for a task checklist. It
+// carries the owning task's current version so clients can send If-Match on
+// the next mutation without fetching task details separately.
+type ChecklistCollection struct {
+	TaskID  string               `json:"task_id"`
+	Version int64                `json:"version"`
+	Items   []TaskChecklistItem  `json:"data"`
+	Summary TaskChecklistSummary `json:"summary"`
 }
 
 // DependencySummary is the bounded, derived graph state embedded in every
@@ -176,6 +246,50 @@ type TaskReference struct {
 type TaskDependencies struct {
 	Prerequisites []TaskReference `json:"prerequisites"`
 	Dependents    []TaskReference `json:"dependents"`
+}
+
+// TaskHierarchyReference is the bounded relation shape used by hierarchy
+// reads. It carries enough server-owned state for board and drawer rollups
+// without recursively embedding full tasks.
+type TaskHierarchyReference struct {
+	ID            string     `json:"id"`
+	Number        int        `json:"number"`
+	Key           string     `json:"key"`
+	ProjectID     string     `json:"project_id"`
+	Title         string     `json:"title"`
+	Kind          string     `json:"kind"`
+	ColumnID      string     `json:"column_id"`
+	SemanticState string     `json:"semantic_state"`
+	State         string     `json:"state,omitempty"`
+	Version       int64      `json:"version"`
+	ParentID      *string    `json:"parent_id,omitempty"`
+	CompletedAt   *string    `json:"completed_at,omitempty"`
+	AgentWork     *AgentWork `json:"agent_work,omitempty"`
+}
+
+// HierarchySummary is derived from live child rows at read time. It never
+// trusts browser-maintained counters or cached client state.
+type HierarchySummary struct {
+	ChildCount          int            `json:"child_count"`
+	CompletedChildCount int            `json:"completed_child_count"`
+	CompletionPercent   float64        `json:"completion_percent"`
+	StateCounts         map[string]int `json:"state_counts"`
+	BlockedChildCount   int            `json:"blocked_child_count"`
+	LiveAgentWorkCount  int            `json:"live_agent_work_count"`
+	ActionNeededCount   int            `json:"action_needed_count"`
+	StaleAgentWorkCount int            `json:"stale_agent_work_count"`
+}
+
+// TaskHierarchy contains bounded direct children and the complete ancestor
+// chain up to MaxTaskHierarchyDepth. Descendants is included as a bounded
+// convenience for tree navigation; callers should use children for direct
+// editing operations.
+type TaskHierarchy struct {
+	Parent      *TaskHierarchyReference  `json:"parent,omitempty"`
+	Children    []TaskHierarchyReference `json:"children"`
+	Ancestors   []TaskHierarchyReference `json:"ancestors"`
+	Descendants []TaskHierarchyReference `json:"descendants"`
+	Summary     HierarchySummary         `json:"summary"`
 }
 
 // AgentWork is the latest progress pulse published for a task. Stale and
@@ -272,12 +386,18 @@ type ResolveBugInput struct {
 }
 
 type Comment struct {
-	ID        string `json:"id"`
-	TaskID    string `json:"task_id"`
-	ActorID   string `json:"actor_id"`
-	Body      string `json:"body"`
+	ID      string `json:"id"`
+	TaskID  string `json:"task_id"`
+	ActorID string `json:"actor_id"`
+	Body    string `json:"body"`
+	// Version is incremented on every edit or tombstone mutation.  It gives
+	// comment writes the same optimistic-concurrency protection as task writes.
+	Version   int64  `json:"version"`
 	CreatedAt string `json:"created_at"`
 	UpdatedAt string `json:"updated_at"`
+	// Deleted comments are retained for audit/event integrity but are omitted
+	// from ordinary comment and timeline comment reads.
+	DeletedAt *string `json:"deleted_at,omitempty"`
 }
 
 // TimelineActor is the least-privilege actor identity embedded in a task
@@ -373,6 +493,16 @@ type TaskFilter struct {
 	LiveWork     bool
 	Query        string
 	UpdatedAfter *time.Time
+	// CursorToken is the opaque keyset cursor used by the large-board task
+	// endpoint. Cursor remains an integer offset for retained callers and
+	// older collection clients; new task reads prefer CursorToken so inserts
+	// and moves before a page boundary cannot cause skips or duplicates.
+	CursorToken string
+	// Sort selects the stable task ordering. Empty means board order. The
+	// HTTP layer validates the public values, while store callers receive the
+	// same invalid-input error for unsupported values.
+	Sort       string
+	Descending bool
 	// ProjectIDs restricts global issue listings to an explicit allow-list.
 	// A non-nil empty slice intentionally matches no projects.
 	ProjectIDs []string
@@ -380,6 +510,65 @@ type TaskFilter struct {
 	// cursors remain monotonic database cursors via EventFilter.After.
 	Cursor int
 	Limit  int
+}
+
+// SearchSort describes one stable ordering term for global task search and
+// saved views.  The HTTP layer validates the field/direction vocabulary before
+// a query reaches the store; the store still normalizes values so direct
+// callers cannot inject SQL through a saved view.
+type SearchSort struct {
+	Field     string `json:"field"`
+	Direction string `json:"direction"`
+}
+
+// SearchFilter is the cross-project task search contract. ProjectIDs is the
+// caller's effective project ceiling and is always applied before pagination.
+// A non-nil empty slice intentionally matches no projects.
+type SearchFilter struct {
+	Query       string
+	Key         string
+	Title       string
+	Description string
+	Label       string
+	State       string
+	Priority    string
+	Assignee    string
+	ClaimOwner  string
+	Project     string
+	ProjectIDs  []string
+	DueFrom     *time.Time
+	DueTo       *time.Time
+	Sort        []SearchSort
+	Cursor      int
+	Limit       int
+}
+
+// SavedView stores a named search/filter combination. Filters are kept as a
+// JSON object because the public search vocabulary can grow without another
+// schema migration; the HTTP layer validates keys and values when creating or
+// updating a view.
+type SavedView struct {
+	ID          string         `json:"id"`
+	ActorID     string         `json:"owner_id"`
+	Name        string         `json:"name"`
+	Description string         `json:"description,omitempty"`
+	Filters     map[string]any `json:"filters"`
+	Sort        []SearchSort   `json:"sort"`
+	Shared      bool           `json:"shared"`
+	CreatedAt   string         `json:"created_at"`
+	UpdatedAt   string         `json:"updated_at"`
+}
+
+// SavedViewInput is used by create and patch operations. FiltersSet and
+// SortSet distinguish an omitted patch field from an explicit empty value.
+type SavedViewInput struct {
+	Name        *string
+	Description *string
+	Filters     map[string]any
+	FiltersSet  bool
+	Sort        []SearchSort
+	SortSet     bool
+	Shared      *bool
 }
 
 type ProjectFilter struct {
@@ -479,8 +668,12 @@ func projectFromRow(scanner interface{ Scan(...any) error }) (Project, error) {
 	var p Project
 	var archived sql.NullString
 	var favorite int
-	if err := scanner.Scan(&p.ID, &p.Key, &p.Slug, &p.Name, &p.Description, &p.Color, &favorite, &archived, &p.CreatedAt, &p.UpdatedAt); err != nil {
+	if err := scanner.Scan(&p.ID, &p.Key, &p.Slug, &p.Name, &p.Description, &p.Color, &favorite, &archived, &p.ChecklistCompletionPolicy, &p.CreatedAt, &p.UpdatedAt, &p.Version); err != nil {
 		return Project{}, err
+	}
+	if p.ChecklistCompletionPolicy == "" {
+		// Direct store tests and retained fixtures may omit the additive field.
+		p.ChecklistCompletionPolicy = "warn"
 	}
 	p.Favorite, p.ArchivedAt = boolValue(favorite), nullableString(archived)
 	return p, nil
@@ -488,9 +681,11 @@ func projectFromRow(scanner interface{ Scan(...any) error }) (Project, error) {
 
 func columnFromRow(scanner interface{ Scan(...any) error }) (Column, error) {
 	var c Column
-	if err := scanner.Scan(&c.ID, &c.ProjectID, &c.Name, &c.SemanticState, &c.Position, &c.CreatedAt, &c.UpdatedAt); err != nil {
+	var archived sql.NullString
+	if err := scanner.Scan(&c.ID, &c.ProjectID, &c.Name, &c.SemanticState, &c.Position, &archived, &c.OrderingVersion, &c.CreatedAt, &c.UpdatedAt, &c.Version); err != nil {
 		return Column{}, err
 	}
+	c.ArchivedAt = nullableString(archived)
 	return c, nil
 }
 
@@ -504,18 +699,19 @@ func labelFromRow(scanner interface{ Scan(...any) error }) (Label, error) {
 
 func taskFromRow(scanner interface{ Scan(...any) error }) (Task, error) {
 	var t Task
-	var assignee, claimed, claimExpiry, due, completed sql.NullString
-	if err := scanner.Scan(&t.ID, &t.Number, &t.ProjectID, &t.Kind, &t.ColumnID, &t.Title, &t.Description, &t.Priority, &t.Position, &assignee, &claimed, &claimExpiry, &due, &t.Version, &completed, &t.CreatedAt, &t.UpdatedAt); err != nil {
+	var assignee, claimed, claimExpiry, due, completed, parent sql.NullString
+	if err := scanner.Scan(&t.ID, &t.Number, &t.ProjectID, &t.Kind, &t.ColumnID, &t.Title, &t.Description, &t.Priority, &t.Position, &assignee, &claimed, &claimExpiry, &due, &t.Version, &completed, &t.CreatedAt, &t.UpdatedAt, &parent); err != nil {
 		return Task{}, err
 	}
 	t.Key = "" // populated by callers because it requires a project key.
-	t.Assignee, t.ClaimedBy, t.ClaimExpiresAt, t.DueAt, t.CompletedAt = nullableString(assignee), nullableString(claimed), nullableString(claimExpiry), nullableString(due), nullableString(completed)
+	t.Assignee, t.ClaimedBy, t.ClaimExpiresAt, t.DueAt, t.CompletedAt, t.ParentTaskID = nullableString(assignee), nullableString(claimed), nullableString(claimExpiry), nullableString(due), nullableString(completed), nullableString(parent)
+	t.ParentID = t.ParentTaskID
 	return t, nil
 }
 
 const taskColumns = `t.id, t.number, t.project_id, t.kind, t.column_id, t.title, t.description,
 	t.priority, t.position, t.assignee_id, t.claimed_by, t.claim_expires_at, t.due_at,
-	t.version, t.completed_at, t.created_at, t.updated_at`
+	t.version, t.completed_at, t.created_at, t.updated_at, t.parent_task_id`
 
 func (s *Store) withTx(ctx context.Context, fn func(*sql.Tx) error) error {
 	tx, err := s.DB.BeginTx(ctx, nil)

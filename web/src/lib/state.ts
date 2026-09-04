@@ -532,7 +532,7 @@ export function filterTasks(tasks: Task[], columns: Column[], filters: BoardFilt
 }
 
 export function sortTasks(tasks: Task[]): Task[] {
-  return [...tasks].sort((a, b) => a.position - b.position || a.number - b.number);
+  return [...tasks].sort((a, b) => a.position - b.position || a.number - b.number || a.id.localeCompare(b.id));
 }
 
 export function nextPosition(tasks: Task[], columnId: string): number {
@@ -545,6 +545,48 @@ export function moveTaskLocal(tasks: Task[], taskId: string, destinationColumnId
   return tasks.map((task) =>
     task.id === taskId ? { ...task, column_id: destinationColumnId, position, version: task.version + 1 } : task
   );
+}
+
+export type TaskOrderingPlacement = 'first' | 'before' | 'between' | 'after' | 'last';
+
+export interface TaskOrderingAnchors {
+  before_task_id?: string;
+  after_task_id?: string;
+  placement: TaskOrderingPlacement;
+}
+
+/**
+ * Return visible-card anchors for a destination insertion index. The server
+ * resolves the gap against the complete column, so hidden cards between the
+ * anchors remain undisturbed by filtered-board reorders.
+ */
+export function taskOrderingAnchors(tasks: Task[], destinationColumnId: string, targetIndex: number, movingTaskId = ''): TaskOrderingAnchors {
+  const destination = sortTasks(tasks.filter((task) => task.column_id === destinationColumnId && task.id !== movingTaskId));
+  const index = Math.max(0, Math.min(destination.length, Math.trunc(targetIndex)));
+  if (index === 0) return { placement: 'first' };
+  if (index === destination.length) return { placement: 'last' };
+  return {
+    after_task_id: destination[index - 1].id,
+    before_task_id: destination[index].id,
+    placement: 'between'
+  };
+}
+
+/** Apply a precise reorder to a local snapshot without mutating its input. */
+export function reorderTaskLocal(tasks: Task[], taskId: string, destinationColumnId: string, targetIndex: number): Task[] {
+  const current = tasks.find((task) => task.id === taskId);
+  if (!current) return [...tasks];
+  const destination = sortTasks(tasks.filter((task) => task.column_id === destinationColumnId && task.id !== taskId));
+  const index = Math.max(0, Math.min(destination.length, Math.trunc(targetIndex)));
+  const before = destination[index - 1];
+  const after = destination[index];
+  let position = 0;
+  if (before && after) position = before.position + (after.position - before.position) / 2;
+  else if (before) position = before.position + 1;
+  else if (after) position = after.position - 1 >= 0 ? after.position - 1 : 0;
+  return tasks.map((task) => task.id === taskId
+    ? { ...task, column_id: destinationColumnId, position, version: task.version + 1 }
+    : task);
 }
 
 /**

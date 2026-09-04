@@ -63,13 +63,17 @@ metadata never includes plaintext token values.
 - `DELETE /api/v1/labels/{label}`
 
 A project contains `id`, uppercase `key`, stable `slug`, `name`,
-`description`, `color`, `favorite`, timestamps, and optional aggregate counts.
+`description`, `color`, `favorite`, timestamps, an optimistic `version`, and
+optional aggregate counts. Archive/restore changes `archived_at` while
+preserving the key and slug unless those identifiers are explicitly edited.
 A supplied slug is normalized to lowercase, must be URL-safe, and is limited to
 64 characters; an omitted slug is generated. Project color defaults to `#64748b`.
 
 Creating a project atomically creates ordered Backlog, Ready, In progress,
 Blocked, and Done columns. A column contains `id`, `project_id`, `name`,
-`semantic_state`, `position`, and timestamps. An empty object or a body with
+`semantic_state`, `position`, `ordering_version`, timestamps, an optimistic
+`version`, and an optional `archived_at`. The `ordering_version` increments
+whenever task ordering in that column changes. An empty object or a body with
 no recognized field in a project or column PATCH returns `400`; null is not a
 clear operation for their non-null fields. Explicit null, wrong types, empty
 strings, invalid formats, and values outside declared min/max constraints are
@@ -90,8 +94,58 @@ and bearer tokens with `tasks:read` retain diagnostic claim details. Human
 administrators may explicitly override this active-claim restriction, while
 bearer tokens and ordinary human actors cannot.
 
+Project and column PATCH requests may include `If-Match: "vN"`; stale guarded
+edits return `409` without a partial write. The board-facing column collection
+hides archived columns by default; `?archived=true` includes active columns
+followed by archived columns for administration. Creating, renaming, and
+reordering columns is transactional. Archiving a column moves its live tasks
+to another active column with the same semantic state and is rejected if that
+would remove the only active mapping for backlog, ready, active, blocked, or
+completed. A restored column receives a fresh board position, and task column
+IDs remain valid throughout the move.
+
 Labels contain `id`, `project_id`, `name`, `color`, and timestamps. Label color
 defaults to `#94a3b8` when omitted or null.
+
+## Portable archives and board navigation
+
+- `GET /api/v1/export?project={project}` or `GET /api/v1/projects/{project}/export`
+- `POST /api/v1/import`
+- `POST /api/v1/projects/{project}/import`
+- `POST /api/v1/import/trello`
+- `GET /api/v1/projects/{project}/boards`
+
+Portable archives use the versioned `helm.portable` format (`version: 1`) and
+include projects, columns, tasks/bug details, labels, comments,
+task-label/dependency/link relationships, actor display references, and
+project-scoped activity. Export requires `projects:read`, `tasks:read`, and
+`events:read`; import requires `projects:write` and `tasks:write`. Authentication
+material is never exported. The global and Trello import routes accept an
+existing `target_project` ID/key/slug when a destination should be selected.
+
+Import validates the entire archive before mutation. `dry_run=true` returns a
+report without writing; `conflict=remap` (the default) keeps stable IDs where
+possible and reports every generated ID/key/slug/position/number remap;
+`conflict=fail` aborts on incompatible stable-ID conflicts. Actual imports are
+one additive transaction and never replace, delete, or restore destination
+rows. Repeating an archive skips equal stable records. Event cursors are
+instance-local and are assigned by the destination SQLite sequence; activity
+IDs remain stable. A project-scoped bearer must provide an existing allowed
+`target_project` (or use the project import route). A project-scoped Trello
+import must select an existing allowed target; a global import without a
+target is rejected for project-scoped bearers because it may create a project
+outside the allow-list.
+
+The Trello route is an isolated adapter for lists, cards, labels, due dates,
+and comment actions. Unsupported Trello members, memberships, checklists,
+attachments, custom fields, Power-Ups/plugins, non-comment actions, and card
+assignees are explicit warnings in the conversion/import report.
+
+Helm v1 exposes one permission-filtered virtual board descriptor per project.
+Multiple boards remain a deferred, explicit additive migration decision, so
+existing `/p/{project-slug}` URLs and project-level permissions remain
+unchanged. Portable import/export is not disaster-recovery backup/restore;
+use the separate documented SQLite workflow for exact database recovery.
 
 ## Tasks, comments, and claims
 
@@ -99,6 +153,7 @@ defaults to `#94a3b8` when omitted or null.
 - `GET /api/v1/issues`
 - `GET|PATCH|DELETE /api/v1/tasks/{task}`
 - `GET|POST /api/v1/tasks/{task}/comments`
+- `GET|PATCH|DELETE /api/v1/tasks/{task}/comments/{comment}`
 - `GET /api/v1/tasks/{task}/timeline`
 - `POST /api/v1/tasks/{task}/claim`
 - `POST /api/v1/tasks/{task}/progress`
@@ -139,6 +194,16 @@ complete, block, progress, triage, resolve, and reopen, and idempotent retries
 replay the already-reduced body.
 Direct task GET and task collections still require `tasks:read`.
 
+Comments contain `id`, `task_id`, `actor_id`, Markdown `body`, timestamps, and
+an optimistic-concurrency `version`. The API returns the Markdown source as
+plain JSON text; the web UI escapes HTML before rendering its small Markdown
+subset. Comment PATCH and DELETE require the comment's `If-Match: "vN"` and an
+idempotency key is recommended for retries. Authors and human administrators
+may edit or tombstone comments. Tombstones retain the body for retention and
+are omitted from active comment reads; immutable `comment.updated` and
+`comment.deleted` events remain in the task timeline. Stale versions return
+`409` without changing the comment.
+
 `GET /api/v1/projects/{project}/timeline` returns the same typed, newest-first
 timeline items as the task route, merged across every non-deleted task in the
 selected project. It requires `tasks:read` and honors project-scoped bearer
@@ -148,6 +213,9 @@ tokens. Use the opaque `next_cursor` as `before` for stable keyset pagination;
 `task.progressed` events are represented once by the corresponding structured
 progress item. Legacy comments and events remain visible with their original
 typed payloads, and actor enrichment includes only actor ID, kind, and name.
+Actor names are resolved at read time, so disabled actors remain attributable
+without stale event copies; events whose actor was deleted remain readable with
+the actor field omitted.
 
 PATCH, DELETE, and task action requests require an exact quoted `If-Match: "vN"`
 value. Missing If-Match returns `428`; an unquoted, weak, malformed, or
@@ -271,6 +339,26 @@ with `tasks:read` may receive bounded IDs/keys and cycle paths, but never more
 than the 200-edge graph limits. Stale task conflicts retain only the dependent
 task `id` and `version` for write-only retry callers.
 
+### Task checklists
+
+Task acceptance criteria are represented by the checklist endpoints documented
+in [TASK_CHECKLISTS.md](TASK_CHECKLISTS.md):
+
+- `GET|POST|PATCH /api/v1/tasks/{task}/checklist`
+- `PATCH|DELETE /api/v1/tasks/{task}/checklist/{item}`
+
+Checklist reads require `tasks:read`; writes require `tasks:write`, the exact
+owning-task `If-Match: "vN"`, and may include an `Idempotency-Key`. Every
+mutation advances the task version and records the actor, timestamp, and
+change event. A task has at most 100 items, each item is capped at 1,000
+Unicode characters, and aggregate checklist text is capped at 100,000 bytes.
+The project `checklist_completion_policy` is `warn` by default or `require`;
+the latter rejects any completion path—including explicit completion, a direct
+move into a completed-semantic column, bug resolution, or a completed-column
+transition—with `409 checklist_incomplete` while open items remain. Board cards
+expose checklist progress and task details provide keyboard-operable editing,
+checking, ordering, and removal controls.
+
 ### Board audits and guarded moves
 
 Board audits are durable, read-first snapshots. The routes are:
@@ -281,6 +369,7 @@ Board audits are durable, read-first snapshots. The routes are:
 - `POST /api/v1/audits/{audit}/finalize`
 - `PATCH /api/v1/audit-findings/{finding}`
 - `POST /api/v1/tasks/{task}/move`
+- `POST /api/v1/tasks/{task}/reorder`
 
 Audit reads (`GET` on the project run collection, run summary, or findings)
 require `tasks:read`. Audit writes (creating a run, appending a finding,
@@ -381,6 +470,22 @@ version, returns the normal full Task or `{ "id": "...", "version": N }`
 write-only response, sets the strong task `ETag`, and emits a `task.moved`
 event containing the from/to columns, old/new position, resulting version,
 actor, source, and reason. An idempotent retry replays the original response.
+
+`POST /api/v1/tasks/{task}/reorder` provides precise placement for board drag
+and keyboard controls. It uses the same guarded ETag/idempotency contract and
+requires `destination_column_id`, `expected_source_column_id`, and `source`.
+Use `placement: first` or `last`, or supply `before_task_id` and/or
+`after_task_id`; both anchors place the task between those cards. Compatibility
+aliases (`before_task`, `before`, `after_task`, and `after`) are accepted.
+Anchors are resolved against all cards in the destination column, so a hidden
+card between visible anchors remains in place. Optional source and destination
+ordering revisions (`expected_source_ordering_version` and
+`expected_destination_ordering_version`, or the shared
+`expected_ordering_version`) reject stale snapshots with `409` rather than
+silently losing another reorder. Positions use deterministic midpoint keys and
+are transactionally rebalanced when no representable gap remains. The event
+includes placement, anchors, resulting ordering revisions, and whether a
+rebalance occurred.
 
 ### Live agent work
 
@@ -537,21 +642,93 @@ narrows the result to one permitted project. Optional filters are `project`,
 `resolution=unresolved` to find bugs whose corresponding lifecycle field is
 unset. Pagination and validation follow the existing collection contract.
 
+`GET /api/v1/issues/metrics` returns aggregate issue health without task rows.
+Its `reopened` value is the number of distinct live bug task IDs with at least
+one `bug.reopened` event during the inclusive trailing seven-day UTC interval
+reported by `since` and `as_of`. The server evaluates this bounded query
+directly, so the value does not depend on the browser's event-poll buffer. An
+optional `project` narrows the result to one permitted project; when omitted,
+project-scoped bearer tokens are limited to the union of their permitted
+projects. The route requires `tasks:read`.
+
+`GET /api/v1/sidebar-counts` returns only scalar primary-navigation counts and
+never task rows. `issues` counts live bug tasks. `my_work` follows `view=live`
+(the default) or `view=assigned`: live counts unfinished tasks with an
+agent-work snapshot in active projects, while assigned counts tasks assigned
+to or actively claimed by the authenticated actor. An optional `project`
+narrows both counts; omitted project-scoped bearer requests aggregate only
+their permitted project ceiling. The route requires `tasks:read`.
+
+### Global task search and saved views
+
+`GET /api/v1/search` requires `tasks:read` and searches live tasks across the
+caller-visible projects. A project-scoped bearer token may omit `project` to
+search the union of its permitted projects; every project ceiling is applied
+in SQL before pagination. Archived projects and deleted tasks are excluded.
+The free-text `q` filter matches task keys, titles, descriptions, project
+names/keys, labels, board state, priority, assignee and claim-owner names,
+and bug detail text. Field filters are `key`, `title`, `description`, `label`,
+`state`, `priority`, `assignee`, `claim_owner`, `project`, `due_from`, and
+`due_to`. `project` accepts an ID, key, or slug; due filters are RFC3339
+timestamps. `sort` accepts up to eight comma-separated `field:direction`
+terms (`updated_at`, `created_at`, `due_at`, `title`, `key`, `priority`,
+`state`, or `position`, with `asc` or `desc`). `view` applies a saved view
+before URL filters override matching fields. `next_cursor` is the same opaque
+offset cursor used by other collections and never counts inaccessible rows.
+When `q` is supplied, the response can also include matching visible `projects`
+and `views` for command-palette navigation.
+
+Saved views use the following lifecycle:
+
+- `GET /api/v1/views` lists the actor's owned views and shared views visible to
+  the caller; `POST /api/v1/views` creates one and requires `tasks:write`.
+- `GET /api/v1/views/{view}/search` executes a view; the equivalent
+  `GET /api/v1/search?view={view}` form is also supported.
+- `GET /api/v1/views/{view}` reads a visible view. `PATCH` and `DELETE` are
+  owner-only and require `tasks:write`; all mutations accept
+  `Idempotency-Key`.
+
+Create requests require a non-empty `name` (maximum 200 characters) and a
+JSON-object `filters`; optional `description` is capped at 2,000 characters,
+`sort` has at most eight terms, and `shared` controls visibility to other
+actors. Supported saved filter keys are the search fields above plus
+`query`/`claimed_by` and `project_id`/`project_ids` aliases. Scoped bearer
+tokens cannot create or update a view that names a project outside their
+allow-list. A shared view never widens the task project ceiling of the actor
+executing it, and a view naming inaccessible projects is omitted from a
+scoped actor's shared-view results.
+
 ## Pagination and filters
 
 Collection routes default to 50 records and cap `limit` at 200. Non-positive,
 malformed, or repeated `limit` values return `400`; values above 200 are capped.
-Their `next_cursor` is an opaque offset cursor (the runtime accepts raw decimal
-or URL-safe base64 offset input); malformed, negative, empty, or repeated
-supplied cursor values return `400`. The terminal value is the literal empty
-string, not JSON null. Boolean filters (`archived`, `favorite`, `action_needed`,
-and agent `disabled`) reject empty, malformed, or repeated values. Agents are listed as
+The project task collection returns a versioned, opaque keyset `next_cursor`
+scoped to its requested sort and direction; retained collection routes continue
+to accept raw decimal or URL-safe base64 offset cursors. Task clients should
+pass that task `next_cursor` unchanged on the next request. Malformed,
+negative, empty, or repeated supplied cursor values return `400`. The terminal
+value is the literal empty string, not JSON null. Boolean filters (`archived`,
+`favorite`, `action_needed`, and agent `disabled`) reject empty, malformed, or
+repeated values. Agents are listed as
 `kind=agent` only and disabled agents are excluded by default; pass
 `disabled=true` to include them.
 
 Task listings support `state`, `column`, `kind`, `priority`, `severity`,
 `label`, `assignee`, `reporter`, `resolution`, `dependency`, `q`,
-`updated_after`, `cursor`, `agent_state`, `action_needed`, and `limit`.
+`updated_after`, `sort`, `order`, `cursor`, `agent_state`, `action_needed`,
+and `limit`. `sort` accepts `board`, `position`, `number`, `created_at`,
+`updated_at`, `priority`, and `title`; `order` accepts `asc` or `desc` and
+defaults to ascending. The default board ordering is column position, task
+position, task number, and task ID. Keyset cursors are strict boundaries for
+that ordering, and unchanged collections traverse without gaps or duplicates.
+Each task cursor carries the project event revision, a fixed read timestamp,
+and a task-collection revision. Any intervening task, board, enrichment, or
+heartbeat mutation invalidates the cursor with HTTP 409 and error code
+`task_collection_changed`; clients must discard it and restart from the first
+page. The response details include `restart: true` and the observed
+collection revisions. Continuations use the cursor's original read timestamp for
+`agent_state=stale` and `action_needed` classification, so page traversal does
+not drift as the wall clock advances.
 `dependency=blocked` selects tasks with at least one unmet live,
 same-project prerequisite. `dependency=ready` selects tasks with at least one
 live prerequisite and none unmet; tasks with no prerequisites do not match.
@@ -565,7 +742,8 @@ is a boolean filter and `action_needed=true` matches a snapshot whose state is
 `waiting`/`handoff` or whose 15-minute liveness window has elapsed. These
 filters classify unfinished work only; completed tasks never match them even
 though their last snapshot remains available on the Task response. Filters
-are evaluated against the server's current time. Column names and
+on a first page use the server's current time; continuation pages reuse the
+cursor's fixed read timestamp. Column names and
 label names are matched case-insensitively. Enum values must use the
 documented lowercase spelling; mixed-case values are rejected. Enum,
 identifier, boolean, and timestamp filters reject empty, malformed, repeated,
@@ -593,6 +771,8 @@ is the last event's decimal cursor or the empty string.
 - `GET /api/v1/roadmap`
 - `GET /api/v1/projects/{project}/roadmap`
 - `GET /api/v1/my-work`
+- `GET /api/v1/sidebar-counts?view={live|assigned}`
+- `GET /api/v1/issues/metrics?project={project}`
 - `GET /api/v1/events?after={cursor}&project={project}`
 - `GET|POST /api/v1/agents`
 - `POST /api/v1/agents/{agent}/tokens`

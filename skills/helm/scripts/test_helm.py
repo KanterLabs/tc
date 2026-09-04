@@ -4,11 +4,13 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import io
 import json
 import os
 import tempfile
 import unittest
+import uuid
 from email.message import Message
 from pathlib import Path
 from unittest import mock
@@ -960,6 +962,489 @@ class CommandTests(unittest.TestCase):
         self.assertNotIn("/tasks/task-applied/move", move_calls)
         self.assertEqual(second["summary"]["applied"], 0)
         self.assertEqual(second["summary"]["conflicted"], 1)
+
+
+class WorkflowCommandTests(unittest.TestCase):
+    def test_auth_check_sanitizes_identity_fields(self) -> None:
+        calls: list[tuple[str, str]] = []
+
+        class StubClient:
+            def call(self, method: str, path: str, **_kwargs):  # type: ignore[no-untyped-def]
+                calls.append((method, path))
+                return {
+                    "id": "agent-1",
+                    "kind": "agent",
+                    "name": "Build agent",
+                    "admin": False,
+                    "email": "private@example.invalid",
+                    "token": "do-not-return",
+                    "project_ids": ["project-1"],
+                    "scopes": ["tasks:read"],
+                }, {}
+
+        result = helper.cmd_auth_check(StubClient(), argparse.Namespace())  # type: ignore[arg-type]
+        self.assertEqual(calls, [("GET", "/auth/me")])
+        self.assertTrue(result["ok"])
+        self.assertNotIn("email", result["actor"])
+        self.assertNotIn("token", json.dumps(result))
+        self.assertEqual(result["actor"]["project_ids"], ["project-1"])
+
+    def test_auth_check_returns_actionable_sanitized_failure(self) -> None:
+        class StubClient:
+            config = helper.Config("https://tc.example", "secret-token")
+
+            def call(self, *_args, **_kwargs):  # type: ignore[no-untyped-def]
+                raise helper.HelmError("authentication required: secret-token", status_code=401, error_code="unauthorized")
+
+        result = helper.cmd_auth_check(StubClient(), argparse.Namespace())  # type: ignore[arg-type]
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["error"]["code"], "unauthorized")
+        self.assertIn("HELM_TOKEN", result["error"]["hint"])
+        self.assertNotIn("secret-token", json.dumps(result))
+
+    def test_new_operation_id_is_uuid4_and_rejects_malformed_explicit_ids(self) -> None:
+        generated = helper._new_operation_id()
+        self.assertEqual(generated, str(uuid.UUID(generated)))
+        self.assertEqual(uuid.UUID(generated).version, 4)
+        with self.assertRaisesRegex(helper.HelmError, "UUIDv4"):
+            helper._new_operation_id("legacy-operation")
+
+    def test_uuid_operation_derives_distinct_replay_safe_keys_per_mutation(self) -> None:
+        operation_id = "11111111-1111-4111-8111-111111111111"
+        first = helper._command_mutation_id(operation_id, "POST", "/tasks/a", {"x": 1})
+        second = helper._command_mutation_id(operation_id, "POST", "/tasks/b", {"x": 1})
+        self.assertNotEqual(first, second)
+        self.assertEqual(first, helper._command_mutation_id(operation_id, "POST", "/tasks/a", {"x": 1}))
+        self.assertEqual(uuid.UUID(first).version, 4)
+        self.assertEqual(uuid.UUID(second).version, 4)
+
+    def test_workflow_parser_dispatches_renew_and_release(self) -> None:
+        operation_id = "11111111-1111-4111-8111-111111111111"
+        renew = helper.build_parser().parse_args(
+            [
+                "renew",
+                "--task",
+                "TC-1",
+                "--lease-seconds",
+                "600",
+                "--operation-id",
+                operation_id,
+            ]
+        )
+        self.assertEqual(renew.command, "renew")
+        self.assertIs(renew.handler, helper.cmd_renew)
+        self.assertEqual(renew.task, "TC-1")
+        self.assertEqual(renew.lease_seconds, 600)
+        self.assertEqual(renew.operation_id, operation_id)
+
+        release = helper.build_parser().parse_args(
+            ["release", "--task", "TC-1", "--operation-id", operation_id]
+        )
+        self.assertEqual(release.command, "release")
+        self.assertIs(release.handler, helper.cmd_release)
+        self.assertEqual(release.task, "TC-1")
+        self.assertEqual(release.operation_id, operation_id)
+
+    def test_renew_uses_explicit_route_etag_and_uuid_key(self) -> None:
+        calls: list[tuple[str, str, dict[str, object]]] = []
+        fixed = "11111111-1111-4111-8111-111111111111"
+
+        class StubClient:
+            def call(self, method: str, path: str, **kwargs):  # type: ignore[no-untyped-def]
+                calls.append((method, path, kwargs))
+                if method == "GET":
+                    return {"id": "task-1", "version": 3, "claimed_by": "agent-1"}, {}
+                return {"id": "task-1", "version": 4}, {}
+
+        with mock.patch.object(helper.uuid, "uuid4", return_value=uuid.UUID(fixed)):
+            result = helper.cmd_renew(
+                StubClient(), argparse.Namespace(task="TC-1", lease_seconds=600, operation_id=None)  # type: ignore[arg-type]
+            )
+        self.assertEqual(calls[1][0:2], ("POST", "/tasks/task-1/renew"))
+        self.assertEqual(calls[1][2]["if_match"], 3)
+        self.assertEqual(calls[1][2]["idempotency_key"], fixed)
+        self.assertEqual(result["operation_id"], fixed)
+
+    def test_dependency_add_and_remove_use_task_version_and_uuid_key(self) -> None:
+        calls: list[tuple[str, str, dict[str, object]]] = []
+        fixed = "22222222-2222-4222-8222-222222222222"
+
+        class StubClient:
+            def call(self, method: str, path: str, **kwargs):  # type: ignore[no-untyped-def]
+                calls.append((method, path, kwargs))
+                if method == "GET":
+                    return {"id": "task-1", "key": "TC-1", "version": 7}, {}
+                return {"id": "task-1", "version": 8}, {}
+
+        add_args = argparse.Namespace(task="TC-1", prerequisite="TC-2", operation_id=None)
+        remove_args = argparse.Namespace(task="TC-1", prerequisite="TC-2", operation_id=None)
+        with mock.patch.object(helper.uuid, "uuid4", return_value=uuid.UUID(fixed)):
+            helper.cmd_dependency_add(StubClient(), add_args)  # type: ignore[arg-type]
+            helper.cmd_dependency_remove(StubClient(), remove_args)  # type: ignore[arg-type]
+        self.assertEqual(calls[1][0:2], ("POST", "/tasks/task-1/dependencies"))
+        self.assertEqual(calls[1][2]["body"], {"prerequisite": "TC-2"})
+        self.assertEqual(calls[1][2]["if_match"], 7)
+        self.assertEqual(calls[1][2]["idempotency_key"], fixed)
+        self.assertEqual(calls[3][0:2], ("DELETE", "/tasks/task-1/dependencies/TC-2"))
+        self.assertEqual(calls[3][2]["if_match"], 7)
+        self.assertEqual(calls[3][2]["idempotency_key"], fixed)
+
+    def test_timeline_preserves_opaque_before_cursor(self) -> None:
+        paths: list[str] = []
+
+        class StubClient:
+            def call(self, _method: str, path: str, **_kwargs):  # type: ignore[no-untyped-def]
+                paths.append(path)
+                if "before=" not in path:
+                    return {"data": [{"id": "event-1"}], "next_cursor": "opaque/cursor"}, {}
+                return {"data": [{"id": "event-2"}], "next_cursor": ""}, {}
+
+        result = helper.cmd_timeline(
+            StubClient(),
+            argparse.Namespace(task="TC-1", project=None, before="", kind="comment", limit=1, all=True),  # type: ignore[arg-type]
+        )
+        self.assertEqual([item["id"] for item in result["data"]], ["event-1", "event-2"])
+        self.assertIn("before=opaque%2Fcursor", paths[1])
+        self.assertEqual(result["next_cursor"], "")
+
+    def test_events_follows_monotonic_cursor(self) -> None:
+        paths: list[str] = []
+
+        class StubClient:
+            def call(self, _method: str, path: str, **_kwargs):  # type: ignore[no-untyped-def]
+                paths.append(path)
+                if "after=0" in path:
+                    return {"data": [{"cursor": 1}], "next_cursor": "2"}, {}
+                return {"data": [{"cursor": 3}], "next_cursor": ""}, {}
+
+        result = helper.cmd_events(
+            StubClient(), argparse.Namespace(after=0, project="TC", limit=1, all=True)  # type: ignore[arg-type]
+        )
+        self.assertEqual(len(result["data"]), 2)
+        self.assertIn("after=2", paths[1])
+
+    def test_events_rejects_repeated_cursor_without_looping(self) -> None:
+        class StubClient:
+            def call(self, _method: str, _path: str, **_kwargs):  # type: ignore[no-untyped-def]
+                return {"data": [{"cursor": 1}], "next_cursor": "1"}, {}
+
+        with self.assertRaisesRegex(helper.HelmError, "repeated cursor"):
+            helper.cmd_events(StubClient(), argparse.Namespace(after=0, project=None, limit=1, all=True))  # type: ignore[arg-type]
+
+    def test_timeline_rejects_repeated_opaque_cursor_without_looping(self) -> None:
+        class StubClient:
+            def call(self, _method: str, _path: str, **_kwargs):  # type: ignore[no-untyped-def]
+                return {"data": [{"id": "event-1"}], "next_cursor": "same"}, {}
+
+        with self.assertRaisesRegex(helper.HelmError, "repeated cursor"):
+            helper.cmd_timeline(
+                StubClient(),
+                argparse.Namespace(task="TC-1", project=None, before="", kind=None, limit=1, all=True),  # type: ignore[arg-type]
+            )
+
+    def test_issues_support_filters_and_cursor_pages(self) -> None:
+        paths: list[str] = []
+
+        class StubClient:
+            def call(self, _method: str, path: str, **_kwargs):  # type: ignore[no-untyped-def]
+                paths.append(path)
+                if "cursor=opaque" not in path:
+                    return {"data": [{"id": "bug-1"}], "next_cursor": "opaque"}, {}
+                return {"data": [{"id": "bug-2"}], "next_cursor": ""}, {}
+
+        result = helper.cmd_issues(
+            StubClient(),
+            argparse.Namespace(
+                project="TC",
+                state=None,
+                column=None,
+                priority="high",
+                severity="untriaged",
+                label=None,
+                assignee=None,
+                reporter=None,
+                resolution="unresolved",
+                agent_state=None,
+                action_needed="true",
+                query="crash",
+                updated_after=None,
+                cursor="",
+                limit=1,
+                all=True,
+            ),  # type: ignore[arg-type]
+        )
+        self.assertEqual([item["id"] for item in result["data"]], ["bug-1", "bug-2"])
+        self.assertIn("severity=untriaged", paths[0])
+        self.assertIn("cursor=opaque", paths[1])
+
+    def test_bug_report_and_lifecycle_actions_send_structured_payloads(self) -> None:
+        calls: list[tuple[str, str, dict[str, object]]] = []
+        fixed = "33333333-3333-4333-8333-333333333333"
+
+        class StubClient:
+            def call(self, method: str, path: str, **kwargs):  # type: ignore[no-untyped-def]
+                calls.append((method, path, kwargs))
+                if method == "GET" and path == "/projects?limit=200":
+                    return {"data": [{"id": "project-1", "key": "TC"}]}, {}
+                if method == "GET":
+                    return {"id": "bug-1", "version": 2, "kind": "bug"}, {}
+                return {"id": "bug-1", "version": 3}, {}
+
+        report_args = argparse.Namespace(
+            project="TC",
+            title="Crash",
+            actual_behavior="It exits",
+            expected_behavior="It completes",
+            reproduction_steps=None,
+            environment=None,
+            affected_version=None,
+            severity="s2",
+            description=None,
+            priority="high",
+            column=None,
+            assignee=None,
+            operation_id=None,
+        )
+        triage_args = argparse.Namespace(task="TC-1", severity="s2", priority=None, assignee=None, column=None, operation_id=None)
+        resolve_args = argparse.Namespace(task="TC-1", resolution="fixed", duplicate_of=None, note=None, operation_id=None)
+        with mock.patch.object(helper.uuid, "uuid4", return_value=uuid.UUID(fixed)):
+            helper.cmd_bug_report(StubClient(), report_args)  # type: ignore[arg-type]
+            helper.cmd_bug_triage(StubClient(), triage_args)  # type: ignore[arg-type]
+            helper.cmd_bug_resolve(StubClient(), resolve_args)  # type: ignore[arg-type]
+        report = next(entry for entry in calls if entry[1] == "/projects/project-1/tasks")
+        self.assertEqual(report[2]["body"]["kind"], "bug")
+        self.assertEqual(report[2]["body"]["bug"]["actual_behavior"], "It exits")
+        self.assertEqual(report[2]["idempotency_key"], fixed)
+        triage = next(entry for entry in calls if entry[1] == "/tasks/bug-1/triage")
+        self.assertEqual(triage[2]["if_match"], 2)
+        self.assertEqual(triage[2]["body"], {"severity": "s2"})
+        resolve = next(entry for entry in calls if entry[1] == "/tasks/bug-1/resolve")
+        self.assertEqual(resolve[2]["body"], {"resolution": "fixed"})
+
+    def test_bug_duplicate_and_reopen_send_structured_payloads(self) -> None:
+        calls: list[tuple[str, str, dict[str, object]]] = []
+        fixed = "44444444-4444-4444-8444-444444444444"
+
+        class StubClient:
+            def call(self, method: str, path: str, **kwargs):  # type: ignore[no-untyped-def]
+                calls.append((method, path, kwargs))
+                if method == "GET":
+                    return {"id": "bug-1", "version": 8, "kind": "bug"}, {}
+                return {"id": "bug-1", "version": 9, "kind": "bug"}, {}
+
+        duplicate_args = argparse.Namespace(
+            task="TC-2",
+            duplicate_of="TC-3",
+            note="Same regression",
+            operation_id=None,
+        )
+        reopen_args = argparse.Namespace(
+            task="TC-2",
+            reason="The regression remains reproducible",
+            operation_id=None,
+        )
+        with mock.patch.object(helper.uuid, "uuid4", return_value=uuid.UUID(fixed)):
+            duplicate = helper.cmd_bug_duplicate(StubClient(), duplicate_args)  # type: ignore[arg-type]
+            reopen = helper.cmd_bug_reopen(StubClient(), reopen_args)  # type: ignore[arg-type]
+
+        self.assertEqual(duplicate["operation_id"], fixed)
+        self.assertEqual(reopen["operation_id"], fixed)
+        self.assertEqual(calls[1][0:2], ("POST", "/tasks/bug-1/resolve"))
+        self.assertEqual(
+            calls[1][2]["body"],
+            {"resolution": "duplicate", "duplicate_of": "TC-3", "note": "Same regression"},
+        )
+        self.assertEqual(calls[1][2]["if_match"], 8)
+        self.assertEqual(calls[3][0:2], ("POST", "/tasks/bug-1/reopen"))
+        self.assertEqual(calls[3][2]["body"], {"reason": "The regression remains reproducible"})
+        self.assertEqual(calls[3][2]["if_match"], 8)
+
+    def test_cli_parser_dispatches_coherent_agent_workflow(self) -> None:
+        """Exercise representative reads and mutations through the real CLI."""
+
+        class WorkflowClient:
+            config = helper.Config("https://tc.example", "test-token")
+
+            def __init__(self) -> None:
+                self.calls: list[tuple[str, str, dict[str, object]]] = []
+                self.task_version = 1
+                self.task_claimed = False
+                self.task_semantic = "ready"
+                self.bug_version = 1
+
+            def task(self) -> dict[str, object]:
+                task: dict[str, object] = {
+                    "id": "task-1",
+                    "key": "TC-1",
+                    "project_id": "project-1",
+                    "version": self.task_version,
+                    "column_id": "column-active" if self.task_semantic == "active" else "column-ready",
+                    "semantic_state": self.task_semantic,
+                }
+                if self.task_claimed:
+                    task["claimed_by"] = "agent-1"
+                return task
+
+            def bug(self) -> dict[str, object]:
+                return {
+                    "id": "bug-1",
+                    "key": "TC-2",
+                    "project_id": "project-1",
+                    "version": self.bug_version,
+                    "kind": "bug",
+                }
+
+            def call(self, method: str, path: str, **kwargs):  # type: ignore[no-untyped-def]
+                self.calls.append((method, path, kwargs))
+                if method == "GET" and path == "/auth/me":
+                    return {"id": "agent-1", "kind": "agent", "name": "Workflow agent", "admin": False}, {}
+                if method == "GET" and path.startswith("/projects?"):
+                    return {"data": [{"id": "project-1", "key": "TC", "name": "Test Coordination"}], "next_cursor": ""}, {}
+                if method == "GET" and path.startswith("/projects/project-1/tasks?"):
+                    return {"data": [self.task()], "next_cursor": ""}, {}
+                if method == "GET" and path == "/tasks/TC-1":
+                    return self.task(), {}
+                if method == "GET" and path == "/tasks/TC-2":
+                    return self.bug(), {}
+                if method == "GET" and path == "/projects/project-1/columns?limit=200":
+                    return {"data": [{"id": "column-active", "semantic_state": "active"}], "next_cursor": ""}, {}
+                if method == "GET" and path == "/tasks/task-1/dependencies":
+                    return {"prerequisites": [], "dependents": []}, {}
+                if method == "GET" and path.startswith("/tasks/TC-1/timeline?"):
+                    return {"data": [{"id": "timeline-1", "kind": "agent_progress"}], "next_cursor": ""}, {}
+                if method == "GET" and path.startswith("/issues?"):
+                    return {"data": [self.bug()], "next_cursor": ""}, {}
+                if method == "POST" and path == "/tasks/task-1/claim":
+                    self.task_claimed = True
+                    self.task_version += 1
+                    return self.task(), {}
+                if method == "POST" and path == "/tasks/task-1/renew":
+                    self.task_version += 1
+                    return self.task(), {}
+                if method == "POST" and path == "/tasks/task-1/progress":
+                    self.task_version += 1
+                    return self.task(), {}
+                if method == "POST" and path == "/tasks/task-1/release":
+                    self.task_claimed = False
+                    self.task_version += 1
+                    return self.task(), {}
+                if method == "PATCH" and path == "/tasks/task-1":
+                    self.task_semantic = "active"
+                    self.task_version += 1
+                    return self.task(), {}
+                if method == "POST" and path == "/tasks/task-1/dependencies":
+                    self.task_version += 1
+                    return self.task(), {}
+                if method == "DELETE" and path == "/tasks/task-1/dependencies/TC-2":
+                    self.task_version += 1
+                    return self.task(), {}
+                if method == "POST" and path == "/projects/project-1/tasks":
+                    return self.bug(), {}
+                if method == "POST" and path in {
+                    "/tasks/bug-1/triage",
+                    "/tasks/bug-1/resolve",
+                    "/tasks/bug-1/reopen",
+                }:
+                    self.bug_version += 1
+                    return self.bug(), {}
+                raise AssertionError(f"unexpected mocked API call: {method} {path}")
+
+        client = WorkflowClient()
+
+        def invoke(argv: list[str]) -> object:
+            stdout = io.StringIO()
+            with (
+                mock.patch.object(helper, "Client", return_value=client),
+                mock.patch.object(helper, "load_config", return_value=client.config),
+                mock.patch.object(helper.sys, "argv", ["helm.py", *argv]),
+                mock.patch.object(helper, "_record_session_start"),
+                mock.patch.object(helper, "_record_session_progress"),
+                mock.patch.object(helper, "_clear_matching_session"),
+                contextlib.redirect_stdout(stdout),
+            ):
+                self.assertEqual(helper.main(), 0, argv)
+            return json.loads(stdout.getvalue())
+
+        self.assertTrue(invoke(["auth-check"])["authenticated"])
+        self.assertEqual(invoke(["projects", "--limit", "2"])["projects"][0]["key"], "TC")
+        self.assertEqual(invoke(["tasks", "--project", "TC", "--limit", "2"])["tasks"][0]["key"], "TC-1")
+        self.assertEqual(invoke(["resume", "--task", "TC-1", "--lease-seconds", "600", "--operation-id", "11111111-1111-4111-8111-111111111111"])["task"]["semantic_state"], "active")
+        self.assertEqual(invoke(["renew", "--task", "TC-1", "--lease-seconds", "600", "--operation-id", "22222222-2222-4222-8222-222222222222"])["task"]["version"], 4)
+        self.assertEqual(invoke(["progress", "--task", "TC-1", "--message", "Working", "--state", "verifying", "--phase", "API", "--completed", "1", "--total", "2", "--next", "Run tests", "--checkpoint-ref", "client", "--checkpoint-ref", "tests", "--operation-id", "33333333-3333-4333-8333-333333333333"])["task"]["version"], 5)
+        self.assertFalse(invoke(["release", "--task", "TC-1", "--operation-id", "44444444-4444-4444-8444-444444444444"])["task"].get("claimed_by"))
+        self.assertEqual(invoke(["dependencies", "list", "--task", "TC-1"])["prerequisites"], [])
+        invoke(["dependencies", "add", "--task", "TC-1", "--prerequisite", "TC-2", "--operation-id", "55555555-5555-4555-8555-555555555555"])
+        invoke(["dependencies", "remove", "--task", "TC-1", "--prerequisite", "TC-2", "--operation-id", "66666666-6666-4666-8666-666666666666"])
+        self.assertEqual(invoke(["timeline", "--task", "TC-1", "--kind", "agent_progress"])["data"][0]["kind"], "agent_progress")
+        self.assertEqual(invoke(["issues", "--project", "TC", "--severity", "s2", "--resolution", "unresolved"])["data"][0]["key"], "TC-2")
+        self.assertEqual(invoke(["bug-report", "--project", "TC", "--title", "Crash", "--actual-behavior", "It exits"])["task"]["kind"], "bug")
+        invoke(["bug-triage", "--task", "TC-2", "--severity", "s2", "--operation-id", "77777777-7777-4777-8777-777777777777"])
+        invoke(["bug-resolve", "--task", "TC-2", "--resolution", "fixed", "--operation-id", "88888888-8888-4888-8888-888888888888"])
+        invoke(["bug-duplicate", "--task", "TC-2", "--duplicate-of", "TC-3", "--operation-id", "99999999-9999-4999-8999-999999999999"])
+        invoke(["bug-reopen", "--task", "TC-2", "--reason", "Still reproducible", "--operation-id", "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"])
+
+        expected_paths = {
+            "/auth/me",
+            "/projects?limit=2",
+            "/projects?limit=200",
+            "/projects/project-1/tasks?limit=2",
+            "/tasks/TC-1",
+            "/tasks/task-1/claim",
+            "/tasks/task-1/renew",
+            "/tasks/task-1/progress",
+            "/tasks/task-1/release",
+            "/tasks/task-1/dependencies",
+            "/tasks/task-1/dependencies/TC-2",
+            "/tasks/TC-1/timeline?kind=agent_progress&limit=50",
+            "/issues?project=TC&severity=s2&resolution=unresolved&limit=50",
+            "/projects/project-1/tasks",
+            "/tasks/bug-1/triage",
+            "/tasks/bug-1/resolve",
+            "/tasks/bug-1/reopen",
+        }
+        actual_paths = {path for _method, path, _kwargs in client.calls}
+        self.assertTrue(expected_paths.issubset(actual_paths))
+        release_call = next(entry for entry in client.calls if entry[1] == "/tasks/task-1/release")
+        self.assertNotIn("body", release_call[2])
+        for method, path, kwargs in client.calls:
+            if method in {"POST", "PATCH", "DELETE"}:
+                self.assertIn("idempotency_key", kwargs, (method, path))
+                if path != "/projects/project-1/tasks":
+                    self.assertIn("if_match", kwargs, (method, path))
+
+    def test_client_request_does_not_place_token_in_url_or_user_agent(self) -> None:
+        class Response:
+            headers = Message()
+
+            def __enter__(self):  # type: ignore[no-untyped-def]
+                return self
+
+            def __exit__(self, *_args):  # type: ignore[no-untyped-def]
+                return False
+
+            def read(self, _limit: int) -> bytes:
+                return b"{}"
+
+        client = helper.Client(helper.Config("https://tc.example", "secret-token"))
+        opener = mock.Mock()
+        opener.open.return_value = Response()
+        with mock.patch.object(helper.request, "build_opener", return_value=opener):
+            client.call("GET", "/auth/me")
+        request_object = opener.open.call_args.args[0]
+        self.assertNotIn("secret-token", request_object.full_url)
+        self.assertNotIn("secret-token", request_object.headers.get("User-agent", ""))
+        self.assertEqual(request_object.headers.get("Authorization"), "Bearer secret-token")
+
+    def test_main_emits_machine_readable_sanitized_errors(self) -> None:
+        stderr = io.StringIO()
+        with mock.patch.object(helper, "load_config", side_effect=helper.HelmError("bad credentials", status_code=401, error_code="unauthorized")), mock.patch.object(
+            helper.sys, "argv", ["helm.py", "events"]
+        ), contextlib.redirect_stderr(stderr):
+            result = helper.main()
+        self.assertEqual(result, 1)
+        payload = json.loads(stderr.getvalue())
+        self.assertEqual(payload["error"]["code"], "unauthorized")
+        self.assertNotIn("secret-token", stderr.getvalue())
 
 
 class RetryTests(unittest.TestCase):

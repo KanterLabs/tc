@@ -331,6 +331,9 @@ func (s *Store) TriageBugWithClaimOverride(ctx context.Context, id string, input
 	if column.ProjectID != current.ProjectID {
 		return Task{}, invalid("column belongs to another project", nil)
 	}
+	if column.ArchivedAt != nil {
+		return Task{}, invalid("column is archived", nil)
+	}
 	if column.SemanticState == "completed" && current.Bug.Resolution == nil {
 		return Task{}, invalid("bugs must be resolved before entering a completed column", nil)
 	}
@@ -341,19 +344,17 @@ func (s *Store) TriageBugWithClaimOverride(ctx context.Context, id string, input
 			return Task{}, err
 		}
 	}
-	beforeDependency := dependencyTaskFromTask(current, sourceColumn.SemanticState)
-	timestamp := now()
-	completedAt := any(nil)
-	if column.SemanticState == "completed" {
-		if current.CompletedAt != nil {
-			completedAt = *current.CompletedAt
-		} else {
-			completedAt = timestamp
-		}
+	if sourceColumn.ArchivedAt != nil {
+		return Task{}, invalid("task is assigned to an archived column", nil)
 	}
+	timestamp := now()
 	err = s.withTx(ctx, func(tx *sql.Tx) error {
-		query := `UPDATE tasks SET priority=?, assignee_id=NULLIF(?, ''), column_id=?, completed_at=?, version=version+1, updated_at=? WHERE id=? AND kind='bug' AND version=? AND deleted_at IS NULL`
-		args := []any{priority, assignee, columnID, completedAt, timestamp, id, expected}
+		// Derive completion from the authoritative destination row in the guarded
+		// UPDATE. The destination can be reclassified or archived while this
+		// operation waits for SQLite's writer lock, so the preflight snapshot is
+		// only an early validation hint.
+		query := `UPDATE tasks SET priority=?, assignee_id=NULLIF(?, ''), column_id=?, completed_at=CASE WHEN (SELECT semantic_state FROM columns WHERE id=?)='completed' THEN CASE WHEN (SELECT semantic_state FROM columns WHERE id=tasks.column_id)='completed' THEN tasks.completed_at ELSE ? END ELSE NULL END, version=version+1, updated_at=? WHERE id=? AND kind='bug' AND version=? AND deleted_at IS NULL`
+		args := []any{priority, assignee, columnID, columnID, timestamp, timestamp, id, expected}
 		if !allowClaimOverride {
 			query += ` AND (claimed_by IS NULL OR claim_expires_at IS NULL OR julianday(claim_expires_at)<=julianday(?) OR claimed_by=?)`
 			args = append(args, timestamp, actorID)
@@ -366,6 +367,32 @@ func (s *Store) TriageBugWithClaimOverride(ctx context.Context, id string, input
 		if count == 0 {
 			return bugMutationFailure(ctx, tx, id, actorID, expected, timestamp, current, allowClaimOverride)
 		}
+		destinationState, err := authoritativeColumnStateTx(ctx, tx, columnID, current.ProjectID)
+		if err != nil {
+			return err
+		}
+		sourceState := destinationState
+		if current.ColumnID != columnID {
+			sourceState, err = authoritativeColumnStateTx(ctx, tx, current.ColumnID, current.ProjectID)
+			if err != nil {
+				return err
+			}
+		}
+		if err := validateTaskBugLifecycleTx(ctx, tx, id, bugKind, destinationState); err != nil {
+			return err
+		}
+		beforeDependency := dependencyTaskFromTask(current, sourceState)
+		checklistStatus := checklistCompletionStatus{}
+		completionTransition := sourceState != "completed" && destinationState == "completed"
+		if completionTransition {
+			checklistStatus, err = checklistCompletionStatusForTaskTx(ctx, tx, current.ProjectID, current.ID)
+			if err != nil {
+				return err
+			}
+			if err := rejectIncompleteChecklist(checklistStatus); err != nil {
+				return err
+			}
+		}
 		result, err = tx.ExecContext(ctx, `UPDATE bug_details SET severity=? WHERE task_id=?`, severity, id)
 		if err != nil {
 			return err
@@ -373,7 +400,11 @@ func (s *Store) TriageBugWithClaimOverride(ctx context.Context, id string, input
 		if changed, _ := result.RowsAffected(); changed == 0 {
 			return invalid("bug details not found", nil)
 		}
-		if _, err = insertEvent(ctx, tx, "bug.triaged", actorID, current.ProjectID, id, map[string]any{"version": expected + 1}); err != nil {
+		eventPayload := map[string]any{"version": expected + 1}
+		if completionTransition {
+			addChecklistCompletionEventFields(eventPayload, checklistStatus)
+		}
+		if _, err = insertEvent(ctx, tx, "bug.triaged", actorID, current.ProjectID, id, eventPayload); err != nil {
 			return err
 		}
 		change, changed, err := dependencyTaskStateChange(ctx, tx, beforeDependency)
@@ -435,21 +466,10 @@ func (s *Store) ResolveBugWithClaimOverride(ctx context.Context, id string, inpu
 	if err != nil {
 		return Task{}, err
 	}
-	sourceColumn, err := s.GetColumn(ctx, current.ColumnID)
-	if err != nil {
-		return Task{}, err
-	}
-	beforeDependency := dependencyTaskFromTask(current, sourceColumn.SemanticState)
 	timestamp := now()
 	err = s.withTx(ctx, func(tx *sql.Tx) error {
+		checklistStatus := checklistCompletionStatus{}
 		duplicateTargetID := ""
-		if resolution == "duplicate" {
-			target, targetErr := s.resolveDuplicateTargetTx(ctx, tx, current.ProjectID, id, duplicateOf)
-			if targetErr != nil {
-				return targetErr
-			}
-			duplicateTargetID = target
-		}
 		query := `UPDATE tasks SET column_id=?, completed_at=CASE WHEN (SELECT semantic_state FROM columns WHERE id=tasks.column_id)='completed' AND tasks.completed_at IS NOT NULL THEN tasks.completed_at ELSE ? END, claimed_by=NULL, claim_expires_at=NULL, version=version+1, updated_at=? WHERE id=? AND kind='bug' AND version=? AND deleted_at IS NULL`
 		args := []any{completedColumn.ID, timestamp, timestamp, id, expected}
 		if !allowClaimOverride {
@@ -463,6 +483,43 @@ func (s *Store) ResolveBugWithClaimOverride(ctx context.Context, id string, inpu
 		count, _ := result.RowsAffected()
 		if count == 0 {
 			return bugMutationFailure(ctx, tx, id, actorID, expected, timestamp, current, allowClaimOverride)
+		}
+		// Resolve duplicate targets only after the guarded task UPDATE has
+		// acquired SQLite's writer lock. A pre-write lookup in a deferred
+		// transaction can retain a stale WAL snapshot and fail with
+		// SQLITE_BUSY_SNAPSHOT when the writer arrives; any invalid target still
+		// rolls back the task update through withTx.
+		if resolution == "duplicate" {
+			target, targetErr := s.resolveDuplicateTargetTx(ctx, tx, current.ProjectID, id, duplicateOf)
+			if targetErr != nil {
+				return targetErr
+			}
+			duplicateTargetID = target
+		}
+		destinationState, err := authoritativeColumnStateTx(ctx, tx, completedColumn.ID, current.ProjectID)
+		if err != nil {
+			return err
+		}
+		if destinationState != "completed" {
+			return conflict("bug destination changed semantic state", map[string]any{"column_id": completedColumn.ID, "expected_state": "completed", "current_state": destinationState})
+		}
+		sourceState := destinationState
+		if current.ColumnID != completedColumn.ID {
+			sourceState, err = authoritativeColumnStateTx(ctx, tx, current.ColumnID, current.ProjectID)
+			if err != nil {
+				return err
+			}
+		}
+		beforeDependency := dependencyTaskFromTask(current, sourceState)
+		// ResolveBug is another completion path. Evaluate the project policy
+		// after the guarded write so require-policy rejection rolls back the bug
+		// row, resolution metadata, links, comments, and activity atomically.
+		checklistStatus, err = checklistCompletionStatusForTaskTx(ctx, tx, current.ProjectID, current.ID)
+		if err != nil {
+			return err
+		}
+		if err := rejectIncompleteChecklist(checklistStatus); err != nil {
+			return err
 		}
 		var duplicateValue any
 		if duplicateTargetID != "" {
@@ -492,7 +549,9 @@ func (s *Store) ResolveBugWithClaimOverride(ctx context.Context, id string, inpu
 		if resolution == "duplicate" {
 			eventType = "bug.duplicated"
 		}
-		if _, err = insertEvent(ctx, tx, eventType, actorID, current.ProjectID, id, map[string]any{"version": expected + 1, "resolution": resolution}); err != nil {
+		eventPayload := map[string]any{"version": expected + 1, "resolution": resolution}
+		addChecklistCompletionEventFields(eventPayload, checklistStatus)
+		if _, err = insertEvent(ctx, tx, eventType, actorID, current.ProjectID, id, eventPayload); err != nil {
 			return err
 		}
 		change, changed, err := dependencyTaskStateChange(ctx, tx, beforeDependency)
@@ -545,11 +604,6 @@ func (s *Store) ReopenBugWithClaimOverride(ctx context.Context, id, reason strin
 	if err != nil {
 		return Task{}, err
 	}
-	sourceColumn, err := s.GetColumn(ctx, current.ColumnID)
-	if err != nil {
-		return Task{}, err
-	}
-	beforeDependency := dependencyTaskFromTask(current, sourceColumn.SemanticState)
 	timestamp := now()
 	err = s.withTx(ctx, func(tx *sql.Tx) error {
 		query := `UPDATE tasks SET column_id=?, completed_at=NULL, claimed_by=NULL, claim_expires_at=NULL, version=version+1, updated_at=? WHERE id=? AND kind='bug' AND version=? AND deleted_at IS NULL`
@@ -566,6 +620,21 @@ func (s *Store) ReopenBugWithClaimOverride(ctx context.Context, id, reason strin
 		if count == 0 {
 			return bugMutationFailure(ctx, tx, id, actorID, expected, timestamp, current, allowClaimOverride)
 		}
+		destinationState, err := authoritativeColumnStateTx(ctx, tx, backlogColumn.ID, current.ProjectID)
+		if err != nil {
+			return err
+		}
+		if destinationState != "backlog" {
+			return conflict("bug destination changed semantic state", map[string]any{"column_id": backlogColumn.ID, "expected_state": "backlog", "current_state": destinationState})
+		}
+		sourceState := destinationState
+		if current.ColumnID != backlogColumn.ID {
+			sourceState, err = authoritativeColumnStateTx(ctx, tx, current.ColumnID, current.ProjectID)
+			if err != nil {
+				return err
+			}
+		}
+		beforeDependency := dependencyTaskFromTask(current, sourceState)
 		if _, err := tx.ExecContext(ctx, `UPDATE bug_details SET resolution=NULL, resolved_by=NULL, resolved_at=NULL, duplicate_of=NULL WHERE task_id=?`, id); err != nil {
 			return err
 		}

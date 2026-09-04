@@ -403,46 +403,46 @@
   }
   .dependency-heading { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; }
   .dependency-heading h2 { margin: 0; color: var(--ink); font-size: 12px; }
-  .dependency-heading p { margin: 4px 0 0; color: var(--muted); font-size: 10px; line-height: 1.45; }
-  .dependency-blocked, .dependency-ready { flex: 0 0 auto; padding: 4px 7px; border-radius: 6px; font-size: 9px; font-weight: 800; }
+  .dependency-heading p { margin: 4px 0 0; color: var(--muted); font-size: 11px; line-height: 1.45; }
+  .dependency-blocked, .dependency-ready { flex: 0 0 auto; padding: 4px 7px; border-radius: 6px; font-size: 11px; font-weight: 800; }
   .dependency-blocked { color: var(--red); background: var(--red-soft); }
   .dependency-ready { color: var(--green); background: var(--green-soft); }
   .relationship-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; }
   .relationship-grid section { min-width: 0; }
-  .relationship-grid h3 { display: flex; align-items: center; gap: 5px; margin: 0 0 7px; color: var(--ink-soft); font-size: 10px; }
-  .relationship-grid h3 span { min-width: 18px; padding: 2px 5px; border-radius: 999px; color: var(--muted); background: var(--surface-muted); font-size: 8px; text-align: center; }
+  .relationship-grid h3 { display: flex; align-items: center; gap: 5px; margin: 0 0 7px; color: var(--ink-soft); font-size: 11px; }
+  .relationship-grid h3 span { min-width: 18px; padding: 2px 5px; border-radius: 999px; color: var(--muted); background: var(--surface-muted); font-size: 11px; text-align: center; }
   .relationship-list { display: grid; gap: 6px; margin: 0; padding: 0; list-style: none; }
   .relationship-list li { position: relative; display: grid; grid-template-columns: minmax(0, 1fr) 34px; gap: 4px; min-width: 0; }
   .dependent-list li { grid-template-columns: minmax(0, 1fr); }
   .relationship-link { min-width: 0; min-height: 44px; display: grid; grid-template-columns: auto minmax(0, 1fr) auto; align-items: center; gap: 7px; padding: 7px 8px; border: 1px solid var(--border); border-radius: 8px; color: var(--ink); background: var(--surface); text-align: left; }
   .relationship-link:hover, .relationship-link:focus-visible { border-color: var(--purple); outline: none; }
-  .relationship-key { color: var(--purple); font: 800 8px ui-monospace, SFMono-Regular, Menlo, monospace; }
-  .relationship-title { min-width: 0; overflow: hidden; font-size: 9px; font-weight: 650; text-overflow: ellipsis; white-space: nowrap; }
-  .relationship-state { padding: 2px 5px; border-radius: 5px; color: var(--amber); background: var(--amber-soft); font-size: 7px; font-weight: 800; }
+  .relationship-key { color: var(--purple); font: 800 11px ui-monospace, SFMono-Regular, Menlo, monospace; }
+  .relationship-title { min-width: 0; overflow: hidden; font-size: 11px; font-weight: 650; text-overflow: ellipsis; white-space: nowrap; }
+  .relationship-state { padding: 2px 5px; border-radius: 5px; color: var(--amber); background: var(--amber-soft); font-size: 11px; font-weight: 800; }
   .relationship-state.done { color: var(--green); background: var(--green-soft); }
   .remove-relationship { min-width: 34px; min-height: 44px; border: 1px solid var(--border); border-radius: 8px; color: var(--muted); background: var(--surface); font-size: 16px; }
   .remove-relationship:hover:not(:disabled), .remove-relationship:focus-visible { color: var(--red); border-color: var(--red); outline: none; }
   .remove-relationship:disabled { cursor: wait; opacity: .55; }
-  .relationship-empty { min-height: 44px; display: flex; align-items: center; margin: 0; padding: 8px; border: 1px dashed var(--border); border-radius: 8px; color: var(--faint); font-size: 9px; }
-  .relationship-error { grid-column: 1 / -1; margin: 0; color: var(--red); font-size: 9px; line-height: 1.4; }
+  .relationship-empty { min-height: 44px; display: flex; align-items: center; margin: 0; padding: 8px; border: 1px dashed var(--border); border-radius: 8px; color: var(--faint); font-size: 11px; }
+  .relationship-error { grid-column: 1 / -1; margin: 0; color: var(--red); font-size: 11px; line-height: 1.4; }
   .dependency-add { display: grid; gap: 5px; padding-top: 12px; border-top: 1px solid var(--border); }
-  .dependency-add > label { color: var(--ink-soft); font-size: 10px; font-weight: 700; }
-  .dependency-add > small { color: var(--faint); font-size: 8px; }
+  .dependency-add > label { color: var(--ink-soft); font-size: 11px; font-weight: 700; }
+  .dependency-add > small { color: var(--faint); font-size: 11px; }
   .combobox-wrap { position: relative; }
   .combobox-wrap > input { width: 100%; min-height: 44px; padding-right: 34px; }
   .dependency-options { position: absolute; top: calc(100% + 4px); right: 0; left: 0; z-index: 8; max-height: 225px; overflow: auto; padding: 5px; border: 1px solid var(--border-strong); border-radius: 9px; background: var(--surface-raised); box-shadow: var(--shadow-md); }
   .dependency-options button { width: 100%; min-height: 44px; display: grid; grid-template-columns: auto minmax(0, 1fr) auto; align-items: center; gap: 8px; padding: 7px 8px; border: 0; border-radius: 6px; color: var(--ink); background: transparent; text-align: left; }
   .dependency-options button:hover, .dependency-options button.active { background: var(--purple-soft); }
-  .dependency-options button span { color: var(--purple); font: 800 8px ui-monospace, SFMono-Regular, Menlo, monospace; }
-  .dependency-options button strong { min-width: 0; overflow: hidden; font-size: 9px; text-overflow: ellipsis; white-space: nowrap; }
-  .dependency-options button small { color: var(--green); font-size: 8px; font-weight: 700; }
-  .dependency-options > p { margin: 0; padding: 10px; color: var(--muted); font-size: 9px; }
-  .dependency-loading, .dependency-load-error { min-height: 62px; display: flex; align-items: center; justify-content: center; gap: 8px; color: var(--muted); font-size: 10px; }
+  .dependency-options button span { color: var(--purple); font: 800 11px ui-monospace, SFMono-Regular, Menlo, monospace; }
+  .dependency-options button strong { min-width: 0; overflow: hidden; font-size: 11px; text-overflow: ellipsis; white-space: nowrap; }
+  .dependency-options button small { color: var(--green); font-size: 11px; font-weight: 700; }
+  .dependency-options > p { margin: 0; padding: 10px; color: var(--muted); font-size: 11px; }
+  .dependency-loading, .dependency-load-error { min-height: 62px; display: flex; align-items: center; justify-content: center; gap: 8px; color: var(--muted); font-size: 11px; }
   .dependency-loading > span:first-child, .add-spinner { width: 13px; height: 13px; border: 2px solid var(--border); border-top-color: var(--purple); border-radius: 50%; animation: spin .7s linear infinite; }
   .dependency-load-error { flex-direction: column; color: var(--red); text-align: center; }
   .dependency-load-error button { min-height: 36px; padding: 0 12px; border: 1px solid var(--border); border-radius: 7px; color: var(--ink); background: var(--surface); }
   .add-spinner { position: absolute; top: 15px; right: 11px; }
-  .dependency-note { margin: 0; color: var(--muted); font-size: 9px; }
+  .dependency-note { margin: 0; color: var(--muted); font-size: 11px; }
   .add-error { margin-top: 2px; }
   .sr-only { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; clip-path: inset(50%); }
   @keyframes spin { to { transform: rotate(360deg); } }

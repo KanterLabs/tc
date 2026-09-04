@@ -35,9 +35,14 @@ func (s *Server) tasks(w http.ResponseWriter, r *http.Request, identity auth.Ide
 		if !requireScope(w, identity, "tasks:read") {
 			return
 		}
-		limit, offset, paginationErr := parsePagination(r, 50)
+		limit, offset, cursorToken, paginationErr := parseTaskPagination(r, 50)
 		if paginationErr != nil {
 			s.writeError(w, http.StatusBadRequest, "invalid_request", paginationErr.Error(), nil)
+			return
+		}
+		sortName, descending, sortErr := parseTaskOrdering(r)
+		if sortErr != nil {
+			s.writeError(w, http.StatusBadRequest, "invalid_request", sortErr.Error(), nil)
 			return
 		}
 		state, err := parseOptionalEnum(r, "state", semanticStates)
@@ -110,24 +115,35 @@ func (s *Server) tasks(w http.ResponseWriter, r *http.Request, identity auth.Ide
 			s.writeError(w, http.StatusBadRequest, "invalid_request", err.Error(), nil)
 			return
 		}
-		filter := store.TaskFilter{State: state, Column: columnFilter, Priority: priority, Label: label, Assignee: assignee, Kind: kind, Severity: severity, Reporter: reporter, Resolution: resolution, Dependency: dependency, AgentState: agentState, ActionNeeded: actionNeeded, Query: query, Cursor: offset, Limit: limit, UpdatedAfter: updatedAfter}
-		tasks, more, err := s.Store.ListTasksWithExtra(r.Context(), project.ID, filter)
+		filter := store.TaskFilter{State: state, Column: columnFilter, Priority: priority, Label: label, Assignee: assignee, Kind: kind, Severity: severity, Reporter: reporter, Resolution: resolution, Dependency: dependency, AgentState: agentState, ActionNeeded: actionNeeded, Query: query, Cursor: offset, CursorToken: cursorToken, Sort: sortName, Descending: descending, Limit: limit, UpdatedAfter: updatedAfter}
+		tasks, more, nextCursor, err := s.Store.ListTasksCursor(r.Context(), project.ID, filter)
 		if err != nil {
-			s.writeInternal(w, err)
+			s.writeStoreError(w, err)
 			return
 		}
-		next := ""
-		if more && len(tasks) > 0 {
-			// Task numbers do not match the board ordering; the store interprets
-			// this opaque cursor as the next row offset.
-			next = encodeCursor(filter.Cursor + len(tasks))
+		if !more {
+			nextCursor = ""
 		}
-		s.writeCollection(w, tasks, next)
+		s.writeCollection(w, tasks, nextCursor)
 	case http.MethodPost:
 		input, err := decodeTaskInput(r, true)
 		if err != nil {
 			writeTaskInputError(w, err)
 			return
+		}
+		if input.ParentTaskID != nil {
+			parent, parentErr := s.Store.ResolveTaskReference(r.Context(), *input.ParentTaskID)
+			if parentErr != nil {
+				s.writeStoreErrorForIdentity(w, identity, parentErr)
+				return
+			}
+			// A scoped bearer must not learn whether a parent outside its
+			// project ceiling exists. Human callers still reach the store's
+			// same-project validation and receive the typed 400 response.
+			if !identity.CanProject(parent.ProjectID) {
+				s.writeError(w, http.StatusNotFound, "not_found", "task not found", nil)
+				return
+			}
 		}
 		s.mutation(w, r, identity, func() (int, []byte, string, error) {
 			task, err := s.Store.CreateTask(r.Context(), project.ID, input, identity.Actor.ID)
@@ -144,6 +160,85 @@ func (s *Server) tasks(w http.ResponseWriter, r *http.Request, identity auth.Ide
 	default:
 		s.writeError(w, http.StatusMethodNotAllowed, "method_not_allowed", "method not allowed", nil)
 	}
+}
+
+// parseTaskPagination preserves decimal/base64 offset cursors for retained
+// API clients while recognizing the tc1 keyset cursors emitted by the board
+// endpoint. Keyset cursors never fall back to offsets when malformed.
+func parseTaskPagination(r *http.Request, fallback int) (int, int, string, error) {
+	limit, err := parseLimit(r, fallback)
+	if err != nil {
+		return 0, 0, "", err
+	}
+	values, present := r.URL.Query()["cursor"]
+	if !present {
+		return limit, 0, "", nil
+	}
+	if len(values) != 1 {
+		return 0, 0, "", errors.New("cursor must be supplied at most once")
+	}
+	value := values[0]
+	if strings.HasPrefix(value, "tc1.") {
+		if _, err := store.DecodeTaskCursor(value); err != nil {
+			return 0, 0, "", err
+		}
+		return limit, 0, value, nil
+	}
+	offset, err := parseCursor(value)
+	if err != nil {
+		return 0, 0, "", err
+	}
+	return limit, offset, "", nil
+}
+
+func parseTaskOrdering(r *http.Request) (string, bool, error) {
+	sortValue, sortPresent, err := queryValue(r, "sort")
+	if err != nil {
+		return "", false, err
+	}
+	orderValue, orderPresent, err := queryValue(r, "order")
+	if err != nil {
+		return "", false, err
+	}
+	if sortPresent && strings.TrimSpace(sortValue) == "" {
+		return "", false, errors.New("sort must not be empty")
+	}
+	descending := false
+	var embeddedDirection *bool
+	if sortPresent {
+		value := strings.ToLower(strings.TrimSpace(sortValue))
+		for _, suffix := range []string{"_asc", ":asc", "_desc", ":desc"} {
+			if strings.HasSuffix(value, suffix) {
+				direction := strings.HasSuffix(suffix, "desc")
+				descending = direction
+				embeddedDirection = &direction
+				value = strings.TrimSuffix(value, suffix)
+				break
+			}
+		}
+		sortValue = value
+	}
+	canonical, err := store.NormalizeTaskSort(sortValue)
+	if err != nil {
+		return "", false, err
+	}
+	if orderPresent {
+		switch orderValue {
+		case "asc":
+			if embeddedDirection != nil && *embeddedDirection {
+				return "", false, errors.New("sort and order disagree")
+			}
+			descending = false
+		case "desc":
+			if embeddedDirection != nil && !*embeddedDirection {
+				return "", false, errors.New("sort and order disagree")
+			}
+			descending = true
+		default:
+			return "", false, errors.New("order must be asc or desc")
+		}
+	}
+	return canonical, descending, nil
 }
 
 func (s *Server) task(w http.ResponseWriter, r *http.Request, identity auth.Identity, id string) {
@@ -183,6 +278,17 @@ func (s *Server) task(w http.ResponseWriter, r *http.Request, identity auth.Iden
 		if err != nil {
 			writeTaskInputError(w, err)
 			return
+		}
+		if input.ParentTaskID != nil {
+			parent, parentErr := s.Store.ResolveTaskReference(r.Context(), *input.ParentTaskID)
+			if parentErr != nil {
+				s.writeStoreErrorForIdentity(w, identity, parentErr)
+				return
+			}
+			if !identity.CanProject(parent.ProjectID) {
+				s.writeError(w, http.StatusNotFound, "not_found", "task not found", nil)
+				return
+			}
 		}
 		s.mutation(w, r, identity, func() (int, []byte, string, error) {
 			updated, err := s.Store.UpdateTaskWithClaimOverride(r.Context(), id, input, version, identity.Actor.ID, !identity.IsToken && identity.Actor.Admin)
@@ -240,7 +346,7 @@ func decodeTaskInput(r *http.Request, creating bool) (store.TaskInput, error) {
 	payload = fields
 	for name := range payload {
 		switch name {
-		case "title", "description", "priority", "kind", "bug", "column_id", "column", "position", "assignee", "assignee_id", "due_at", "labels", "label_ids":
+		case "title", "description", "priority", "kind", "bug", "column_id", "column", "position", "assignee", "assignee_id", "due_at", "labels", "label_ids", "parent", "parent_id", "parent_task_id":
 		default:
 			return store.TaskInput{}, taskInputError("unknown task field: " + name)
 		}
@@ -256,7 +362,7 @@ func decodeTaskInput(r *http.Request, creating bool) (store.TaskInput, error) {
 	// clients cannot accidentally believe an ignored field was applied.
 	if !creating {
 		recognized := false
-		for _, name := range []string{"title", "description", "priority", "kind", "bug", "column_id", "column", "position", "assignee", "assignee_id", "due_at", "labels", "label_ids"} {
+		for _, name := range []string{"title", "description", "priority", "kind", "bug", "column_id", "column", "position", "assignee", "assignee_id", "due_at", "labels", "label_ids", "parent", "parent_id", "parent_task_id"} {
 			if _, ok := payload[name]; ok {
 				recognized = true
 				break
@@ -387,6 +493,23 @@ func decodeTaskInput(r *http.Request, creating bool) (store.TaskInput, error) {
 			}
 		}
 		input.DueAt, input.DueAtSet = value, true
+	}
+	if raw, ok := preferredTaskField(payload, "parent_task_id", "parent_id", "parent"); ok {
+		value, err := parseTaskString(raw, "parent_task_id", true)
+		if err != nil {
+			return store.TaskInput{}, err
+		}
+		if value != nil {
+			trimmed := strings.TrimSpace(*value)
+			if trimmed == "" {
+				return store.TaskInput{}, taskInputError("parent_task_id must not be empty")
+			}
+			if len(trimmed) > maxDependencyReferenceLength {
+				return store.TaskInput{}, taskInputError("parent_task_id is too long")
+			}
+			value = &trimmed
+		}
+		input.ParentTaskID, input.ParentSet = value, true
 	}
 	if raw, ok := preferredTaskField(payload, "labels"); ok {
 		if err := validateIdentifierArray(raw, "labels", true); err != nil {
@@ -554,32 +677,9 @@ func (s *Server) comments(w http.ResponseWriter, r *http.Request, identity auth.
 		}
 		s.writeCollection(w, comments, next)
 	case http.MethodPost:
-		var payload struct {
-			Body *string `json:"body"`
-			Text *string `json:"text"`
-		}
-		fields, err := decodeJSONObject(r, &payload)
+		body, err := decodeCommentBody(r)
 		if err != nil {
-			s.writeError(w, http.StatusBadRequest, "invalid_json", "request body is invalid", nil)
-			return
-		}
-		if !jsonFieldPresent(fields, "body") && !jsonFieldPresent(fields, "text") {
-			s.writeStoreError(w, taskInputError("comment body is required"))
-			return
-		}
-		body := ""
-		if payload.Body != nil {
-			body = strings.TrimSpace(*payload.Body)
-		}
-		if body == "" && payload.Text != nil {
-			body = strings.TrimSpace(*payload.Text)
-		}
-		if body == "" {
-			s.writeStoreError(w, taskInputError("comment body is required"))
-			return
-		}
-		if len(body) > 20000 {
-			s.writeStoreError(w, taskInputError("comment is too long"))
+			writeTaskInputError(w, err)
 			return
 		}
 		s.mutation(w, r, identity, func() (int, []byte, string, error) {
@@ -588,11 +688,121 @@ func (s *Server) comments(w http.ResponseWriter, r *http.Request, identity auth.
 				return 0, nil, "", err
 			}
 			body, _ := json.Marshal(comment)
-			return http.StatusCreated, body, "", nil
+			return http.StatusCreated, body, `"v` + strconv.FormatInt(comment.Version, 10) + `"`, nil
 		})
 	default:
 		s.writeError(w, http.StatusMethodNotAllowed, "method_not_allowed", "method not allowed", nil)
 	}
+}
+
+// commentMutation handles the nested comment resource. Comment writes are
+// guarded by the comment's own version and author ownership, while the task
+// reference is resolved first so project scope remains fail-closed.
+func (s *Server) commentMutation(w http.ResponseWriter, r *http.Request, identity auth.Identity, taskReference, commentID string) {
+	if r.Method == http.MethodGet {
+		if !requireScope(w, identity, "tasks:read") {
+			return
+		}
+		task, err := s.Store.ResolveTaskReference(r.Context(), taskReference)
+		if err != nil {
+			s.writeStoreError(w, err)
+			return
+		}
+		if !identity.CanProject(task.ProjectID) {
+			s.writeError(w, http.StatusForbidden, "forbidden", "token is not scoped to this project", nil)
+			return
+		}
+		comment, err := s.Store.GetComment(r.Context(), commentID)
+		if err != nil {
+			s.writeStoreError(w, err)
+			return
+		}
+		if comment.TaskID != task.ID {
+			s.writeError(w, http.StatusNotFound, "not_found", "comment not found", nil)
+			return
+		}
+		w.Header().Set("ETag", `"v`+strconv.FormatInt(comment.Version, 10)+`"`)
+		s.writeJSON(w, http.StatusOK, comment)
+		return
+	}
+	if r.Method != http.MethodPatch && r.Method != http.MethodDelete {
+		s.writeError(w, http.StatusMethodNotAllowed, "method_not_allowed", "method not allowed", nil)
+		return
+	}
+	if !requireScope(w, identity, "tasks:write") {
+		return
+	}
+	version, err := parseVersion(r)
+	if err != nil {
+		s.writeStoreError(w, err)
+		return
+	}
+	if s.idempotencyReplay(w, r, identity) {
+		return
+	}
+	task, err := s.Store.ResolveTaskReference(r.Context(), taskReference)
+	if err != nil {
+		s.writeStoreError(w, err)
+		return
+	}
+	if !identity.CanProject(task.ProjectID) {
+		s.writeError(w, http.StatusForbidden, "forbidden", "token is not scoped to this project", nil)
+		return
+	}
+	allowAdmin := !identity.IsToken && identity.Actor.Admin
+	if r.Method == http.MethodDelete {
+		s.mutation(w, r, identity, func() (int, []byte, string, error) {
+			if err := s.Store.DeleteComment(r.Context(), task.ID, commentID, identity.Actor.ID, version, allowAdmin); err != nil {
+				return 0, nil, "", err
+			}
+			return http.StatusNoContent, nil, `"v` + strconv.FormatInt(version+1, 10) + `"`, nil
+		})
+		return
+	}
+	body, err := decodeCommentBody(r)
+	if err != nil {
+		writeTaskInputError(w, err)
+		return
+	}
+	s.mutation(w, r, identity, func() (int, []byte, string, error) {
+		comment, err := s.Store.UpdateComment(r.Context(), task.ID, commentID, identity.Actor.ID, body, version, allowAdmin)
+		if err != nil {
+			return 0, nil, "", err
+		}
+		encoded, err := json.Marshal(comment)
+		if err != nil {
+			return 0, nil, "", err
+		}
+		return http.StatusOK, encoded, `"v` + strconv.FormatInt(comment.Version, 10) + `"`, nil
+	})
+}
+
+func decodeCommentBody(r *http.Request) (string, error) {
+	var payload struct {
+		Body *string `json:"body"`
+		Text *string `json:"text"`
+	}
+	fields, err := decodeJSONObject(r, &payload)
+	if err != nil {
+		return "", err
+	}
+	if !jsonFieldPresent(fields, "body") && !jsonFieldPresent(fields, "text") {
+		return "", taskInputError("comment body is required")
+	}
+	body := ""
+	if payload.Body != nil {
+		body = strings.TrimSpace(*payload.Body)
+	}
+	if body == "" && payload.Text != nil {
+		body = strings.TrimSpace(*payload.Text)
+	}
+	if body == "" {
+		return "", taskInputError("comment body is required")
+	}
+	if len(body) > 20000 {
+		return "", taskInputError("comment is too long")
+	}
+	return body, nil
 }
 
 func (s *Server) taskAction(w http.ResponseWriter, r *http.Request, identity auth.Identity, id, action string) {

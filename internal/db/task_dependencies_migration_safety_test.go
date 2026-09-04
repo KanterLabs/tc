@@ -34,7 +34,11 @@ func TestTaskDependencyMigrationPreservesPopulatedDataAndConstraints(t *testing.
 	if err := Migrate(ctx, database); err != nil {
 		t.Fatalf("migrate populated pre-012 database: %v", err)
 	}
-	after := readStableFixture(t, ctx, database, 12)
+	latest, _, err := EmbeddedSchema()
+	if err != nil {
+		t.Fatalf("read latest schema: %v", err)
+	}
+	after := readStableFixture(t, ctx, database, latest)
 	if !reflect.DeepEqual(before.stable, after.stable) {
 		t.Fatalf("stable fixture changed during migration:\nbefore=%#v\nafter=%#v", before.stable, after.stable)
 	}

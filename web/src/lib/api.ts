@@ -18,22 +18,36 @@ import {
   type Collection,
   type Column,
   type Comment,
+  type IssueMetrics,
   type Label,
   type Project,
   type BugInput,
   type BugSeverity,
   type BugResolution,
+  type BoardDescriptor,
   type RoadmapSummary,
+  type SidebarCounts,
+  type SavedView,
+  type SearchResponse,
+  type SearchSort,
   type Task,
   type TaskDraftSuggestion,
   type TaskDependencies,
+  type TaskChecklistCollection,
+  type TaskChecklistItemInput,
+  type TaskChecklistItemPatch,
+  type TaskHierarchy,
+  type TaskHierarchyReference,
   type TaskTimelineCollection,
   type TaskTimelineKind,
   type TaskMoveInput,
+  type TaskReorderInput,
   type TaskPatch,
   type TriageInput,
   type ResolveInput,
-  type ReopenInput
+  type ReopenInput,
+  type PortableArchive,
+  type PortableImportReport
 } from './types';
 
 export const API_PREFIX = '/api/v1';
@@ -59,6 +73,8 @@ export interface TaskListParams {
   dependency?: 'blocked' | 'ready';
   q?: string;
   updated_after?: string;
+  sort?: 'board' | 'position' | 'number' | 'created_at' | 'updated_at' | 'priority' | 'title' | string;
+  order?: 'asc' | 'desc';
   cursor?: string;
   limit?: number;
 }
@@ -80,6 +96,25 @@ export interface MyWorkParams {
   agent_state?: AgentWorkStateFilter;
   action_needed?: boolean | string;
   dependency?: 'blocked' | 'ready';
+  cursor?: string;
+  limit?: number;
+}
+
+export interface SearchParams {
+  q?: string;
+  key?: string;
+  title?: string;
+  description?: string;
+  label?: string;
+  state?: string;
+  priority?: string;
+  assignee?: string;
+  claim_owner?: string;
+  project?: string;
+  due_from?: string;
+  due_to?: string;
+  sort?: string;
+  view?: string;
   cursor?: string;
   limit?: number;
 }
@@ -147,6 +182,28 @@ export async function request<T>(path: string, options: RequestOptions = {}): Pr
   return parsed as T;
 }
 
+/**
+ * Validation failures are returned by the server in the structured error
+ * details alongside the regular message. Keeping the report intact lets the
+ * import review dialog show every failing field and remap, not just the first
+ * toast string.
+ */
+export function portableImportReportFromError(error: unknown): PortableImportReport | null {
+  if (!(error instanceof ApiError) || !error.details || typeof error.details !== 'object') return null;
+  const details = error.details as Partial<PortableImportReport>;
+  if (!Array.isArray(details.errors)) return null;
+  return {
+    format: typeof details.format === 'string' ? details.format : 'helm.portable',
+    version: typeof details.version === 'number' ? details.version : 1,
+    dry_run: typeof details.dry_run === 'boolean' ? details.dry_run : true,
+    conflict: typeof details.conflict === 'string' ? details.conflict : 'remap',
+    counts: details.counts && typeof details.counts === 'object' ? details.counts : {},
+    remaps: Array.isArray(details.remaps) ? details.remaps : [],
+    warnings: Array.isArray(details.warnings) ? details.warnings : [],
+    errors: details.errors
+  };
+}
+
 export function etagForVersion(version: number): string {
   return `"v${version}"`;
 }
@@ -195,23 +252,58 @@ export const api = {
     request<Collection<Project>>(
       pathWithQuery('/projects', { cursor: params.cursor, limit: params.limit ?? 100 })
     ).then(collectionFrom),
-  listAllProjects: () => collectPages((cursor) =>
-    request<Collection<Project>>(pathWithQuery('/projects', { cursor, limit: 200 })).then(collectionFrom)
+  listAllProjects: (params: { includeArchived?: boolean } = {}) => collectPages((cursor) =>
+    request<Collection<Project>>(pathWithQuery('/projects', { cursor, limit: 200, archived: params.includeArchived ? true : undefined })).then(collectionFrom)
   ),
-  createProject: (input: { key: string; name: string; description?: string; color?: string; favorite?: boolean }) =>
+  createProject: (input: { key: string; name: string; description?: string; color?: string; favorite?: boolean; checklist_completion_policy?: Project['checklist_completion_policy'] }) =>
     request<Project>('/projects', { method: 'POST', body: input, idempotencyKey: key() }),
-  patchProject: (project: string, input: Partial<Pick<Project, 'name' | 'description' | 'color' | 'favorite'>>) =>
-    request<Project>(`/projects/${encodeURIComponent(project)}`, { method: 'PATCH', body: input, idempotencyKey: key() }),
+  getProject: (project: string) => request<Project>(`/projects/${encodeURIComponent(project)}`),
+  patchProject: (project: string, input: Partial<Pick<Project, 'name' | 'description' | 'color' | 'favorite' | 'checklist_completion_policy'>> & { archived?: boolean }, version?: number) =>
+    request<Project>(`/projects/${encodeURIComponent(project)}`, { method: 'PATCH', body: input, ifMatch: version, idempotencyKey: key() }),
+  exportProject: (project?: string) =>
+    request<PortableArchive>(project ? `/projects/${encodeURIComponent(project)}/export` : '/export'),
+  importPortable: (archive: PortableArchive | unknown, options: { targetProject?: string; conflict?: 'remap' | 'fail'; dryRun?: boolean } = {}) =>
+    request<PortableImportReport>('/import', {
+      method: 'POST',
+      body: {
+        archive,
+        target_project: options.targetProject,
+        conflict: options.conflict,
+        dry_run: options.dryRun
+      },
+      idempotencyKey: options.dryRun ? undefined : key()
+    }),
+  importTrello: (board: unknown, options: { targetProject?: string; conflict?: 'remap' | 'fail'; dryRun?: boolean } = {}) =>
+    request<PortableImportReport>(pathWithQuery('/import/trello', { target_project: options.targetProject, conflict: options.conflict, dry_run: options.dryRun }), {
+      method: 'POST',
+      body: board,
+      idempotencyKey: options.dryRun ? undefined : key()
+    }),
+  listBoards: (project: string) =>
+    request<{ data: BoardDescriptor[]; next_cursor?: string | null; multi_board?: Record<string, unknown> }>(`/projects/${encodeURIComponent(project)}/boards`),
 
   listColumns: (project: string, params: { cursor?: string; limit?: number } = {}) =>
     request<Collection<Column> | Column[]>(
       pathWithQuery(`/projects/${encodeURIComponent(project)}/columns`, { cursor: params.cursor, limit: params.limit })
     ).then(collectionFrom),
-  listAllColumns: (project: string) => collectPages((cursor) =>
+  listAllColumns: (project: string, params: { includeArchived?: boolean } = {}) => collectPages((cursor) =>
     request<Collection<Column>>(
-      pathWithQuery(`/projects/${encodeURIComponent(project)}/columns`, { cursor, limit: 200 })
+      pathWithQuery(`/projects/${encodeURIComponent(project)}/columns`, { cursor, limit: 200, archived: params.includeArchived ? true : undefined })
     ).then(collectionFrom)
   ),
+  createColumn: (project: string, input: { name: string; semantic_state: Column['semantic_state']; position?: number }) =>
+    request<Column>(`/projects/${encodeURIComponent(project)}/columns`, {
+      method: 'POST',
+      body: input,
+      idempotencyKey: key()
+    }),
+  patchColumn: (column: string, input: Partial<Pick<Column, 'name' | 'semantic_state' | 'position'>> & { archived?: boolean }, version?: number) =>
+    request<Column>(`/columns/${encodeURIComponent(column)}`, {
+      method: 'PATCH',
+      body: input,
+      ifMatch: version,
+      idempotencyKey: key()
+    }),
 
   listTasks: (project: string, params: TaskListParams = {}) =>
     request<Collection<Task> | Task[]>(
@@ -230,6 +322,8 @@ export const api = {
         dependency: params.dependency,
         q: params.q,
         updated_after: params.updated_after,
+        sort: params.sort,
+        order: params.order,
         cursor: params.cursor,
         limit: params.limit ?? 200
       })
@@ -270,6 +364,9 @@ export const api = {
       assignee?: string | null;
       labels?: string[];
       label_ids?: string[];
+      parent?: string | null;
+      parent_id?: string | null;
+      parent_task_id?: string | null;
     }
   ) =>
     request<Task>(`/projects/${encodeURIComponent(project)}/tasks`, {
@@ -287,6 +384,37 @@ export const api = {
     }),
   getTaskDependencies: (task: string) =>
     request<TaskDependencies>(`/tasks/${encodeURIComponent(task)}/dependencies`),
+  getTaskChecklist: (task: string) =>
+    request<TaskChecklistCollection>(`/tasks/${encodeURIComponent(task)}/checklist`),
+  addTaskChecklistItem: (task: string, input: TaskChecklistItemInput, version: number) =>
+    request<Task>(`/tasks/${encodeURIComponent(task)}/checklist`, {
+      method: 'POST',
+      body: input,
+      ifMatch: version,
+      idempotencyKey: key()
+    }),
+  updateTaskChecklistItem: (task: string, item: string, input: TaskChecklistItemPatch, version: number) =>
+    request<Task>(`/tasks/${encodeURIComponent(task)}/checklist/${encodeURIComponent(item)}`, {
+      method: 'PATCH',
+      body: input,
+      ifMatch: version,
+      idempotencyKey: key()
+    }),
+  patchTaskChecklistItem: (task: string, item: string, input: TaskChecklistItemPatch, version: number) =>
+    api.updateTaskChecklistItem(task, item, input, version),
+  deleteTaskChecklistItem: (task: string, item: string, version: number) =>
+    request<Task>(`/tasks/${encodeURIComponent(task)}/checklist/${encodeURIComponent(item)}`, {
+      method: 'DELETE',
+      ifMatch: version,
+      idempotencyKey: key()
+    }),
+  reorderTaskChecklist: (task: string, itemIds: string[], version: number) =>
+    request<Task>(`/tasks/${encodeURIComponent(task)}/checklist`, {
+      method: 'PATCH',
+      body: { item_ids: itemIds },
+      ifMatch: version,
+      idempotencyKey: key()
+    }),
   addTaskDependency: (task: string, prerequisite: string, version: number) =>
     request<Task>(`/tasks/${encodeURIComponent(task)}/dependencies`, {
       method: 'POST',
@@ -296,6 +424,33 @@ export const api = {
     }),
   removeTaskDependency: (task: string, prerequisite: string, version: number) =>
     request<Task>(`/tasks/${encodeURIComponent(task)}/dependencies/${encodeURIComponent(prerequisite)}`, {
+      method: 'DELETE',
+      ifMatch: version,
+      idempotencyKey: key()
+    }),
+  getTaskHierarchy: (task: string) =>
+    request<TaskHierarchy>(`/tasks/${encodeURIComponent(task)}/hierarchy`),
+  listTaskChildren: (task: string) =>
+    request<Collection<TaskHierarchyReference> | TaskHierarchyReference[]>(`/tasks/${encodeURIComponent(task)}/children`).then(collectionFrom),
+  listTaskAncestors: (task: string) =>
+    request<Collection<TaskHierarchyReference> | TaskHierarchyReference[]>(`/tasks/${encodeURIComponent(task)}/ancestors`).then(collectionFrom),
+  listTaskDescendants: (task: string) =>
+    request<Collection<TaskHierarchyReference> | TaskHierarchyReference[]>(`/tasks/${encodeURIComponent(task)}/descendants`).then(collectionFrom),
+  setTaskParent: (task: string, parent: string, version: number) =>
+    request<Task>(`/tasks/${encodeURIComponent(task)}/parent`, {
+      method: 'POST',
+      body: { parent },
+      ifMatch: version,
+      idempotencyKey: key()
+    }),
+  clearTaskParent: (task: string, version: number) =>
+    request<Task>(`/tasks/${encodeURIComponent(task)}/parent`, {
+      method: 'DELETE',
+      ifMatch: version,
+      idempotencyKey: key()
+    }),
+  removeTaskChild: (parent: string, child: string, version: number) =>
+    request<Task>(`/tasks/${encodeURIComponent(parent)}/children/${encodeURIComponent(child)}`, {
       method: 'DELETE',
       ifMatch: version,
       idempotencyKey: key()
@@ -328,6 +483,12 @@ export const api = {
       ifMatch: version,
       idempotencyKey: key()
     }),
+  restoreTask: (task: string, version: number) =>
+    request<Task>(`/tasks/${encodeURIComponent(task)}/restore`, {
+      method: 'POST',
+      ifMatch: version,
+      idempotencyKey: key()
+    }),
 
   listComments: (task: string, params: { cursor?: string; limit?: number } = {}) =>
     request<Collection<Comment> | Comment[]>(
@@ -338,10 +499,25 @@ export const api = {
       pathWithQuery(`/tasks/${encodeURIComponent(task)}/comments`, { cursor, limit: 200 })
     ).then(collectionFrom)
   ),
+  getComment: (task: string, comment: string) =>
+    request<Comment>(`/tasks/${encodeURIComponent(task)}/comments/${encodeURIComponent(comment)}`),
   postComment: (task: string, body: string) =>
     request<Comment>(`/tasks/${encodeURIComponent(task)}/comments`, {
       method: 'POST',
       body: { body },
+      idempotencyKey: key()
+    }),
+  patchComment: (task: string, comment: string, body: string, version: number) =>
+    request<Comment>(`/tasks/${encodeURIComponent(task)}/comments/${encodeURIComponent(comment)}`, {
+      method: 'PATCH',
+      body: { body },
+      ifMatch: version,
+      idempotencyKey: key()
+    }),
+  deleteComment: (task: string, comment: string, version: number) =>
+    request<void>(`/tasks/${encodeURIComponent(task)}/comments/${encodeURIComponent(comment)}`, {
+      method: 'DELETE',
+      ifMatch: version,
       idempotencyKey: key()
     }),
   listTaskTimeline: (task: string, params: { before?: string; limit?: number; kind?: TaskTimelineKind } = {}) =>
@@ -455,6 +631,45 @@ export const api = {
       })
     ).then(collectionFrom), params.cursor
   ),
+  issueMetrics: (params: { project?: string } = {}) =>
+    request<IssueMetrics>(pathWithQuery('/issues/metrics', { project: params.project })),
+  sidebarCounts: (params: { project?: string; view?: WorkView } = {}) =>
+    request<SidebarCounts>(pathWithQuery('/sidebar-counts', { project: params.project, view: params.view })),
+  search: (params: SearchParams = {}) =>
+    request<SearchResponse>(
+      pathWithQuery('/search', {
+        q: params.q,
+        key: params.key,
+        title: params.title,
+        description: params.description,
+        label: params.label,
+        state: params.state,
+        priority: params.priority,
+        assignee: params.assignee,
+        claim_owner: params.claim_owner,
+        project: params.project,
+        due_from: params.due_from,
+        due_to: params.due_to,
+        sort: params.sort,
+        view: params.view,
+        cursor: params.cursor,
+        limit: params.limit
+      })
+    ).then((result) => ({ ...result, data: result?.data ?? [], next_cursor: result?.next_cursor ?? null })),
+  searchSavedView: (view: string, params: Omit<SearchParams, 'view'> = {}) =>
+    api.search({ ...params, view }),
+  listSavedViews: (params: { cursor?: string; limit?: number } = {}) =>
+    request<Collection<SavedView> | SavedView[]>(pathWithQuery('/views', { cursor: params.cursor, limit: params.limit })).then(collectionFrom),
+  listAllSavedViews: () => collectPages((cursor) =>
+    request<Collection<SavedView> | SavedView[]>(pathWithQuery('/views', { cursor, limit: 200 })).then(collectionFrom)
+  ),
+  getSavedView: (view: string) => request<SavedView>(`/views/${encodeURIComponent(view)}`),
+  createSavedView: (input: { name: string; description?: string; filters: Record<string, unknown>; sort?: SearchSort[]; shared?: boolean }) =>
+    request<SavedView>('/views', { method: 'POST', body: input, idempotencyKey: key() }),
+  patchSavedView: (view: string, input: Partial<{ name: string; description: string; filters: Record<string, unknown>; sort: SearchSort[]; shared: boolean }>) =>
+    request<SavedView>(`/views/${encodeURIComponent(view)}`, { method: 'PATCH', body: input, idempotencyKey: key() }),
+  deleteSavedView: (view: string) =>
+    request<void>(`/views/${encodeURIComponent(view)}`, { method: 'DELETE', idempotencyKey: key() }),
   roadmap: (project?: string) =>
     request<RoadmapSummary>(project ? `/projects/${encodeURIComponent(project)}/roadmap` : '/roadmap'),
 
@@ -507,6 +722,13 @@ export const api = {
    */
   moveTask: (task: string, input: TaskMoveInput, version: number) =>
     request<Task>(`/tasks/${encodeURIComponent(task)}/move`, {
+      method: 'POST',
+      body: input,
+      ifMatch: version,
+      idempotencyKey: key()
+    }),
+  reorderTask: (task: string, input: TaskReorderInput, version: number) =>
+    request<Task>(`/tasks/${encodeURIComponent(task)}/reorder`, {
       method: 'POST',
       body: input,
       ifMatch: version,
