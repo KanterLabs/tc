@@ -12,6 +12,7 @@ import re
 import stat
 import sys
 import time
+import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -27,6 +28,9 @@ LEGACY_CONFIG = Path("~/.config/tc-roadmap/credentials.json").expanduser()
 MAX_RESPONSE_BYTES = 4 * 1024 * 1024
 MAX_TRANSIENT_RETRIES = 2
 MAX_RETRY_DELAY_SECONDS = 5.0
+UUID4_PATTERN = re.compile(
+    r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-4[0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$"
+)
 
 # Board Audit is intentionally a client-side, read-only projection. Keep the
 # limits here independent from the API's larger collection limits so one audit
@@ -68,6 +72,19 @@ class HelmError(RuntimeError):
         self.api_code = error_code
         self.code = status_code
         self.retry_after = retry_after
+
+    def as_dict(self) -> dict[str, Any]:
+        """Return a bounded, machine-readable error without credential data."""
+
+        payload: dict[str, Any] = {
+            "code": self.error_code or "client_error",
+            "message": str(self)[:300],
+        }
+        if self.status_code is not None:
+            payload["status"] = self.status_code
+        if self.retry_after:
+            payload["retry_after"] = self.retry_after[:120]
+        return payload
 
 
 # The old exception name is retained for callers that imported the helper
@@ -283,6 +300,10 @@ class Client:
                     time.sleep(self._retry_delay(response_headers, attempt))
                     continue
                 message, error_code = _error_details(raw)
+                message = _redact_secrets(
+                    message,
+                    (self.config.token, self.config.cf_access_client_id, self.config.cf_access_client_secret),
+                )
                 raise HelmError(
                     f"Helm returned HTTP {exc.code}: {message}",
                     status_code=exc.code,
@@ -318,6 +339,31 @@ def _error_details(raw: bytes) -> tuple[str, str]:
             if isinstance(message, str):
                 return message[:300], code[:120] if isinstance(code, str) else ""
     return "request failed", ""
+
+
+def _redact_secrets(value: str, secrets: tuple[str, ...]) -> str:
+    """Remove configured credential values from user-visible text."""
+
+    result = value
+    for secret in secrets:
+        if secret:
+            result = result.replace(secret, "[redacted]")
+    return result[:MAX_RESPONSE_BYTES]
+
+
+def _safe_error_for_client(exc: HelmError, client: Client) -> dict[str, Any]:
+    payload = exc.as_dict()
+    config = getattr(client, "config", None)
+    secrets = (
+        str(getattr(config, "token", "") or ""),
+        str(getattr(config, "cf_access_client_id", "") or ""),
+        str(getattr(config, "cf_access_client_secret", "") or ""),
+    )
+    for field in ("code", "message", "retry_after"):
+        value = payload.get(field)
+        if isinstance(value, str):
+            payload[field] = _redact_secrets(value, secrets)[:300 if field == "message" else 120]
+    return payload
 
 
 def _data(payload: Any) -> list[dict[str, Any]]:
@@ -380,6 +426,156 @@ def _paged_collection(
             raise HelmError(f"{context} collection returned a repeated cursor")
         seen.add(next_cursor)
         cursor = next_cursor
+
+
+def _paged_collection_with_cursor(
+    client: Client,
+    path: str,
+    params: list[tuple[str, str]],
+    *,
+    context: str,
+    initial_cursor: str = "",
+    cursor_param: str = "cursor",
+    collect_all: bool = False,
+) -> tuple[list[dict[str, Any]], str]:
+    """Read an offset collection while retaining its terminal cursor.
+
+    ``cursor`` values are opaque to callers.  This helper only transports the
+    exact server value and prevents duplicate query parameters when a caller
+    starts from an explicitly supplied cursor.
+    """
+
+    result: list[dict[str, Any]] = []
+    cursor = initial_cursor.strip()
+    seen: set[str] = set()
+    while True:
+        page_params = [(key, value) for key, value in params if key != cursor_param]
+        if cursor:
+            page_params.append((cursor_param, cursor))
+        payload, _ = client.call("GET", _query_path(path, page_params))
+        try:
+            result.extend(_data(payload))
+            next_cursor = _collection_cursor(payload)
+        except HelmError as exc:
+            raise HelmError(f"invalid {context} collection response") from exc
+        if not collect_all:
+            return result, next_cursor
+        if not next_cursor:
+            return result, ""
+        if next_cursor in seen or next_cursor == cursor:
+            raise HelmError(f"{context} collection returned a repeated cursor")
+        seen.add(next_cursor)
+        cursor = next_cursor
+
+
+def _validate_limit(value: Any, *, default: int = 50) -> int:
+    """Validate the API collection limit before making a request."""
+
+    if value is None:
+        return default
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError) as exc:
+        raise HelmError("limit must be an integer between 1 and 200") from exc
+    if parsed < 1 or parsed > 200:
+        raise HelmError("limit must be an integer between 1 and 200")
+    return parsed
+
+
+def _validate_nonnegative_int(value: Any, label: str) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError) as exc:
+        raise HelmError(f"{label} must be a non-negative integer") from exc
+    if parsed < 0:
+        raise HelmError(f"{label} must be a non-negative integer")
+    return parsed
+
+
+def _new_operation_id(value: Any = None) -> str:
+    """Resolve a new-workflow mutation ID to a UUIDv4.
+
+    Existing Helm/TC compatibility commands intentionally retain their
+    deterministic ``helm-<sha256>`` namespace.  New workflow commands use a
+    UUIDv4 so the value itself is a valid API idempotency key.  Re-running a
+    logical operation is deterministic when the caller supplies the emitted
+    UUID again.
+    """
+
+    if value is None or not str(value).strip():
+        return str(uuid.uuid4())
+    candidate = str(value).strip()
+    if not UUID4_PATTERN.fullmatch(candidate):
+        raise HelmError("operation_id must be a UUIDv4 for this mutation")
+    return candidate.lower()
+
+
+def _new_mutation_idempotency(operation_id: str) -> str:
+    """Use one UUIDv4 for one new logical mutation and safe retries."""
+
+    return _new_operation_id(operation_id)
+
+
+def _derived_uuid4(seed: str) -> str:
+    """Derive a deterministic UUIDv4-shaped key for a mutation sub-step."""
+
+    raw = bytearray(hashlib.sha256(seed.encode("utf-8")).digest()[:16])
+    raw[6] = (raw[6] & 0x0F) | 0x40
+    raw[8] = (raw[8] & 0x3F) | 0x80
+    return str(uuid.UUID(bytes=bytes(raw)))
+
+
+def _command_operation_id(value: Any = None) -> str:
+    """Use UUIDv4 by default while retaining explicit legacy operation IDs."""
+
+    if value is None or not str(value).strip():
+        return str(uuid.uuid4())
+    candidate = str(value).strip()
+    if UUID4_PATTERN.fullmatch(candidate):
+        return candidate.lower()
+    # Existing Helm commands accepted safe human-readable IDs. Keep those
+    # deterministic for callers that explicitly continue to use them, while
+    # making every newly-created logical operation a UUIDv4 by default.
+    return _validate_operation_id(candidate)
+
+
+def _command_mutation_id(operation_id: str, method: str, path: str, detail: Any = "") -> str:
+    """Return a per-mutation UUID key or the legacy deterministic key."""
+
+    if UUID4_PATTERN.fullmatch(operation_id):
+        if not isinstance(detail, str):
+            detail = _canonical_json(detail)
+        seed = "\0".join((operation_id, method.upper().strip(), path.strip(), detail))
+        return _derived_uuid4(seed)
+    return _mutation_idempotency(operation_id, method, path, detail)
+
+
+def _safe_actor(actor: Any) -> dict[str, Any]:
+    """Keep auth-check output limited to non-secret actor identity fields."""
+
+    if not isinstance(actor, dict):
+        return {}
+    result: dict[str, Any] = {}
+    for field in ("id", "kind", "name", "admin"):
+        if field in actor and isinstance(actor[field], (str, bool)):
+            result[field] = actor[field]
+    for field in ("project_ids", "scopes"):
+        values = actor.get(field)
+        if isinstance(values, list) and all(isinstance(value, str) for value in values):
+            result[field] = [value[:200] for value in values[:200]]
+    return result
+
+
+def _auth_failure_hint(exc: HelmError) -> str:
+    if exc.status_code == 401:
+        return "Check HELM_URL and HELM_TOKEN; the token may be expired or invalid."
+    if exc.status_code == 403:
+        return "Check the token scopes and project ceiling, then verify Cloudflare edge credentials if configured."
+    if exc.status_code in {429, 503}:
+        return "Retry after the server's backoff window; no mutation was attempted by auth-check."
+    if exc.status_code is None:
+        return "Check HELM_URL, network access, and the API TLS certificate."
+    return "Inspect the returned API code and verify the Helm endpoint configuration."
 
 
 def _audit_states(value: Any) -> tuple[str, ...]:
@@ -963,9 +1159,15 @@ def _task(client: Client, reference: str) -> dict[str, Any]:
 
 
 def _project(client: Client, reference: str) -> dict[str, Any]:
-    payload, _ = client.call("GET", "/projects?limit=200")
+    projects, _ = _paged_collection_with_cursor(
+        client,
+        "/projects",
+        [("limit", "200")],
+        context="projects",
+        collect_all=True,
+    )
     folded = reference.casefold()
-    for project in _data(payload):
+    for project in projects:
         candidates = (project.get("id"), project.get("key"), project.get("slug"), project.get("name"))
         if any(isinstance(item, str) and item.casefold() == folded for item in candidates):
             return project
@@ -1591,22 +1793,352 @@ def cmd_reconcile(client: Client, args: argparse.Namespace) -> Any:
     }
 
 
-def cmd_projects(client: Client, _args: argparse.Namespace) -> Any:
-    payload, _ = client.call("GET", "/projects?limit=200")
-    return {"projects": [{key: item.get(key) for key in ("id", "key", "slug", "name")} for item in _data(payload)]}
+def cmd_projects(client: Client, args: argparse.Namespace) -> Any:
+    limit = _validate_limit(getattr(args, "limit", 200), default=200)
+    cursor = str(getattr(args, "cursor", "") or "").strip()
+    projects, next_cursor = _paged_collection_with_cursor(
+        client,
+        "/projects",
+        [("limit", str(limit))],
+        context="projects",
+        initial_cursor=cursor,
+        collect_all=bool(getattr(args, "all", False)),
+    )
+    selected = [{key: item.get(key) for key in ("id", "key", "slug", "name")} for item in projects]
+    return {"projects": selected, "next_cursor": next_cursor}
 
 
 def cmd_tasks(client: Client, args: argparse.Namespace) -> Any:
     project = _project(client, args.project)
-    query = "?limit=200"
-    if args.query:
-        query += "&q=" + parse.quote(args.query)
-    payload, _ = client.call("GET", f"/projects/{parse.quote(str(project['id']), safe='')}/tasks{query}")
-    return {"project": project.get("key"), "tasks": _data(payload)}
+    limit = _validate_limit(getattr(args, "limit", 200), default=200)
+    params: list[tuple[str, str]] = [("limit", str(limit))]
+    if getattr(args, "query", ""):
+        params.append(("q", str(args.query)))
+    tasks, next_cursor = _paged_collection_with_cursor(
+        client,
+        f"/projects/{parse.quote(str(project['id']), safe='')}/tasks",
+        params,
+        context="tasks",
+        initial_cursor=str(getattr(args, "cursor", "") or "").strip(),
+        collect_all=bool(getattr(args, "all", False)),
+    )
+    return {"project": project.get("key"), "tasks": tasks, "next_cursor": next_cursor}
+
+
+def cmd_auth_check(client: Client, _args: argparse.Namespace) -> Any:
+    """Validate the configured agent credential without mutating Helm."""
+
+    try:
+        # ``/auth/status`` intentionally treats a bearer header as an edge
+        # navigation hint rather than authenticating it.  ``/auth/me`` is the
+        # protected, non-mutating identity check for API clients.
+        payload, _ = client.call("GET", "/auth/me")
+    except HelmError as exc:
+        return {
+            "ok": False,
+            "authenticated": False,
+            "error": {**_safe_error_for_client(exc, client), "hint": _auth_failure_hint(exc)},
+        }
+    if not isinstance(payload, dict):
+        error = HelmError("Helm returned an unexpected auth identity")
+        return {
+            "ok": False,
+            "authenticated": False,
+            "error": {
+                **_safe_error_for_client(error, client),
+                "hint": "Retry against a Helm API endpoint that supports /auth/me.",
+            },
+        }
+    return {"ok": True, "authenticated": True, "actor": _safe_actor(payload)}
+
+
+def _events_page(client: Client, after: int, project: str, limit: int) -> tuple[list[dict[str, Any]], str]:
+    params: list[tuple[str, str]] = [("after", str(after))]
+    if project:
+        params.append(("project", project))
+    params.append(("limit", str(limit)))
+    payload, _ = client.call("GET", _query_path("/events", params))
+    try:
+        return _data(payload), _collection_cursor(payload)
+    except HelmError as exc:
+        raise HelmError("invalid events collection response") from exc
+
+
+def cmd_events(client: Client, args: argparse.Namespace) -> Any:
+    """Poll the append-only event feed using its monotonic cursor."""
+
+    after = _validate_nonnegative_int(getattr(args, "after", 0), "after")
+    limit = _validate_limit(getattr(args, "limit", 50))
+    project = str(getattr(args, "project", "") or "").strip()
+    collect_all = bool(getattr(args, "all", False))
+    events: list[dict[str, Any]] = []
+    seen: set[int] = set()
+    while True:
+        page, next_cursor = _events_page(client, after, project, limit)
+        events.extend(page)
+        if not collect_all or not next_cursor:
+            return {"data": events, "next_cursor": "" if collect_all else next_cursor}
+        next_after = _validate_nonnegative_int(next_cursor, "event next_cursor")
+        if next_after <= after or next_after in seen:
+            raise HelmError("events collection returned a repeated cursor")
+        seen.add(next_after)
+        after = next_after
+
+
+def _timeline_page(
+    client: Client,
+    path: str,
+    *,
+    before: str,
+    kind: str,
+    limit: int,
+) -> tuple[list[dict[str, Any]], str]:
+    params: list[tuple[str, str]] = []
+    if before:
+        params.append(("before", before))
+    if kind:
+        params.append(("kind", kind))
+    params.append(("limit", str(limit)))
+    payload, _ = client.call("GET", _query_path(path, params))
+    try:
+        return _data(payload), _collection_cursor(payload)
+    except HelmError as exc:
+        raise HelmError("invalid timeline collection response") from exc
+
+
+def cmd_timeline(client: Client, args: argparse.Namespace) -> Any:
+    """Read task or project activity while preserving opaque keyset cursors."""
+
+    task = str(getattr(args, "task", "") or "").strip()
+    project = str(getattr(args, "project", "") or "").strip()
+    if bool(task) == bool(project):
+        raise HelmError("exactly one of --task or --project is required")
+    if task:
+        path = "/tasks/" + parse.quote(task, safe="") + "/timeline"
+    else:
+        path = "/projects/" + parse.quote(project, safe="") + "/timeline"
+    before = str(getattr(args, "before", "") or "").strip()
+    kind = str(getattr(args, "kind", "") or "").strip()
+    limit = _validate_limit(getattr(args, "limit", 50))
+    collect_all = bool(getattr(args, "all", False))
+    items: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    while True:
+        page, next_cursor = _timeline_page(client, path, before=before, kind=kind, limit=limit)
+        items.extend(page)
+        if not collect_all or not next_cursor:
+            return {"data": items, "next_cursor": "" if collect_all else next_cursor}
+        if next_cursor in seen or next_cursor == before:
+            raise HelmError("timeline collection returned a repeated cursor")
+        seen.add(next_cursor)
+        before = next_cursor
+
+
+def _task_action_with_uuid(
+    client: Client,
+    args: argparse.Namespace,
+    action: str,
+    body: dict[str, Any] | None,
+) -> Any:
+    operation_id = _new_operation_id(getattr(args, "operation_id", None))
+    current = _task(client, str(getattr(args, "task", "")))
+    path = "/tasks/" + parse.quote(str(current["id"]), safe="") + "/" + action
+    request_kwargs: dict[str, Any] = {
+        "if_match": current["version"],
+        "idempotency_key": _new_mutation_idempotency(operation_id),
+    }
+    if body is not None:
+        request_kwargs["body"] = body
+    payload, _ = client.call("POST", path, **request_kwargs)
+    return {"task": payload, "operation_id": operation_id}
+
+
+def cmd_renew(client: Client, args: argparse.Namespace) -> Any:
+    """Renew only the current owner's active lease through the exact route."""
+
+    lease_seconds = getattr(args, "lease_seconds", 1800)
+    return _task_action_with_uuid(client, args, "renew", {"lease_seconds": lease_seconds})
+
+
+def cmd_release(client: Client, args: argparse.Namespace) -> Any:
+    """Release the current owner's active lease through the exact route."""
+
+    result = _task_action_with_uuid(client, args, "release", None)
+    if isinstance(result, dict):
+        _clear_matching_session(result.get("task"), str(result.get("operation_id", "")))
+    return result
+
+
+def cmd_dependency_list(client: Client, args: argparse.Namespace) -> Any:
+    task = _task(client, str(getattr(args, "task", "")))
+    path = "/tasks/" + parse.quote(str(task["id"]), safe="") + "/dependencies"
+    payload, headers = client.call("GET", path)
+    if not isinstance(payload, dict):
+        raise HelmError("Helm returned an unexpected dependency collection")
+    result = dict(payload)
+    result["task"] = task.get("key", task["id"])
+    etag = None
+    if isinstance(headers, dict):
+        etag = next((value for key, value in headers.items() if str(key).lower() == "etag"), None)
+    if etag:
+        result["etag"] = etag
+    return result
+
+
+def cmd_dependency_add(client: Client, args: argparse.Namespace) -> Any:
+    prerequisite = str(getattr(args, "prerequisite", "") or "").strip()
+    if not prerequisite:
+        raise HelmError("prerequisite must not be empty")
+    return _task_action_with_uuid(client, args, "dependencies", {"prerequisite": prerequisite})
+
+
+def cmd_dependency_remove(client: Client, args: argparse.Namespace) -> Any:
+    prerequisite = str(getattr(args, "prerequisite", "") or "").strip()
+    if not prerequisite:
+        raise HelmError("prerequisite must not be empty")
+    operation_id = _new_operation_id(getattr(args, "operation_id", None))
+    current = _task(client, str(getattr(args, "task", "")))
+    path = (
+        "/tasks/"
+        + parse.quote(str(current["id"]), safe="")
+        + "/dependencies/"
+        + parse.quote(prerequisite, safe="")
+    )
+    payload, _ = client.call(
+        "DELETE",
+        path,
+        if_match=current["version"],
+        idempotency_key=_new_mutation_idempotency(operation_id),
+    )
+    return {"task": payload, "operation_id": operation_id}
+
+
+def _issue_query_params(args: argparse.Namespace) -> list[tuple[str, str]]:
+    params: list[tuple[str, str]] = []
+    fields = (
+        ("project", "project"),
+        ("state", "state"),
+        ("column", "column"),
+        ("priority", "priority"),
+        ("severity", "severity"),
+        ("label", "label"),
+        ("assignee", "assignee"),
+        ("reporter", "reporter"),
+        ("resolution", "resolution"),
+        ("agent_state", "agent_state"),
+        ("query", "q"),
+        ("updated_after", "updated_after"),
+    )
+    for source, target in fields:
+        value = getattr(args, source, None)
+        if value is not None and str(value).strip():
+            params.append((target, str(value).strip()))
+    action_needed = getattr(args, "action_needed", None)
+    if action_needed is not None:
+        if isinstance(action_needed, bool):
+            params.append(("action_needed", "true" if action_needed else "false"))
+        else:
+            value = str(action_needed).strip().lower()
+            if value not in {"true", "false"}:
+                raise HelmError("action_needed must be true or false")
+            params.append(("action_needed", value))
+    return params
+
+
+def cmd_issues(client: Client, args: argparse.Namespace) -> Any:
+    params = _issue_query_params(args)
+    params.append(("limit", str(_validate_limit(getattr(args, "limit", 50)))))
+    items, next_cursor = _paged_collection_with_cursor(
+        client,
+        "/issues",
+        params,
+        context="issues",
+        initial_cursor=str(getattr(args, "cursor", "") or "").strip(),
+        collect_all=bool(getattr(args, "all", False)),
+    )
+    return {"data": items, "next_cursor": next_cursor}
+
+
+def _optional_text(args: argparse.Namespace, name: str) -> str | None:
+    value = getattr(args, name, None)
+    if value is None:
+        return None
+    normalized = str(value).strip()
+    return normalized or None
+
+
+def cmd_bug_report(client: Client, args: argparse.Namespace) -> Any:
+    title = _optional_text(args, "title")
+    actual_behavior = _optional_text(args, "actual_behavior")
+    if not title or not actual_behavior:
+        raise HelmError("title and actual_behavior are required for a bug report")
+    operation_id = _new_operation_id(getattr(args, "operation_id", None))
+    project = _project(client, str(getattr(args, "project", "")))
+    project_id = str(project["id"])
+    bug: dict[str, Any] = {"actual_behavior": actual_behavior}
+    for source in ("expected_behavior", "reproduction_steps", "environment", "affected_version", "severity"):
+        value = _optional_text(args, source)
+        if value:
+            bug[source] = value
+    body: dict[str, Any] = {"title": title, "kind": "bug", "bug": bug}
+    for source, target in (("description", "description"), ("priority", "priority"), ("column", "column_id"), ("assignee", "assignee_id")):
+        value = _optional_text(args, source)
+        if value:
+            body[target] = value
+    path = "/projects/" + parse.quote(project_id, safe="") + "/tasks"
+    task, _ = client.call(
+        "POST",
+        path,
+        body=body,
+        idempotency_key=_new_mutation_idempotency(operation_id),
+    )
+    return {"task": task, "operation_id": operation_id}
+
+
+def cmd_bug_triage(client: Client, args: argparse.Namespace) -> Any:
+    severity = _optional_text(args, "severity")
+    if not severity:
+        raise HelmError("severity is required for bug triage")
+    body: dict[str, Any] = {"severity": severity}
+    for source, target in (("priority", "priority"), ("assignee", "assignee_id"), ("column", "column_id")):
+        value = _optional_text(args, source)
+        if value:
+            body[target] = value
+    return _task_action_with_uuid(client, args, "triage", body)
+
+
+def cmd_bug_resolve(client: Client, args: argparse.Namespace) -> Any:
+    resolution = _optional_text(args, "resolution")
+    if not resolution:
+        raise HelmError("resolution is required for bug resolve")
+    body: dict[str, Any] = {"resolution": resolution}
+    for source, target in (("duplicate_of", "duplicate_of"), ("note", "note")):
+        value = _optional_text(args, source)
+        if value:
+            body[target] = value
+    return _task_action_with_uuid(client, args, "resolve", body)
+
+
+def cmd_bug_duplicate(client: Client, args: argparse.Namespace) -> Any:
+    duplicate_of = _optional_text(args, "duplicate_of")
+    if not duplicate_of:
+        raise HelmError("duplicate_of is required when resolving a duplicate bug")
+    body = {"resolution": "duplicate", "duplicate_of": duplicate_of}
+    note = _optional_text(args, "note")
+    if note:
+        body["note"] = note
+    return _task_action_with_uuid(client, args, "resolve", body)
+
+
+def cmd_bug_reopen(client: Client, args: argparse.Namespace) -> Any:
+    reason = _optional_text(args, "reason")
+    if not reason:
+        raise HelmError("reason is required for bug reopen")
+    return _task_action_with_uuid(client, args, "reopen", {"reason": reason})
 
 
 def cmd_start(client: Client, args: argparse.Namespace) -> Any:
-    args.operation_id = _validate_operation_id(args.operation_id)
+    args.operation_id = _command_operation_id(getattr(args, "operation_id", None))
     project = _project(client, args.project)
     project_id = str(project["id"])
     columns, _ = client.call("GET", f"/projects/{parse.quote(project_id, safe='')}/columns?limit=200")
@@ -1617,16 +2149,17 @@ def cmd_start(client: Client, args: argparse.Namespace) -> Any:
     if args.step:
         description += "\n\nCheckpoints\n" + "\n".join(f"- [ ] {step.strip()}" for step in args.step)
     create_path = f"/projects/{parse.quote(project_id, safe='')}/tasks"
+    create_body = {
+        "title": args.title.strip(),
+        "description": description,
+        "column_id": active["id"],
+        "priority": args.priority,
+    }
     created, _ = client.call(
         "POST",
         create_path,
-        body={"title": args.title.strip(), "description": description, "column_id": active["id"], "priority": args.priority},
-        idempotency_key=_mutation_idempotency(args.operation_id, "POST", create_path, {
-            "title": args.title.strip(),
-            "description": description,
-            "column_id": active["id"],
-            "priority": args.priority,
-        }),
+        body=create_body,
+        idempotency_key=_command_mutation_id(args.operation_id, "POST", create_path, create_body),
     )
     if not isinstance(created, dict) or not isinstance(created.get("version"), int):
         raise HelmError("Helm returned an unexpected created task")
@@ -1637,7 +2170,7 @@ def cmd_start(client: Client, args: argparse.Namespace) -> Any:
         claim_path,
         body=claim_body,
         if_match=created["version"],
-        idempotency_key=_mutation_idempotency(args.operation_id, "POST", claim_path, claim_body),
+        idempotency_key=_command_mutation_id(args.operation_id, "POST", claim_path, claim_body),
     )
     if not isinstance(claimed, dict) or not isinstance(claimed.get("version"), int):
         raise HelmError("Helm returned an unexpected claimed task")
@@ -1646,7 +2179,7 @@ def cmd_start(client: Client, args: argparse.Namespace) -> Any:
 
 
 def cmd_backlog(client: Client, args: argparse.Namespace) -> Any:
-    args.operation_id = _validate_operation_id(args.operation_id)
+    args.operation_id = _command_operation_id(getattr(args, "operation_id", None))
     project = _project(client, args.project)
     project_id = str(project["id"])
     columns, _ = client.call("GET", f"/projects/{parse.quote(project_id, safe='')}/columns?limit=200")
@@ -1662,7 +2195,7 @@ def cmd_backlog(client: Client, args: argparse.Namespace) -> Any:
         "POST",
         create_path,
         body=create_body,
-        idempotency_key=_mutation_idempotency(args.operation_id, "POST", create_path, create_body),
+        idempotency_key=_command_mutation_id(args.operation_id, "POST", create_path, create_body),
     )
     if not isinstance(created, dict) or not isinstance(created.get("version"), int):
         raise HelmError("Helm returned an unexpected created task")
@@ -1670,13 +2203,12 @@ def cmd_backlog(client: Client, args: argparse.Namespace) -> Any:
 
 
 def cmd_resume(client: Client, args: argparse.Namespace) -> Any:
-    args.operation_id = _validate_operation_id(args.operation_id)
+    args.operation_id = _command_operation_id(getattr(args, "operation_id", None))
     current = _task(client, args.task)
     # The claim endpoint is intentionally used for both an unclaimed task and
     # a same-owner reclaim. The server treats a same-owner POST /claim as a
     # lease renewal, which makes a retry safe after a lost response and avoids
     # making a race-prone claim/renew decision from a stale GET.
-    action = "claim"
     task_id = str(current["id"])
     claim_path = "/tasks/" + parse.quote(task_id, safe="") + "/claim"
     claim_body = {"lease_seconds": args.lease_seconds}
@@ -1685,7 +2217,7 @@ def cmd_resume(client: Client, args: argparse.Namespace) -> Any:
         claim_path,
         body=claim_body,
         if_match=current["version"],
-        idempotency_key=_mutation_idempotency(args.operation_id, "POST", claim_path, claim_body),
+        idempotency_key=_command_mutation_id(args.operation_id, "POST", claim_path, claim_body),
     )
     if not isinstance(claimed, dict) or not isinstance(claimed.get("version"), int):
         raise HelmError("Helm returned an unexpected claimed task")
@@ -1725,7 +2257,7 @@ def cmd_resume(client: Client, args: argparse.Namespace) -> Any:
                 patch_path,
                 body=patch_body,
                 if_match=claimed["version"],
-                idempotency_key=_mutation_idempotency(args.operation_id, "PATCH", patch_path, patch_body),
+                idempotency_key=_command_mutation_id(args.operation_id, "PATCH", patch_path, patch_body),
             )
             if not isinstance(moved, dict) or not isinstance(moved.get("version"), int):
                 raise HelmError("Helm returned an unexpected moved task")
@@ -1747,7 +2279,7 @@ def cmd_resume(client: Client, args: argparse.Namespace) -> Any:
 
 
 def cmd_progress(client: Client, args: argparse.Namespace) -> Any:
-    args.operation_id = _validate_operation_id(args.operation_id)
+    args.operation_id = _command_operation_id(getattr(args, "operation_id", None))
     current = _task(client, args.task)
     if _structured_progress_supplied(args):
         if not _active_claim(current):
@@ -1759,7 +2291,7 @@ def cmd_progress(client: Client, args: argparse.Namespace) -> Any:
             path,
             body=payload,
             if_match=current["version"],
-            idempotency_key=_mutation_idempotency(args.operation_id, "POST", path, payload),
+            idempotency_key=_command_mutation_id(args.operation_id, "POST", path, payload),
         )
         if not isinstance(updated, dict) or not isinstance(updated.get("version"), int):
             raise HelmError("Helm returned an unexpected updated task")
@@ -1772,7 +2304,7 @@ def cmd_progress(client: Client, args: argparse.Namespace) -> Any:
         "POST",
         path,
         body=comment_body,
-        idempotency_key=_mutation_idempotency(args.operation_id, "POST", path, comment_body),
+        idempotency_key=_command_mutation_id(args.operation_id, "POST", path, comment_body),
     )
     return {"task": current.get("key", current["id"]), "comment": comment}
 
@@ -1908,7 +2440,7 @@ def _progress_message(args: argparse.Namespace) -> str:
 
 
 def _action(client: Client, args: argparse.Namespace, action: str, field: str) -> Any:
-    args.operation_id = _validate_operation_id(args.operation_id)
+    args.operation_id = _command_operation_id(getattr(args, "operation_id", None))
     current = _task(client, args.task)
     value = getattr(args, field)
     path = "/tasks/" + parse.quote(str(current["id"]), safe="") + "/" + action
@@ -1918,7 +2450,7 @@ def _action(client: Client, args: argparse.Namespace, action: str, field: str) -
         path,
         body=body,
         if_match=current["version"],
-        idempotency_key=_mutation_idempotency(args.operation_id, "POST", path, body),
+        idempotency_key=_command_mutation_id(args.operation_id, "POST", path, body),
     )
     _clear_matching_session(current, args.operation_id)
     return {"task": payload, "operation_id": args.operation_id}
@@ -1929,12 +2461,191 @@ def build_parser() -> argparse.ArgumentParser:
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     projects = subparsers.add_parser("projects", help="List visible projects")
+    projects.add_argument("--limit", type=int, default=200)
+    projects.add_argument("--cursor", default="")
+    projects.add_argument("--all", action="store_true", help="Follow every cursor page")
     projects.set_defaults(handler=cmd_projects)
 
     tasks = subparsers.add_parser("tasks", help="List or search tasks in a project")
     tasks.add_argument("--project", required=True)
     tasks.add_argument("--query", default="")
+    tasks.add_argument("--limit", type=int, default=200)
+    tasks.add_argument("--cursor", default="")
+    tasks.add_argument("--all", action="store_true", help="Follow every cursor page")
     tasks.set_defaults(handler=cmd_tasks)
+
+    auth_check = subparsers.add_parser(
+        "auth-check",
+        aliases=("auth", "auth_check"),
+        help="Validate the configured agent token without mutating Helm",
+    )
+    auth_check.set_defaults(handler=cmd_auth_check)
+
+    events = subparsers.add_parser(
+        "events", aliases=("event", "events-poll"), help="Poll events after a monotonic cursor"
+    )
+    events.add_argument("--after", type=int, default=0, help="Last event cursor observed (default: 0)")
+    events.add_argument("--project", help="Restrict events to a project ID, key, or slug")
+    events.add_argument("--limit", type=int, default=50)
+    events.add_argument("--all", action="store_true", help="Follow every event page")
+    events.set_defaults(handler=cmd_events)
+
+    timeline = subparsers.add_parser(
+        "timeline",
+        aliases=("activity", "task-timeline", "project-timeline"),
+        help="Read a task or project timeline",
+    )
+    timeline_target = timeline.add_mutually_exclusive_group(required=True)
+    timeline_target.add_argument("--task", help="Task key or opaque task ID")
+    timeline_target.add_argument("--project", help="Project key, slug, or opaque project ID")
+    timeline.add_argument("--before", default="", help="Opaque cursor from a prior page")
+    timeline.add_argument(
+        "--kind", choices=("agent_progress", "comment", "task_change"), help="Optional activity kind filter"
+    )
+    timeline.add_argument("--limit", type=int, default=50)
+    timeline.add_argument("--all", action="store_true", help="Follow every opaque cursor page")
+    timeline.set_defaults(handler=cmd_timeline)
+
+    renew = subparsers.add_parser("renew", help="Renew the current owner's active task lease")
+    renew.add_argument("--task", required=True)
+    renew.add_argument("--lease-seconds", type=int, choices=range(30, 604801), default=1800)
+    renew.add_argument("--operation-id", help="UUIDv4 for deterministic replay (generated when omitted)")
+    renew.set_defaults(handler=cmd_renew)
+
+    release = subparsers.add_parser("release", help="Release the current owner's active task lease")
+    release.add_argument("--task", required=True)
+    release.add_argument("--operation-id", help="UUIDv4 for deterministic replay (generated when omitted)")
+    release.set_defaults(handler=cmd_release)
+
+    def add_dependency_args(parser: argparse.ArgumentParser, *, mutation: bool) -> None:
+        parser.add_argument("--task", required=True, help="Dependent task key or opaque ID")
+        if mutation:
+            parser.add_argument(
+                "--prerequisite",
+                "--depends-on",
+                required=True,
+                help="Prerequisite task key or opaque ID",
+            )
+            parser.add_argument(
+                "--operation-id",
+                help="UUIDv4 for deterministic replay (generated when omitted)",
+            )
+
+    dependencies = subparsers.add_parser(
+        "dependencies", aliases=("dependency",), help="List or mutate direct task dependencies"
+    )
+    dependency_actions = dependencies.add_subparsers(dest="dependency_action", required=True)
+    dependency_list = dependency_actions.add_parser("list", help="List prerequisites and dependents")
+    add_dependency_args(dependency_list, mutation=False)
+    dependency_list.set_defaults(handler=cmd_dependency_list)
+    dependency_add = dependency_actions.add_parser("add", help="Add a prerequisite edge")
+    add_dependency_args(dependency_add, mutation=True)
+    dependency_add.set_defaults(handler=cmd_dependency_add)
+    dependency_remove = dependency_actions.add_parser("remove", help="Remove a prerequisite edge")
+    add_dependency_args(dependency_remove, mutation=True)
+    dependency_remove.set_defaults(handler=cmd_dependency_remove)
+
+    for name, handler, mutation in (
+        ("dependency-list", cmd_dependency_list, False),
+        ("dependency-add", cmd_dependency_add, True),
+        ("dependency-remove", cmd_dependency_remove, True),
+    ):
+        dependency_command = subparsers.add_parser(name, help=f"{name.replace('-', ' ').capitalize()}")
+        add_dependency_args(dependency_command, mutation=mutation)
+        dependency_command.set_defaults(handler=handler)
+
+    def add_issue_filter_args(parser: argparse.ArgumentParser) -> None:
+        parser.add_argument("--project")
+        parser.add_argument("--state")
+        parser.add_argument("--column")
+        parser.add_argument("--priority")
+        parser.add_argument("--severity")
+        parser.add_argument("--label")
+        parser.add_argument("--assignee")
+        parser.add_argument("--reporter")
+        parser.add_argument("--resolution")
+        parser.add_argument("--agent-state")
+        parser.add_argument("--action-needed", choices=("true", "false"))
+        parser.add_argument("--query", "-q")
+        parser.add_argument("--updated-after")
+        parser.add_argument("--cursor", default="")
+        parser.add_argument("--limit", type=int, default=50)
+        parser.add_argument("--all", action="store_true", help="Follow every cursor page")
+
+    issues = subparsers.add_parser(
+        "issues",
+        aliases=("issue", "bug-list", "issue-list"),
+        help="List visible bug tasks with lifecycle filters",
+    )
+    add_issue_filter_args(issues)
+    issues.set_defaults(handler=cmd_issues)
+
+    def add_bug_report_args(parser: argparse.ArgumentParser) -> None:
+        parser.add_argument("--project", required=True)
+        parser.add_argument("--title", required=True)
+        parser.add_argument("--actual-behavior", required=True, dest="actual_behavior")
+        parser.add_argument("--expected-behavior", dest="expected_behavior")
+        parser.add_argument("--reproduction-steps", dest="reproduction_steps")
+        parser.add_argument("--environment")
+        parser.add_argument("--affected-version", dest="affected_version")
+        parser.add_argument("--severity", choices=("s1", "s2", "s3", "s4"))
+        parser.add_argument("--description")
+        parser.add_argument("--priority", choices=("low", "normal", "high", "urgent"))
+        parser.add_argument("--column")
+        parser.add_argument("--assignee")
+        parser.add_argument("--operation-id", help="UUIDv4 for deterministic replay (generated when omitted)")
+
+    bug_report = subparsers.add_parser(
+        "bug-report", aliases=("report-bug", "report"), help="Create a structured bug task"
+    )
+    add_bug_report_args(bug_report)
+    bug_report.set_defaults(handler=cmd_bug_report)
+
+    def add_bug_action_args(parser: argparse.ArgumentParser, action: str) -> None:
+        parser.add_argument("--task", required=True, help="Bug key or opaque task ID")
+        parser.add_argument("--operation-id", help="UUIDv4 for deterministic replay (generated when omitted)")
+        if action == "triage":
+            parser.add_argument("--severity", required=True, choices=("s1", "s2", "s3", "s4"))
+            parser.add_argument("--priority", choices=("low", "normal", "high", "urgent"))
+            parser.add_argument("--assignee")
+            parser.add_argument("--column")
+        elif action == "resolve":
+            parser.add_argument(
+                "--resolution",
+                required=True,
+                choices=("fixed", "duplicate", "not_planned", "cannot_reproduce", "works_as_designed"),
+            )
+            parser.add_argument("--duplicate-of", dest="duplicate_of")
+            parser.add_argument("--note")
+        elif action == "duplicate":
+            parser.add_argument("--duplicate-of", required=True, dest="duplicate_of")
+            parser.add_argument("--note")
+        elif action == "reopen":
+            parser.add_argument("--reason", required=True)
+
+    bug_action_specs = (
+        ("bug-triage", cmd_bug_triage, "triage"),
+        ("bug-resolve", cmd_bug_resolve, "resolve"),
+        ("bug-duplicate", cmd_bug_duplicate, "duplicate"),
+        ("bug-reopen", cmd_bug_reopen, "reopen"),
+    )
+    for name, handler, action in bug_action_specs:
+        bug_action = subparsers.add_parser(name, help=f"{action.capitalize()} a bug")
+        add_bug_action_args(bug_action, action)
+        bug_action.set_defaults(handler=handler)
+
+    bug = subparsers.add_parser("bug", aliases=("bugs",), help="Run a bug report, list, or lifecycle command")
+    bug_actions = bug.add_subparsers(dest="bug_action", required=True)
+    bug_list = bug_actions.add_parser("list", help="List visible bugs")
+    add_issue_filter_args(bug_list)
+    bug_list.set_defaults(handler=cmd_issues)
+    bug_report_nested = bug_actions.add_parser("report", help="Create a structured bug")
+    add_bug_report_args(bug_report_nested)
+    bug_report_nested.set_defaults(handler=cmd_bug_report)
+    for action, handler in (("triage", cmd_bug_triage), ("resolve", cmd_bug_resolve), ("duplicate", cmd_bug_duplicate), ("reopen", cmd_bug_reopen)):
+        nested = bug_actions.add_parser(action, help=f"{action.capitalize()} a bug")
+        add_bug_action_args(nested, action)
+        nested.set_defaults(handler=handler)
 
     audit = subparsers.add_parser("audit", help="Read-only audit of board column placement")
     audit.add_argument("--project", required=True)
@@ -1991,7 +2702,7 @@ def build_parser() -> argparse.ArgumentParser:
     start.add_argument("--step", action="append", default=[])
     start.add_argument("--priority", choices=("low", "normal", "high", "urgent"), default="normal")
     start.add_argument("--lease-seconds", type=int, choices=range(30, 604801), default=604800)
-    start.add_argument("--operation-id", required=True)
+    start.add_argument("--operation-id", help="UUIDv4 for new work; explicit legacy IDs remain deterministic")
     start.set_defaults(handler=cmd_start)
 
     backlog = subparsers.add_parser("backlog", help="Create an unclaimed backlog task")
@@ -2000,13 +2711,13 @@ def build_parser() -> argparse.ArgumentParser:
     backlog.add_argument("--goal", required=True)
     backlog.add_argument("--step", action="append", default=[])
     backlog.add_argument("--priority", choices=("low", "normal", "high", "urgent"), default="normal")
-    backlog.add_argument("--operation-id", required=True)
+    backlog.add_argument("--operation-id", help="UUIDv4 for new work; explicit legacy IDs remain deterministic")
     backlog.set_defaults(handler=cmd_backlog)
 
     resume = subparsers.add_parser("resume", help="Claim or renew an existing task")
     resume.add_argument("--task", required=True)
     resume.add_argument("--lease-seconds", type=int, choices=range(30, 604801), default=604800)
-    resume.add_argument("--operation-id", required=True)
+    resume.add_argument("--operation-id", help="UUIDv4 for new work; explicit legacy IDs remain deterministic")
     resume.set_defaults(handler=cmd_resume)
 
     heartbeat = subparsers.add_parser("heartbeat", help="Refresh agent-work liveness")
@@ -2023,19 +2734,19 @@ def build_parser() -> argparse.ArgumentParser:
     progress.add_argument("--total", type=int)
     progress.add_argument("--next", dest="next_step")
     progress.add_argument("--checkpoint-ref", action="append", dest="checkpoint_refs", default=[])
-    progress.add_argument("--operation-id", required=True)
+    progress.add_argument("--operation-id", help="UUIDv4 for new work; explicit legacy IDs remain deterministic")
     progress.set_defaults(handler=cmd_progress)
 
     complete = subparsers.add_parser("complete", help="Complete a claimed task")
     complete.add_argument("--task", required=True)
     complete.add_argument("--comment", required=True)
-    complete.add_argument("--operation-id", required=True)
+    complete.add_argument("--operation-id", help="UUIDv4 for new work; explicit legacy IDs remain deterministic")
     complete.set_defaults(handler=lambda client, args: _action(client, args, "complete", "comment"))
 
     block = subparsers.add_parser("block", help="Block a claimed task")
     block.add_argument("--task", required=True)
     block.add_argument("--reason", required=True)
-    block.add_argument("--operation-id", required=True)
+    block.add_argument("--operation-id", help="UUIDv4 for new work; explicit legacy IDs remain deterministic")
     block.set_defaults(handler=lambda client, args: _action(client, args, "block", "reason"))
     return parser
 
@@ -2046,9 +2757,33 @@ def main() -> int:
         result = args.handler(Client(load_config()), args)
         json.dump(result, sys.stdout, ensure_ascii=False, separators=(",", ":"))
         sys.stdout.write("\n")
-        return 0
+        return (
+            1
+            if args.command in {"auth-check", "auth", "auth_check"}
+            and isinstance(result, dict)
+            and not result.get("ok", True)
+            else 0
+        )
     except HelmError as exc:
-        print(f"helm: {exc}", file=sys.stderr)
+        payload = exc.as_dict()
+        env_secrets = tuple(
+            os.environ.get(name, "")
+            for name in (
+                "HELM_TOKEN",
+                "TC_ROADMAP_TOKEN",
+                "ROADMAP_TOKEN",
+                "HELM_CF_ACCESS_CLIENT_ID",
+                "HELM_CF_ACCESS_CLIENT_SECRET",
+                "TC_CF_ACCESS_CLIENT_ID",
+                "TC_CF_ACCESS_CLIENT_SECRET",
+            )
+        )
+        for field in ("code", "message", "retry_after"):
+            value = payload.get(field)
+            if isinstance(value, str):
+                payload[field] = _redact_secrets(value, env_secrets)[:300 if field == "message" else 120]
+        json.dump({"error": payload}, sys.stderr, ensure_ascii=False, separators=(",", ":"))
+        sys.stderr.write("\n")
         return 1
 
 

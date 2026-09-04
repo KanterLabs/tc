@@ -32,6 +32,9 @@ import {
   rememberProject,
   sortRoadmapLiveWork,
   sortLiveWork,
+  sortTasks,
+  taskOrderingAnchors,
+  reorderTaskLocal,
   shouldShowAgentPulse,
   taskDeepLink,
   toInputDate
@@ -130,6 +133,30 @@ describe('board state helpers', () => {
     expect(moved).not.toBe(tasks);
     expect(moved.find((task) => task.id === '1')).toMatchObject({ column_id: 'active', position: 1, version: 2 });
     expect(tasks[0].column_id).toBe('backlog');
+  });
+
+  it('builds visible-card anchors and preserves deterministic tie ordering', () => {
+    const ordered = [
+      { ...tasks[0], id: 'same-position-b', number: 2, position: 0 },
+      { ...tasks[0], id: 'same-position-a', number: 1, position: 0 },
+      { ...tasks[0], id: 'last', number: 3, position: 2 }
+    ];
+    expect(sortTasks(ordered).map((task) => task.id)).toEqual(['same-position-a', 'same-position-b', 'last']);
+    expect(taskOrderingAnchors(ordered, 'backlog', 0)).toEqual({ placement: 'first' });
+    expect(taskOrderingAnchors(ordered, 'backlog', 1)).toEqual({ after_task_id: 'same-position-a', before_task_id: 'same-position-b', placement: 'between' });
+    expect(taskOrderingAnchors(ordered, 'backlog', 3)).toEqual({ placement: 'last' });
+  });
+
+  it('computes a precise local reorder without mutating the source snapshot', () => {
+    const source = [
+      { ...tasks[0], id: 'a', number: 1, position: 0 },
+      { ...tasks[0], id: 'b', number: 2, position: 1 },
+      { ...tasks[0], id: 'c', number: 3, position: 2 }
+    ];
+    const moved = reorderTaskLocal(source, 'c', 'backlog', 1);
+    expect(sortTasks(moved).map((task) => task.id)).toEqual(['a', 'c', 'b']);
+    expect(moved.find((task) => task.id === 'c')).toMatchObject({ position: 0.5, version: 2 });
+    expect(source.map((task) => task.id)).toEqual(['a', 'b', 'c']);
   });
 
   it('filters and reads nested bug metadata', () => {

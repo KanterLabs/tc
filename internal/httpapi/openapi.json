@@ -4,7 +4,7 @@
   "info": {
     "title": "Helm API",
     "version": "1.0.0",
-    "description": "Stable JSON API for the Helm project board and its built-in internal bug\ntracker. Humans use a session cookie or Cloudflare Access identity; agents\nuse scoped bearer tokens.\nSingle-resource responses contain the resource directly. Collections use\na cursor-paginated object containing data and next_cursor. Collection\ncursors are opaque URL-safe offsets and an empty next_cursor means that\nthere is no next page. Every response includes X-Request-ID; deployments\nthat provide a release revision also include X-Roadmap-Revision.\nCookie- and Cloudflare-authenticated mutations require an Origin that\nexactly matches the configured public origin; bearer-token mutations do\nnot require Origin. Temporary bearer-authentication or request-body\nadmission saturation returns 503 with Retry-After.\n",
+    "description": "Stable JSON API for the Helm project board and its built-in internal bug\ntracker. Humans use a session cookie or Cloudflare Access identity; agents\nuse scoped bearer tokens.\nSingle-resource responses contain the resource directly. Collections use\na cursor-paginated object containing data and next_cursor. Collection\ncursors are opaque URL-safe keyset markers (retained decimal/base64\noffsets remain accepted for compatibility) and an empty next_cursor means\nthat there is no next page. Every response includes X-Request-ID; deployments\nthat provide a release revision also include X-Roadmap-Revision.\nCookie- and Cloudflare-authenticated mutations require an Origin that\nexactly matches the configured public origin; bearer-token mutations do\nnot require Origin. Temporary bearer-authentication or request-body\nadmission saturation returns 503 with Retry-After.\n",
     "license": {
       "name": "MIT",
       "identifier": "MIT"
@@ -86,6 +86,14 @@
       "description": "Tasks assigned to the authenticated actor"
     },
     {
+      "name": "Search",
+      "description": "Global task search across the caller's visible projects"
+    },
+    {
+      "name": "Views",
+      "description": "Named, optionally shared global-search filter views"
+    },
+    {
       "name": "Roadmap",
       "description": "Progress summaries and activity"
     },
@@ -99,6 +107,542 @@
     }
   ],
   "paths": {
+    "/api/v1/search": {
+      "get": {
+        "operationId": "searchTasks",
+        "summary": "Search tasks across visible projects",
+        "description": "Returns tasks matching the supplied full-text or field filters. The\nproject ceiling is applied before pagination, so a scoped bearer token\nnever spends a page slot on an inaccessible match. `q` searches task\nkeys, titles, descriptions, project names, labels, board state,\npriority, assignee/claim owner names, and bug details. When `q` is\nsupplied, matching projects and saved views are included in the\noptional `projects` and `views` response fields for command navigation.\n`view` loads a saved view first; explicit query parameters override its\nmatching filters without changing the saved view.\n",
+        "tags": [
+          "Search"
+        ],
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/SearchQuery"
+          },
+          {
+            "name": "key",
+            "in": "query",
+            "description": "Match a task key such as OPS-42.",
+            "schema": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 200
+            }
+          },
+          {
+            "name": "title",
+            "in": "query",
+            "description": "Case-insensitive substring match on task title.",
+            "schema": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 200
+            }
+          },
+          {
+            "name": "description",
+            "in": "query",
+            "description": "Case-insensitive substring match on task description.",
+            "schema": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 200
+            }
+          },
+          {
+            "$ref": "#/components/parameters/LabelFilter"
+          },
+          {
+            "$ref": "#/components/parameters/AssigneeFilter"
+          },
+          {
+            "name": "claim_owner",
+            "in": "query",
+            "description": "Match a claim owner ID or case-insensitive actor-name substring; use `none` for unclaimed tasks.",
+            "schema": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 200
+            }
+          },
+          {
+            "$ref": "#/components/parameters/TaskState"
+          },
+          {
+            "$ref": "#/components/parameters/PriorityFilter"
+          },
+          {
+            "name": "project",
+            "in": "query",
+            "description": "Restrict results to a project ID, key, or stable slug.",
+            "schema": {
+              "$ref": "#/components/schemas/Identifier"
+            }
+          },
+          {
+            "name": "due_from",
+            "in": "query",
+            "description": "Include tasks due at or after this RFC3339 timestamp.",
+            "schema": {
+              "type": "string",
+              "format": "date-time"
+            }
+          },
+          {
+            "name": "due_to",
+            "in": "query",
+            "description": "Include tasks due at or before this RFC3339 timestamp.",
+            "schema": {
+              "type": "string",
+              "format": "date-time"
+            }
+          },
+          {
+            "name": "sort",
+            "in": "query",
+            "description": "Comma-separated stable sort terms such as `updated_at:desc,title:asc`.",
+            "schema": {
+              "type": "string",
+              "maxLength": 200,
+              "pattern": "^[a-z_]+(?::(?:asc|desc))(?:,[a-z_]+(?::(?:asc|desc))){0,7}$"
+            }
+          },
+          {
+            "name": "view",
+            "in": "query",
+            "description": "Saved view ID to use as the initial filter set.",
+            "schema": {
+              "$ref": "#/components/schemas/Identifier"
+            }
+          },
+          {
+            "$ref": "#/components/parameters/Cursor"
+          },
+          {
+            "$ref": "#/components/parameters/Limit"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Cursor-paginated global search results.",
+            "headers": {
+              "X-Request-ID": {
+                "$ref": "#/components/headers/XRequestID"
+              },
+              "X-Roadmap-Revision": {
+                "$ref": "#/components/headers/XRoadmapRevision"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GlobalSearchResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalServerError"
+          },
+          "503": {
+            "$ref": "#/components/responses/ServiceUnavailable"
+          }
+        }
+      }
+    },
+    "/api/v1/views": {
+      "get": {
+        "operationId": "listSavedViews",
+        "summary": "List visible saved search views",
+        "description": "Returns views owned by the actor and shared views visible to the caller.",
+        "tags": [
+          "Views"
+        ],
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/Cursor"
+          },
+          {
+            "$ref": "#/components/parameters/Limit"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Cursor-paginated saved views.",
+            "headers": {
+              "X-Request-ID": {
+                "$ref": "#/components/headers/XRequestID"
+              },
+              "X-Roadmap-Revision": {
+                "$ref": "#/components/headers/XRoadmapRevision"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SavedViewCollection"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalServerError"
+          },
+          "503": {
+            "$ref": "#/components/responses/ServiceUnavailable"
+          }
+        }
+      },
+      "post": {
+        "operationId": "createSavedView",
+        "summary": "Create a saved search view",
+        "description": "The view owner may later update or delete the view. Shared views are readable by other actors who can access their filtered projects.",
+        "tags": [
+          "Views"
+        ],
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/IdempotencyKey"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SavedViewCreateRequest"
+              },
+              "example": {
+                "name": "Urgent operations",
+                "description": "Open urgent work for the operations team.",
+                "filters": {
+                  "priority": "urgent",
+                  "project": "operations"
+                },
+                "sort": [
+                  {
+                    "field": "updated_at",
+                    "direction": "desc"
+                  }
+                ],
+                "shared": true
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "Saved view created.",
+            "headers": {
+              "X-Request-ID": {
+                "$ref": "#/components/headers/XRequestID"
+              },
+              "X-Roadmap-Revision": {
+                "$ref": "#/components/headers/XRoadmapRevision"
+              },
+              "Location": {
+                "$ref": "#/components/headers/Location"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SavedView"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalServerError"
+          },
+          "503": {
+            "$ref": "#/components/responses/ServiceUnavailable"
+          }
+        }
+      }
+    },
+    "/api/v1/views/{view}": {
+      "parameters": [
+        {
+          "name": "view",
+          "in": "path",
+          "required": true,
+          "description": "Opaque saved view ID.",
+          "schema": {
+            "$ref": "#/components/schemas/Identifier"
+          }
+        }
+      ],
+      "get": {
+        "operationId": "getSavedView",
+        "summary": "Get a saved search view",
+        "tags": [
+          "Views"
+        ],
+        "responses": {
+          "200": {
+            "description": "Saved view.",
+            "headers": {
+              "X-Request-ID": {
+                "$ref": "#/components/headers/XRequestID"
+              },
+              "X-Roadmap-Revision": {
+                "$ref": "#/components/headers/XRoadmapRevision"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SavedView"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalServerError"
+          },
+          "503": {
+            "$ref": "#/components/responses/ServiceUnavailable"
+          }
+        }
+      },
+      "patch": {
+        "operationId": "updateSavedView",
+        "summary": "Update an owned saved search view",
+        "tags": [
+          "Views"
+        ],
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/IdempotencyKey"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SavedViewPatchRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Updated saved view.",
+            "headers": {
+              "X-Request-ID": {
+                "$ref": "#/components/headers/XRequestID"
+              },
+              "X-Roadmap-Revision": {
+                "$ref": "#/components/headers/XRoadmapRevision"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SavedView"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalServerError"
+          },
+          "503": {
+            "$ref": "#/components/responses/ServiceUnavailable"
+          }
+        }
+      },
+      "delete": {
+        "operationId": "deleteSavedView",
+        "summary": "Delete an owned saved search view",
+        "tags": [
+          "Views"
+        ],
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/IdempotencyKey"
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Saved view deleted.",
+            "headers": {
+              "X-Request-ID": {
+                "$ref": "#/components/headers/XRequestID"
+              },
+              "X-Roadmap-Revision": {
+                "$ref": "#/components/headers/XRoadmapRevision"
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalServerError"
+          },
+          "503": {
+            "$ref": "#/components/responses/ServiceUnavailable"
+          }
+        }
+      }
+    },
+    "/api/v1/views/{view}/search": {
+      "parameters": [
+        {
+          "name": "view",
+          "in": "path",
+          "required": true,
+          "description": "Opaque saved view ID.",
+          "schema": {
+            "$ref": "#/components/schemas/Identifier"
+          }
+        }
+      ],
+      "get": {
+        "operationId": "searchSavedView",
+        "summary": "Execute a saved search view",
+        "description": "Explicit search query parameters override matching saved-view filters for this request only.",
+        "tags": [
+          "Search"
+        ],
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/SearchQuery"
+          },
+          {
+            "$ref": "#/components/parameters/Cursor"
+          },
+          {
+            "$ref": "#/components/parameters/Limit"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Search results produced from the saved view.",
+            "headers": {
+              "X-Request-ID": {
+                "$ref": "#/components/headers/XRequestID"
+              },
+              "X-Roadmap-Revision": {
+                "$ref": "#/components/headers/XRoadmapRevision"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GlobalSearchResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalServerError"
+          },
+          "503": {
+            "$ref": "#/components/responses/ServiceUnavailable"
+          }
+        }
+      }
+    },
     "/healthz": {
       "get": {
         "operationId": "getHealth",
@@ -341,6 +885,255 @@
           },
           "405": {
             "$ref": "#/components/responses/MethodNotAllowed"
+          }
+        }
+      }
+    },
+    "/api/v1/export": {
+      "get": {
+        "operationId": "exportPortableArchive",
+        "summary": "Export a versioned portable archive",
+        "description": "Exports live projects, columns, tasks, labels, comments, relationships,\nand activity references as a `helm.portable` v1 JSON archive. A\n`project` query selects one project; an unscoped caller may omit it to\nexport every accessible project. This is a portability snapshot, not\na database backup or restore operation.\n",
+        "tags": [
+          "Projects"
+        ],
+        "parameters": [
+          {
+            "name": "project",
+            "in": "query",
+            "required": false,
+            "description": "Project ID, key, or stable slug to export.",
+            "schema": {
+              "$ref": "#/components/schemas/Identifier"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Portable archive JSON attachment",
+            "headers": {
+              "X-Request-ID": {
+                "$ref": "#/components/headers/XRequestID"
+              },
+              "X-Roadmap-Revision": {
+                "$ref": "#/components/headers/XRoadmapRevision"
+              },
+              "X-Helm-Portable-Format": {
+                "description": "Portable envelope format identifier.",
+                "schema": {
+                  "type": "string",
+                  "example": "helm.portable"
+                }
+              },
+              "X-Helm-Portable-Version": {
+                "description": "Portable envelope version.",
+                "schema": {
+                  "type": "integer",
+                  "example": 1
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PortableArchive"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalServerError"
+          }
+        }
+      }
+    },
+    "/api/v1/import": {
+      "post": {
+        "operationId": "importPortableArchive",
+        "summary": "Validate or import a portable archive",
+        "description": "The archive is fully validated before any write. Set `dry_run` to true\nfor a report without mutation. `conflict` defaults to `remap`; use\n`fail` to reject destination identifier conflicts. Stable IDs are kept\nwhenever possible and every remap is listed in the report. Imports\ninsert records transactionally and never replace or delete the\ndestination database.\n",
+        "tags": [
+          "Projects"
+        ],
+        "parameters": [
+          {
+            "name": "dry_run",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "boolean",
+              "default": false
+            }
+          },
+          {
+            "name": "conflict",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "enum": [
+                "remap",
+                "fail"
+              ],
+              "default": "remap"
+            }
+          },
+          {
+            "name": "target_project",
+            "in": "query",
+            "required": false,
+            "description": "Existing project ID, key, or slug to receive the imported archive.",
+            "schema": {
+              "$ref": "#/components/schemas/Identifier"
+            }
+          },
+          {
+            "$ref": "#/components/parameters/IdempotencyKey"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PortableArchiveRequestBody"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Validation or import report",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PortableImportReport"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "413": {
+            "$ref": "#/components/responses/RequestTooLarge"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalServerError"
+          }
+        }
+      }
+    },
+    "/api/v1/import/trello": {
+      "post": {
+        "operationId": "importTrelloBoard",
+        "summary": "Import a Trello board through the isolated adapter",
+        "description": "Accepts a Trello board export/API JSON object and translates supported\nlists, cards, labels, due dates, and comment actions into a Helm\nportable archive. Unsupported Trello fields (including closed flags,\nlist/card positions, idLabels, dueComplete, preferences, and unknown\nfields) are returned explicitly as warnings; the core Helm importer\nremains format-neutral.\n",
+        "tags": [
+          "Projects"
+        ],
+        "parameters": [
+          {
+            "name": "dry_run",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "boolean",
+              "default": false
+            }
+          },
+          {
+            "name": "conflict",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "enum": [
+                "remap",
+                "fail"
+              ],
+              "default": "remap"
+            }
+          },
+          {
+            "name": "target_project",
+            "in": "query",
+            "required": false,
+            "description": "Existing project ID, key, or slug to receive the converted board.",
+            "schema": {
+              "$ref": "#/components/schemas/Identifier"
+            }
+          },
+          {
+            "$ref": "#/components/parameters/IdempotencyKey"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "additionalProperties": true
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Validation or import report",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PortableImportReport"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "413": {
+            "$ref": "#/components/responses/RequestTooLarge"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalServerError"
           }
         }
       }
@@ -1035,6 +1828,9 @@
               },
               "Location": {
                 "$ref": "#/components/headers/Location"
+              },
+              "ETag": {
+                "$ref": "#/components/headers/ETag"
               }
             },
             "content": {
@@ -1101,6 +1897,9 @@
               },
               "X-Roadmap-Revision": {
                 "$ref": "#/components/headers/XRoadmapRevision"
+              },
+              "ETag": {
+                "$ref": "#/components/headers/ETag"
               }
             },
             "content": {
@@ -1139,13 +1938,16 @@
       "patch": {
         "operationId": "updateProject",
         "summary": "Update a project",
-        "description": "An empty object or a body with no recognized project field returns 400.\nNon-nullable properties reject explicit JSON `null`; string properties\nenforce their declared length and format constraints.\n",
+        "description": "An empty object or a body with no recognized project field returns 400.\nNon-nullable properties reject explicit JSON `null`; string properties\nenforce their declared length and format constraints.\nProject keys and slugs remain stable unless explicitly changed in the\nrequest. Archive/restore preserves both identifiers. Send the\noptional If-Match header with the last observed ETag to make an admin\nedit conflict-safe; stale guarded edits return 409.\n",
         "tags": [
           "Projects"
         ],
         "parameters": [
           {
             "$ref": "#/components/parameters/IdempotencyKey"
+          },
+          {
+            "$ref": "#/components/parameters/ProjectColumnIfMatch"
           }
         ],
         "requestBody": {
@@ -1171,6 +1973,9 @@
               },
               "X-Roadmap-Revision": {
                 "$ref": "#/components/headers/XRoadmapRevision"
+              },
+              "ETag": {
+                "$ref": "#/components/headers/ETag"
               }
             },
             "content": {
@@ -1214,6 +2019,172 @@
         }
       }
     },
+    "/api/v1/projects/{project}/export": {
+      "parameters": [
+        {
+          "$ref": "#/components/parameters/ProjectPath"
+        }
+      ],
+      "get": {
+        "operationId": "exportProjectPortableArchive",
+        "summary": "Export one project's portable archive",
+        "description": "Exports the live project and its related records in the versioned `helm.portable` format.",
+        "tags": [
+          "Projects"
+        ],
+        "responses": {
+          "200": {
+            "description": "Portable archive JSON attachment",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PortableArchive"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalServerError"
+          }
+        }
+      }
+    },
+    "/api/v1/projects/{project}/import": {
+      "parameters": [
+        {
+          "$ref": "#/components/parameters/ProjectPath"
+        }
+      ],
+      "post": {
+        "operationId": "importPortableArchiveIntoProject",
+        "summary": "Validate or import an archive into this project",
+        "description": "Imports a one-project archive into the selected project without replacing existing records; use `dry_run` for a validation report.",
+        "tags": [
+          "Projects"
+        ],
+        "parameters": [
+          {
+            "name": "dry_run",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "boolean",
+              "default": false
+            }
+          },
+          {
+            "name": "conflict",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "enum": [
+                "remap",
+                "fail"
+              ],
+              "default": "remap"
+            }
+          },
+          {
+            "$ref": "#/components/parameters/IdempotencyKey"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PortableArchiveRequestBody"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Validation or import report",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PortableImportReport"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "413": {
+            "$ref": "#/components/responses/RequestTooLarge"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalServerError"
+          }
+        }
+      }
+    },
+    "/api/v1/projects/{project}/boards": {
+      "parameters": [
+        {
+          "$ref": "#/components/parameters/ProjectPath"
+        }
+      ],
+      "get": {
+        "operationId": "listProjectBoards",
+        "summary": "List project boards",
+        "description": "v1 exposes one virtual board per project. Multiple boards remain an\nexplicit deferred migration decision; existing project URLs and\npermissions remain canonical until that migration is approved.\n",
+        "tags": [
+          "Projects"
+        ],
+        "responses": {
+          "200": {
+            "description": "Permission-filtered board descriptors and feature decision",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BoardCollection"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalServerError"
+          }
+        }
+      }
+    },
     "/api/v1/projects/{project}/columns": {
       "parameters": [
         {
@@ -1232,6 +2203,16 @@
           },
           {
             "$ref": "#/components/parameters/Limit"
+          },
+          {
+            "name": "archived",
+            "in": "query",
+            "description": "Include archived columns after active columns; defaults to false for board reads.",
+            "required": false,
+            "schema": {
+              "type": "boolean",
+              "default": false
+            }
           }
         ],
         "responses": {
@@ -1338,6 +2319,9 @@
               },
               "Location": {
                 "$ref": "#/components/headers/Location"
+              },
+              "ETag": {
+                "$ref": "#/components/headers/ETag"
               }
             },
             "content": {
@@ -1390,13 +2374,16 @@
       "patch": {
         "operationId": "updateColumn",
         "summary": "Update a board column",
-        "description": "An empty object or a body with no recognized column field returns 400.\nNon-nullable properties reject explicit JSON `null`; string properties\nenforce their declared length and format constraints. A human\nadministrator may explicitly override an active task claim when\nchanging a column's semantic state; bearer tokens and ordinary human\nactors cannot.\n",
+        "description": "An empty object or a body with no recognized column field returns 400.\nNon-nullable properties reject explicit JSON `null`; string properties\nenforce their declared length and format constraints. A human\nadministrator may explicitly override an active task claim when\nchanging a column's semantic state; bearer tokens and ordinary human\nactors cannot. Archiving rehomes tasks to another live column with the\nsame semantic state and is rejected when it would remove the only live\nmapping for one of the five required states. Use If-Match for a\nrecoverable optimistic conflict response.\n",
         "tags": [
           "Columns"
         ],
         "parameters": [
           {
             "$ref": "#/components/parameters/IdempotencyKey"
+          },
+          {
+            "$ref": "#/components/parameters/ProjectColumnIfMatch"
           }
         ],
         "requestBody": {
@@ -1422,6 +2409,9 @@
               },
               "X-Roadmap-Revision": {
                 "$ref": "#/components/headers/XRoadmapRevision"
+              },
+              "ETag": {
+                "$ref": "#/components/headers/ETag"
               }
             },
             "content": {
@@ -1494,6 +2484,9 @@
               },
               "X-Roadmap-Revision": {
                 "$ref": "#/components/headers/XRoadmapRevision"
+              },
+              "ETag": {
+                "$ref": "#/components/headers/ETag"
               }
             },
             "content": {
@@ -1534,7 +2527,7 @@
       "get": {
         "operationId": "listProjectTasks",
         "summary": "List tasks in a project",
-        "description": "Results are ordered by column position and task position. `state`,\n`column`, `kind`, `priority`, `severity`, `label`, `assignee`,\n`reporter`, `resolution`, `agent_state`, `action_needed`, `dependency`,\n`q`, and `updated_after` can be combined. `agent_state` filters the latest\nstructured agent-work snapshot; `stale` and `missing` identify\nread-time liveness conditions. `action_needed=true` selects waiting,\nhandoff, or stale snapshots among unfinished tasks; completed tasks\nretain their snapshot as history but never match an agent-work filter.\n`action_needed=false` is accepted as an explicit no-op filter for\nclients that build filters dynamically.\n`state` filters by a column's semantic state. `dependency=blocked`\nselects tasks with an unmet live prerequisite; `dependency=ready`\nselects tasks with at least one live prerequisite and none unmet (so a\ntask with no prerequisites does not match). Supplied scalar filters are\nsingle-valued; empty identifier/enum/timestamp values and values outside\ntheir declared enum, format, or length are rejected with `400`.\n",
+        "description": "Results use a stable server-side ordering. `sort` accepts `board`,\n`position`, `number`, `created_at`, `updated_at`, `priority`, or\n`title`; `order` selects ascending or descending direction. The\ndefault is board order (column position, task position, number, ID).\nThe returned `next_cursor` is a keyset marker scoped to that ordering;\nunchanged collections traverse without gaps or duplicates.\nEach task cursor also records the project collection revision, a fixed\nread timestamp, and a task-collection revision. If the project\ncollection changes between pages, or while a page and its enrichment\nare being read, the server returns `409 task_collection_changed` with\n`details.restart=true`; discard the cursor and restart from the first\npage. Continuations use the cursor's original read timestamp for\n`stale` and `action_needed` filters.\n`state`,\n`column`, `kind`, `priority`, `severity`, `label`, `assignee`,\n`reporter`, `resolution`, `agent_state`, `action_needed`, `dependency`,\n`q`, and `updated_after` can be combined. `agent_state` filters the latest\nstructured agent-work snapshot; `stale` and `missing` identify\nread-time liveness conditions. `action_needed=true` selects waiting,\nhandoff, or stale snapshots among unfinished tasks; completed tasks\nretain their snapshot as history but never match an agent-work filter.\n`action_needed=false` is accepted as an explicit no-op filter for\nclients that build filters dynamically.\n`state` filters by a column's semantic state. `dependency=blocked`\nselects tasks with an unmet live prerequisite; `dependency=ready`\nselects tasks with at least one live prerequisite and none unmet (so a\ntask with no prerequisites does not match). Supplied scalar filters are\nsingle-valued; empty identifier/enum/timestamp values and values outside\ntheir declared enum, format, or length are rejected with `400`.\n",
         "tags": [
           "Tasks"
         ],
@@ -1582,6 +2575,12 @@
             "$ref": "#/components/parameters/UpdatedAfter"
           },
           {
+            "$ref": "#/components/parameters/TaskSort"
+          },
+          {
+            "$ref": "#/components/parameters/TaskOrder"
+          },
+          {
             "$ref": "#/components/parameters/Cursor"
           },
           {
@@ -1623,6 +2622,9 @@
           },
           "404": {
             "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "#/components/responses/TaskCollectionConflict"
           },
           "429": {
             "$ref": "#/components/responses/TooManyRequests"
@@ -2507,6 +3509,69 @@
         }
       }
     },
+    "/api/v1/issues/metrics": {
+      "get": {
+        "operationId": "getIssueMetrics",
+        "summary": "Get bounded issue health metrics",
+        "description": "Returns aggregate issue health without returning task rows. `reopened`\nis the number of distinct live bug tasks with at least one\n`bug.reopened` event in the inclusive UTC interval from `since` through\n`as_of`. The interval is always the trailing seven days, so the value\nis not derived from the client's finite event-poll buffer. An optional\n`project` narrows the aggregate to one permitted project. When omitted,\nan unscoped identity sees all projects and a project-scoped bearer token\nsees only the union of its permitted project ceiling. Requires\n`tasks:read`.\n",
+        "tags": [
+          "Tasks"
+        ],
+        "parameters": [
+          {
+            "name": "project",
+            "in": "query",
+            "required": false,
+            "description": "Restrict the metric to a permitted project ID, key, or stable slug.",
+            "schema": {
+              "$ref": "#/components/schemas/Identifier"
+            },
+            "example": "operations"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Server-authoritative seven-day issue metrics",
+            "headers": {
+              "X-Request-ID": {
+                "$ref": "#/components/headers/XRequestID"
+              },
+              "X-Roadmap-Revision": {
+                "$ref": "#/components/headers/XRoadmapRevision"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/IssueMetrics"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalServerError"
+          },
+          "503": {
+            "$ref": "#/components/responses/ServiceUnavailable"
+          }
+        }
+      }
+    },
     "/api/v1/issues": {
       "get": {
         "operationId": "listIssues",
@@ -2826,6 +3891,85 @@
         }
       }
     },
+    "/api/v1/tasks/{task}/restore": {
+      "parameters": [
+        {
+          "$ref": "#/components/parameters/TaskPath"
+        }
+      ],
+      "post": {
+        "operationId": "restoreTask",
+        "summary": "Restore a soft-deleted task",
+        "description": "Restores a task deleted by the soft-delete endpoint. Restore requires\nthe exact deleted task version in `If-Match` and an `Idempotency-Key`.\nA restore is accepted only while the task remains deleted; a stale or\nalready-restored task returns a conflict. Retained claims are cleared\nso Undo never revives an expired or unknown lease.\n",
+        "tags": [
+          "Tasks"
+        ],
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/IfMatch"
+          },
+          {
+            "$ref": "#/components/parameters/IdempotencyKey"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Restored task with its current version",
+            "headers": {
+              "X-Request-ID": {
+                "$ref": "#/components/headers/XRequestID"
+              },
+              "X-Roadmap-Revision": {
+                "$ref": "#/components/headers/XRoadmapRevision"
+              },
+              "ETag": {
+                "$ref": "#/components/headers/ETag"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TaskMutationResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "#/components/responses/TaskMutationConflict"
+          },
+          "413": {
+            "$ref": "#/components/responses/RequestTooLarge"
+          },
+          "428": {
+            "$ref": "#/components/responses/PreconditionRequired"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalServerError"
+          },
+          "503": {
+            "$ref": "#/components/responses/ServiceUnavailable"
+          },
+          "507": {
+            "$ref": "#/components/responses/InsufficientStorage"
+          }
+        }
+      }
+    },
     "/api/v1/tasks/{task}/move": {
       "parameters": [
         {
@@ -2835,7 +3979,7 @@
       "post": {
         "operationId": "moveTask",
         "summary": "Apply a guarded task move",
-        "description": "Moves an unfinished task to a backlog or ready column only. Task\nmoves require `tasks:write`, the exact current task ETag in `If-Match`,\nand an `Idempotency-Key`. The expected source column is guarded in the\nsame transaction as the task version and active-claim check; any live\nclaim, including the caller's own, rejects the move. The server\ncomputes the destination position atomically, so `position` is not a\nrequest field. A successful move emits a `task.moved` event. This is\nthe explicit apply step after a client has reviewed an audit finding;\naudit reads and finding review never apply moves.\n",
+        "description": "Moves an unfinished task to a backlog or ready column only. Task\nmoves require `tasks:write`, the exact current task ETag in `If-Match`,\nand an `Idempotency-Key`. The expected source column is guarded in the\nsame transaction as the task version and active-claim check; any live\nclaim, including the caller's own, rejects the move. The server\ncomputes the destination position atomically when no anchors are\nsupplied, so `position` is not a request field. Optional before/after\nanchors provide precise placement and are guarded by column ordering\nrevisions. A successful move emits a `task.moved` event. This is\nthe explicit apply step after a client has reviewed an audit finding;\naudit reads and finding review never apply moves.\n",
         "tags": [
           "Tasks"
         ],
@@ -2926,6 +4070,1243 @@
         }
       }
     },
+    "/api/v1/tasks/{task}/reorder": {
+      "parameters": [
+        {
+          "$ref": "#/components/parameters/TaskPath"
+        }
+      ],
+      "post": {
+        "operationId": "reorderTask",
+        "summary": "Place a task at a precise board position",
+        "description": "Places an unfinished task before/after visible cards in the same or\nanother column. Supply `placement: first` or `last`, or provide\n`before_task_id` and/or `after_task_id`; when both anchors are sent,\nthe task is placed between them. The server resolves anchors against\nthe complete column, so hidden cards remain in their relative order.\nTask reorders require `tasks:write`, the exact current task ETag in\n`If-Match`, and an `Idempotency-Key`. Optional source/destination\n`ordering_version` values reject stale filtered-board snapshots with\n`409` rather than silently overwriting another user's reorder. A\nsuccessful reorder emits `task.moved` with placement and revision\nmetadata; dense positions are rebalanced transactionally.\n",
+        "tags": [
+          "Tasks"
+        ],
+        "security": [
+          {
+            "cookieAuth": []
+          },
+          {
+            "cloudflareAccess": []
+          },
+          {
+            "bearerAuth": [
+              "tasks:write"
+            ]
+          }
+        ],
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/IfMatch"
+          },
+          {
+            "$ref": "#/components/parameters/IdempotencyKey"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/TaskReorderRequest"
+              },
+              "example": {
+                "destination_column_id": "col_ready",
+                "expected_source_column_id": "col_backlog",
+                "before_task_id": "task-42",
+                "after_task_id": "task-41",
+                "placement": "between",
+                "expected_source_ordering_version": 3,
+                "expected_destination_ordering_version": 8,
+                "source": "board",
+                "reason": "Keyboard reorder."
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Precisely placed task with a strong ETag.",
+            "headers": {
+              "X-Request-ID": {
+                "$ref": "#/components/headers/XRequestID"
+              },
+              "X-Roadmap-Revision": {
+                "$ref": "#/components/headers/XRoadmapRevision"
+              },
+              "ETag": {
+                "$ref": "#/components/headers/ETag"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TaskMutationResponse"
+                },
+                "examples": {
+                  "task": {
+                    "$ref": "#/components/examples/TaskExample"
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "#/components/responses/TaskMutationConflict"
+          },
+          "413": {
+            "$ref": "#/components/responses/RequestTooLarge"
+          },
+          "428": {
+            "$ref": "#/components/responses/PreconditionRequired"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalServerError"
+          },
+          "503": {
+            "$ref": "#/components/responses/ServiceUnavailable"
+          },
+          "507": {
+            "$ref": "#/components/responses/InsufficientStorage"
+          }
+        }
+      }
+    },
+    "/api/v1/tasks/{task}/checklist": {
+      "parameters": [
+        {
+          "$ref": "#/components/parameters/TaskPath"
+        }
+      ],
+      "get": {
+        "operationId": "getTaskChecklist",
+        "summary": "Get a task checklist",
+        "description": "Return the ordered acceptance criteria for a task, including a\nderived completion summary and the project's completion policy. The\nresponse ETag is the owning task version; send it as `If-Match` for\nthe next checklist mutation. Reads require `tasks:read` and honor the\ncaller's project access ceiling.\n",
+        "tags": [
+          "Tasks"
+        ],
+        "security": [
+          {
+            "cookieAuth": []
+          },
+          {
+            "cloudflareAccess": []
+          },
+          {
+            "bearerAuth": [
+              "tasks:read"
+            ]
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Ordered checklist and completion summary",
+            "headers": {
+              "X-Request-ID": {
+                "$ref": "#/components/headers/XRequestID"
+              },
+              "X-Roadmap-Revision": {
+                "$ref": "#/components/headers/XRoadmapRevision"
+              },
+              "ETag": {
+                "$ref": "#/components/headers/ETag"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TaskChecklistCollection"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalServerError"
+          },
+          "503": {
+            "$ref": "#/components/responses/ServiceUnavailable"
+          }
+        }
+      },
+      "post": {
+        "operationId": "addTaskChecklistItem",
+        "summary": "Add an acceptance criterion",
+        "description": "Append or insert one acceptance criterion. The caller must have\n`tasks:write`, send the exact current task ETag in `If-Match`, and may\nsend an `Idempotency-Key` for exact replay. Text is trimmed and capped\nat 1,000 Unicode characters; each task is limited to 100 items and\n100,000 total text bytes. A successful mutation advances the owning\ntask version, records the actor and timestamp in activity, and returns\nthe updated task (or id/version metadata for a write-only bearer).\n",
+        "tags": [
+          "Tasks"
+        ],
+        "security": [
+          {
+            "cookieAuth": []
+          },
+          {
+            "cloudflareAccess": []
+          },
+          {
+            "bearerAuth": [
+              "tasks:write"
+            ]
+          }
+        ],
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/IfMatch"
+          },
+          {
+            "$ref": "#/components/parameters/IdempotencyKey"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/TaskChecklistItemRequest"
+              },
+              "example": {
+                "text": "Verify keyboard access",
+                "position": 0
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Updated task and new checklist ETag",
+            "headers": {
+              "X-Request-ID": {
+                "$ref": "#/components/headers/XRequestID"
+              },
+              "X-Roadmap-Revision": {
+                "$ref": "#/components/headers/XRoadmapRevision"
+              },
+              "ETag": {
+                "$ref": "#/components/headers/ETag"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TaskMutationResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "#/components/responses/TaskMutationConflict"
+          },
+          "413": {
+            "$ref": "#/components/responses/RequestTooLarge"
+          },
+          "428": {
+            "$ref": "#/components/responses/PreconditionRequired"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalServerError"
+          },
+          "503": {
+            "$ref": "#/components/responses/ServiceUnavailable"
+          },
+          "507": {
+            "$ref": "#/components/responses/InsufficientStorage"
+          }
+        }
+      },
+      "patch": {
+        "operationId": "reorderTaskChecklist",
+        "summary": "Reorder checklist items",
+        "description": "Replace the complete checklist order with item IDs. Every existing\nitem must appear exactly once. The mutation is task-versioned and\nemits a `task.checklist_reordered` activity event.\n",
+        "tags": [
+          "Tasks"
+        ],
+        "security": [
+          {
+            "cookieAuth": []
+          },
+          {
+            "cloudflareAccess": []
+          },
+          {
+            "bearerAuth": [
+              "tasks:write"
+            ]
+          }
+        ],
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/IfMatch"
+          },
+          {
+            "$ref": "#/components/parameters/IdempotencyKey"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/TaskChecklistReorderRequest"
+              },
+              "example": {
+                "item_ids": [
+                  "check_2",
+                  "check_1"
+                ]
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Updated task and new checklist ETag",
+            "headers": {
+              "ETag": {
+                "$ref": "#/components/headers/ETag"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TaskMutationResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "#/components/responses/TaskMutationConflict"
+          },
+          "413": {
+            "$ref": "#/components/responses/RequestTooLarge"
+          },
+          "428": {
+            "$ref": "#/components/responses/PreconditionRequired"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalServerError"
+          },
+          "503": {
+            "$ref": "#/components/responses/ServiceUnavailable"
+          },
+          "507": {
+            "$ref": "#/components/responses/InsufficientStorage"
+          }
+        }
+      }
+    },
+    "/api/v1/tasks/{task}/checklist/{item}": {
+      "parameters": [
+        {
+          "$ref": "#/components/parameters/TaskPath"
+        },
+        {
+          "name": "item",
+          "in": "path",
+          "required": true,
+          "description": "Opaque checklist item ID.",
+          "schema": {
+            "$ref": "#/components/schemas/Identifier"
+          }
+        }
+      ],
+      "patch": {
+        "operationId": "updateTaskChecklistItem",
+        "summary": "Edit or check an acceptance criterion",
+        "description": "Update one or more of text, completion, or position. Completion\nchanges record the completing actor and timestamp and clear both when\nan item is reopened. The mutation advances the owning task version and\nemits `task.checklist_item_updated`.\n",
+        "tags": [
+          "Tasks"
+        ],
+        "security": [
+          {
+            "cookieAuth": []
+          },
+          {
+            "cloudflareAccess": []
+          },
+          {
+            "bearerAuth": [
+              "tasks:write"
+            ]
+          }
+        ],
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/IfMatch"
+          },
+          {
+            "$ref": "#/components/parameters/IdempotencyKey"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/TaskChecklistItemPatchRequest"
+              },
+              "example": {
+                "completed": true
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Updated task and new checklist ETag",
+            "headers": {
+              "ETag": {
+                "$ref": "#/components/headers/ETag"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TaskMutationResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "#/components/responses/TaskMutationConflict"
+          },
+          "413": {
+            "$ref": "#/components/responses/RequestTooLarge"
+          },
+          "428": {
+            "$ref": "#/components/responses/PreconditionRequired"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalServerError"
+          },
+          "503": {
+            "$ref": "#/components/responses/ServiceUnavailable"
+          },
+          "507": {
+            "$ref": "#/components/responses/InsufficientStorage"
+          }
+        }
+      },
+      "delete": {
+        "operationId": "deleteTaskChecklistItem",
+        "summary": "Remove an acceptance criterion",
+        "description": "Removes one item, compacts its position, advances the task version, and emits `task.checklist_item_removed`.",
+        "tags": [
+          "Tasks"
+        ],
+        "security": [
+          {
+            "cookieAuth": []
+          },
+          {
+            "cloudflareAccess": []
+          },
+          {
+            "bearerAuth": [
+              "tasks:write"
+            ]
+          }
+        ],
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/IfMatch"
+          },
+          {
+            "$ref": "#/components/parameters/IdempotencyKey"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Updated task and new checklist ETag",
+            "headers": {
+              "ETag": {
+                "$ref": "#/components/headers/ETag"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TaskMutationResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "#/components/responses/TaskMutationConflict"
+          },
+          "428": {
+            "$ref": "#/components/responses/PreconditionRequired"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalServerError"
+          },
+          "503": {
+            "$ref": "#/components/responses/ServiceUnavailable"
+          },
+          "507": {
+            "$ref": "#/components/responses/InsufficientStorage"
+          }
+        }
+      }
+    },
+    "/api/v1/tasks/{task}/hierarchy": {
+      "parameters": [
+        {
+          "$ref": "#/components/parameters/TaskPath"
+        }
+      ],
+      "get": {
+        "operationId": "getTaskHierarchy",
+        "summary": "Get a task hierarchy view",
+        "description": "Return the live parent, direct children, bounded ancestors and\nbounded descendants for a task, plus server-derived direct-child\nrollups. All relation reads are limited to 200 direct children and\n20 hierarchy levels and remain within the task's project.\n",
+        "tags": [
+          "Tasks"
+        ],
+        "security": [
+          {
+            "cookieAuth": []
+          },
+          {
+            "cloudflareAccess": []
+          },
+          {
+            "bearerAuth": [
+              "tasks:read"
+            ]
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Bounded hierarchy view",
+            "headers": {
+              "X-Request-ID": {
+                "$ref": "#/components/headers/XRequestID"
+              },
+              "X-Roadmap-Revision": {
+                "$ref": "#/components/headers/XRoadmapRevision"
+              },
+              "ETag": {
+                "$ref": "#/components/headers/ETag"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TaskHierarchy"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalServerError"
+          },
+          "503": {
+            "$ref": "#/components/responses/ServiceUnavailable"
+          }
+        }
+      }
+    },
+    "/api/v1/tasks/{task}/children": {
+      "parameters": [
+        {
+          "$ref": "#/components/parameters/TaskPath"
+        }
+      ],
+      "get": {
+        "operationId": "listTaskChildren",
+        "summary": "List direct child tasks",
+        "tags": [
+          "Tasks"
+        ],
+        "security": [
+          {
+            "cookieAuth": []
+          },
+          {
+            "cloudflareAccess": []
+          },
+          {
+            "bearerAuth": [
+              "tasks:read"
+            ]
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Bounded direct child collection",
+            "headers": {
+              "X-Request-ID": {
+                "$ref": "#/components/headers/XRequestID"
+              },
+              "X-Roadmap-Revision": {
+                "$ref": "#/components/headers/XRoadmapRevision"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TaskHierarchyReferenceCollection"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalServerError"
+          },
+          "503": {
+            "$ref": "#/components/responses/ServiceUnavailable"
+          }
+        }
+      },
+      "post": {
+        "operationId": "addTaskChild",
+        "summary": "Link a child task",
+        "description": "Link a live same-project child to the parent task in the path. The\nrequest body accepts `child`, `child_id`, or `child_task_id`. Send the\nchild's exact ETag in `If-Match` and a non-empty\n`Idempotency-Key`. A parent may have at most 200 direct children and\nthe hierarchy may not exceed 20 levels. Successful mutations return\nthe updated child and emit a scoped `task.parent_linked` event.\n",
+        "tags": [
+          "Tasks"
+        ],
+        "security": [
+          {
+            "cookieAuth": []
+          },
+          {
+            "cloudflareAccess": []
+          },
+          {
+            "bearerAuth": [
+              "tasks:write"
+            ]
+          }
+        ],
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/IfMatch"
+          },
+          {
+            "$ref": "#/components/parameters/RequiredIdempotencyKey"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/TaskHierarchyChildRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Updated child task",
+            "headers": {
+              "ETag": {
+                "$ref": "#/components/headers/ETag"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TaskMutationResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "428": {
+            "$ref": "#/components/responses/PreconditionRequired"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalServerError"
+          },
+          "503": {
+            "$ref": "#/components/responses/ServiceUnavailable"
+          },
+          "507": {
+            "$ref": "#/components/responses/InsufficientStorage"
+          }
+        }
+      }
+    },
+    "/api/v1/tasks/{task}/children/{child}": {
+      "parameters": [
+        {
+          "$ref": "#/components/parameters/TaskPath"
+        },
+        {
+          "$ref": "#/components/parameters/HierarchyChildPath"
+        }
+      ],
+      "delete": {
+        "operationId": "removeTaskChild",
+        "summary": "Unlink a direct child task",
+        "description": "Remove the child relationship. The child ETag is required; the mutation emits a scoped `task.parent_unlinked` event and is idempotent when retried with the same key.",
+        "tags": [
+          "Tasks"
+        ],
+        "security": [
+          {
+            "cookieAuth": []
+          },
+          {
+            "cloudflareAccess": []
+          },
+          {
+            "bearerAuth": [
+              "tasks:write"
+            ]
+          }
+        ],
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/IfMatch"
+          },
+          {
+            "$ref": "#/components/parameters/RequiredIdempotencyKey"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Updated child task",
+            "headers": {
+              "ETag": {
+                "$ref": "#/components/headers/ETag"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TaskMutationResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "428": {
+            "$ref": "#/components/responses/PreconditionRequired"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalServerError"
+          },
+          "503": {
+            "$ref": "#/components/responses/ServiceUnavailable"
+          }
+        }
+      }
+    },
+    "/api/v1/tasks/{task}/ancestors": {
+      "parameters": [
+        {
+          "$ref": "#/components/parameters/TaskPath"
+        }
+      ],
+      "get": {
+        "operationId": "listTaskAncestors",
+        "summary": "List bounded task ancestors",
+        "tags": [
+          "Tasks"
+        ],
+        "security": [
+          {
+            "cookieAuth": []
+          },
+          {
+            "cloudflareAccess": []
+          },
+          {
+            "bearerAuth": [
+              "tasks:read"
+            ]
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Ancestors ordered from nearest parent upward",
+            "headers": {
+              "X-Request-ID": {
+                "$ref": "#/components/headers/XRequestID"
+              },
+              "X-Roadmap-Revision": {
+                "$ref": "#/components/headers/XRoadmapRevision"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TaskHierarchyReferenceCollection"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalServerError"
+          },
+          "503": {
+            "$ref": "#/components/responses/ServiceUnavailable"
+          }
+        }
+      }
+    },
+    "/api/v1/tasks/{task}/descendants": {
+      "parameters": [
+        {
+          "$ref": "#/components/parameters/TaskPath"
+        }
+      ],
+      "get": {
+        "operationId": "listTaskDescendants",
+        "summary": "List bounded task descendants",
+        "tags": [
+          "Tasks"
+        ],
+        "security": [
+          {
+            "cookieAuth": []
+          },
+          {
+            "cloudflareAccess": []
+          },
+          {
+            "bearerAuth": [
+              "tasks:read"
+            ]
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Bounded descendant collection",
+            "headers": {
+              "X-Request-ID": {
+                "$ref": "#/components/headers/XRequestID"
+              },
+              "X-Roadmap-Revision": {
+                "$ref": "#/components/headers/XRoadmapRevision"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TaskHierarchyReferenceCollection"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalServerError"
+          },
+          "503": {
+            "$ref": "#/components/responses/ServiceUnavailable"
+          }
+        }
+      }
+    },
+    "/api/v1/tasks/{task}/parent": {
+      "parameters": [
+        {
+          "$ref": "#/components/parameters/TaskPath"
+        }
+      ],
+      "get": {
+        "operationId": "getTaskParent",
+        "summary": "Get a task's parent",
+        "tags": [
+          "Tasks"
+        ],
+        "security": [
+          {
+            "cookieAuth": []
+          },
+          {
+            "cloudflareAccess": []
+          },
+          {
+            "bearerAuth": [
+              "tasks:read"
+            ]
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Parent reference, or null when unlinked",
+            "headers": {
+              "X-Request-ID": {
+                "$ref": "#/components/headers/XRequestID"
+              },
+              "X-Roadmap-Revision": {
+                "$ref": "#/components/headers/XRoadmapRevision"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": [
+                    "parent"
+                  ],
+                  "properties": {
+                    "parent": {
+                      "oneOf": [
+                        {
+                          "$ref": "#/components/schemas/TaskHierarchyReference"
+                        },
+                        {
+                          "type": "null"
+                        }
+                      ]
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalServerError"
+          },
+          "503": {
+            "$ref": "#/components/responses/ServiceUnavailable"
+          }
+        }
+      },
+      "post": {
+        "operationId": "setTaskParent",
+        "summary": "Link or replace a task parent",
+        "description": "The body accepts `parent`, `parent_id`, or `parent_task_id` as an opaque task ID or project-local key. The child must be live and in the same project. Send the child's ETag and a non-empty idempotency key; successful writes emit `task.parent_linked`.",
+        "tags": [
+          "Tasks"
+        ],
+        "security": [
+          {
+            "cookieAuth": []
+          },
+          {
+            "cloudflareAccess": []
+          },
+          {
+            "bearerAuth": [
+              "tasks:write"
+            ]
+          }
+        ],
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/IfMatch"
+          },
+          {
+            "$ref": "#/components/parameters/RequiredIdempotencyKey"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/TaskHierarchyParentRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Updated child task",
+            "headers": {
+              "ETag": {
+                "$ref": "#/components/headers/ETag"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TaskMutationResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "428": {
+            "$ref": "#/components/responses/PreconditionRequired"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalServerError"
+          },
+          "503": {
+            "$ref": "#/components/responses/ServiceUnavailable"
+          },
+          "507": {
+            "$ref": "#/components/responses/InsufficientStorage"
+          }
+        }
+      },
+      "delete": {
+        "operationId": "clearTaskParent",
+        "summary": "Remove a task parent",
+        "description": "Unlink the task from its parent using its current ETag. Successful writes emit `task.parent_unlinked` and can be replayed with the same idempotency key.",
+        "tags": [
+          "Tasks"
+        ],
+        "security": [
+          {
+            "cookieAuth": []
+          },
+          {
+            "cloudflareAccess": []
+          },
+          {
+            "bearerAuth": [
+              "tasks:write"
+            ]
+          }
+        ],
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/IfMatch"
+          },
+          {
+            "$ref": "#/components/parameters/RequiredIdempotencyKey"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Updated child task",
+            "headers": {
+              "ETag": {
+                "$ref": "#/components/headers/ETag"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TaskMutationResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "428": {
+            "$ref": "#/components/responses/PreconditionRequired"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalServerError"
+          },
+          "503": {
+            "$ref": "#/components/responses/ServiceUnavailable"
+          }
+        }
+      }
+    },
     "/api/v1/tasks/{task}/dependencies": {
       "parameters": [
         {
@@ -2933,6 +5314,9 @@
         }
       ],
       "get": {
+        "503": {
+          "$ref": "#/components/responses/ServiceUnavailable"
+        },
         "operationId": "getTaskDependencies",
         "summary": "Get a task's direct dependencies",
         "description": "Return the live, same-project direct prerequisites and dependents for\na task. The `{task}` path value accepts an opaque task ID or a\ncase-insensitive project-local key such as `OPS-42`. Each direction is\ncapped at 200 relations and ordered deterministically. The response's\nstrong ETag is the current ETag of the referenced task and can be sent\nas `If-Match` when changing its graph.\n",
@@ -2993,9 +5377,6 @@
           },
           "500": {
             "$ref": "#/components/responses/InternalServerError"
-          },
-          "503": {
-            "$ref": "#/components/responses/ServiceUnavailable"
           }
         }
       },
@@ -3236,6 +5617,7 @@
                       "task_id": "task_42",
                       "actor_id": "human_ada",
                       "body": "Progress is now visible in the event feed.",
+                      "version": 1,
                       "created_at": "2026-08-27T10:00:00Z",
                       "updated_at": "2026-08-27T10:00:00Z"
                     }
@@ -3302,6 +5684,9 @@
               },
               "X-Roadmap-Revision": {
                 "$ref": "#/components/headers/XRoadmapRevision"
+              },
+              "ETag": {
+                "$ref": "#/components/headers/ETag"
               }
             },
             "content": {
@@ -3345,6 +5730,242 @@
         }
       }
     },
+    "/api/v1/tasks/{task}/comments/{comment}": {
+      "parameters": [
+        {
+          "$ref": "#/components/parameters/TaskPath"
+        },
+        {
+          "$ref": "#/components/parameters/CommentPath"
+        }
+      ],
+      "get": {
+        "operationId": "getTaskComment",
+        "summary": "Read one task comment",
+        "description": "Return the current active Markdown comment so polling clients can\nreconcile an edited row that is older than the visible timeline page.\nTombstoned comments return 404. The response includes the current\ncomment ETag for optimistic edit or delete operations.\n",
+        "tags": [
+          "Tasks"
+        ],
+        "security": [
+          {
+            "cookieAuth": []
+          },
+          {
+            "cloudflareAccess": []
+          },
+          {
+            "bearerAuth": [
+              "tasks:read"
+            ]
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Current comment",
+            "headers": {
+              "X-Request-ID": {
+                "$ref": "#/components/headers/XRequestID"
+              },
+              "X-Roadmap-Revision": {
+                "$ref": "#/components/headers/XRoadmapRevision"
+              },
+              "ETag": {
+                "$ref": "#/components/headers/ETag"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Comment"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalServerError"
+          },
+          "503": {
+            "$ref": "#/components/responses/ServiceUnavailable"
+          }
+        }
+      },
+      "patch": {
+        "operationId": "updateTaskComment",
+        "summary": "Edit a task comment",
+        "description": "Replace the current Markdown body of a comment. Only its author or a\nhuman administrator may edit it. The required If-Match value is the\ncomment ETag returned by the prior read or mutation; a stale version\nreturns 409 and never overwrites the newer body. Each successful edit\nappends an immutable `comment.updated` activity event.\n",
+        "tags": [
+          "Tasks"
+        ],
+        "security": [
+          {
+            "cookieAuth": []
+          },
+          {
+            "cloudflareAccess": []
+          },
+          {
+            "bearerAuth": [
+              "tasks:write"
+            ]
+          }
+        ],
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/IfMatch"
+          },
+          {
+            "$ref": "#/components/parameters/IdempotencyKey"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CommentUpdateRequest"
+              },
+              "example": {
+                "body": "The rollout is now complete."
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Updated comment",
+            "headers": {
+              "X-Request-ID": {
+                "$ref": "#/components/headers/XRequestID"
+              },
+              "X-Roadmap-Revision": {
+                "$ref": "#/components/headers/XRoadmapRevision"
+              },
+              "ETag": {
+                "$ref": "#/components/headers/ETag"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Comment"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "413": {
+            "$ref": "#/components/responses/RequestTooLarge"
+          },
+          "428": {
+            "$ref": "#/components/responses/PreconditionRequired"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalServerError"
+          },
+          "503": {
+            "$ref": "#/components/responses/ServiceUnavailable"
+          }
+        }
+      },
+      "delete": {
+        "operationId": "deleteTaskComment",
+        "summary": "Delete a task comment",
+        "description": "Tombstone a comment while retaining its original body for the\nconfigured retention period. Only its author or a human administrator\nmay delete it. The required If-Match value is the comment ETag returned\nby the prior read or mutation; each successful deletion appends an\nimmutable `comment.deleted` activity event.\n",
+        "tags": [
+          "Tasks"
+        ],
+        "security": [
+          {
+            "cookieAuth": []
+          },
+          {
+            "cloudflareAccess": []
+          },
+          {
+            "bearerAuth": [
+              "tasks:write"
+            ]
+          }
+        ],
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/IfMatch"
+          },
+          {
+            "$ref": "#/components/parameters/IdempotencyKey"
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Comment deleted",
+            "headers": {
+              "X-Request-ID": {
+                "$ref": "#/components/headers/XRequestID"
+              },
+              "X-Roadmap-Revision": {
+                "$ref": "#/components/headers/XRoadmapRevision"
+              },
+              "ETag": {
+                "$ref": "#/components/headers/ETag"
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "428": {
+            "$ref": "#/components/responses/PreconditionRequired"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalServerError"
+          },
+          "503": {
+            "$ref": "#/components/responses/ServiceUnavailable"
+          }
+        }
+      }
+    },
     "/api/v1/tasks/{task}/timeline": {
       "parameters": [
         {
@@ -3354,7 +5975,7 @@
       "get": {
         "operationId": "listTaskTimeline",
         "summary": "List unified task activity",
-        "description": "Return the durable newest-first task activity stream, merging\nstructured agent progress, comments, and task-change events. The\nresponse uses stable opaque keyset cursors: pass `next_cursor` as\n`before` to load older activity. Generated progress comments and their\n`comment.created` events are represented once by the corresponding\n`agent_progress` item. Legacy comments and events remain available as\ncomments or generic `task_change` items without inferred progress\nfields. Timeline reads require `tasks:read`.\n",
+        "description": "Return the durable newest-first task activity stream, merging\nstructured agent progress, comments, and task-change events. The\nresponse uses stable opaque keyset cursors: pass `next_cursor` as\n`before` to load older activity. Generated progress comments and their\n`comment.created` events are represented once by the corresponding\n`agent_progress` item. Legacy comments and events remain available as\ncomments or generic `task_change` items without inferred progress\nfields. Comment edits and tombstones remain visible as immutable\n`comment.updated` and `comment.deleted` task changes. Timeline reads\nrequire `tasks:read`.\n",
         "tags": [
           "Tasks"
         ],
@@ -4644,6 +7265,71 @@
         }
       }
     },
+    "/api/v1/sidebar-counts": {
+      "get": {
+        "operationId": "getSidebarCounts",
+        "summary": "Get scalar primary-navigation counts",
+        "description": "Returns only the scalar counts needed by the primary navigation; this\nendpoint never materializes task rows. `issues` counts live bug tasks\nand `my_work` follows the requested `view` (default `live`). Live work\ncounts unfinished tasks with an agent-work snapshot in active projects;\nassigned work counts tasks assigned to, or actively claimed by, the\nauthenticated actor. An optional `project` narrows both counts to one\npermitted project. When omitted, unscoped identities see all projects\nand project-scoped bearer tokens see only their permitted project\nceiling. Requires `tasks:read`.\n",
+        "tags": [
+          "My work"
+        ],
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/MyWorkView"
+          },
+          {
+            "name": "project",
+            "in": "query",
+            "description": "Restrict both counts to a permitted project ID, key, or slug.",
+            "required": false,
+            "schema": {
+              "$ref": "#/components/schemas/Identifier"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Scalar primary-navigation counts",
+            "headers": {
+              "X-Request-ID": {
+                "$ref": "#/components/headers/XRequestID"
+              },
+              "X-Roadmap-Revision": {
+                "$ref": "#/components/headers/XRoadmapRevision"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SidebarCounts"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalServerError"
+          },
+          "503": {
+            "$ref": "#/components/responses/ServiceUnavailable"
+          }
+        }
+      }
+    },
     "/api/v1/my-work": {
       "get": {
         "operationId": "listMyWork",
@@ -5317,7 +8003,7 @@
     },
     "headers": {
       "ETag": {
-        "description": "Strong task or audit-finding version validator. Send this value as If-Match on the next mutation of that resource.",
+        "description": "Strong project, column, task, or audit-finding version validator. Send this value as If-Match on the next guarded mutation of that resource.",
         "schema": {
           "type": "string",
           "pattern": "^\"v[1-9][0-9]*\"$"
@@ -5388,6 +8074,16 @@
         },
         "example": "task_42"
       },
+      "CommentPath": {
+        "name": "comment",
+        "in": "path",
+        "required": true,
+        "description": "Opaque comment ID.",
+        "schema": {
+          "$ref": "#/components/schemas/Identifier"
+        },
+        "example": "comment_01"
+      },
       "DependencyPath": {
         "name": "prerequisite",
         "in": "path",
@@ -5397,6 +8093,16 @@
           "$ref": "#/components/schemas/Identifier"
         },
         "example": "OPS-41"
+      },
+      "HierarchyChildPath": {
+        "name": "child",
+        "in": "path",
+        "required": true,
+        "description": "Opaque child task ID or project-local task key such as OPS-42; task keys are matched case-insensitively.",
+        "schema": {
+          "$ref": "#/components/schemas/Identifier"
+        },
+        "example": "OPS-42"
       },
       "AuditPath": {
         "name": "audit",
@@ -5452,12 +8158,45 @@
         "name": "cursor",
         "in": "query",
         "required": false,
-        "description": "Opaque cursor returned as next_cursor. Omit for the first page. For\ncollection routes this is a URL-safe base64 encoding of the next row\noffset; a raw non-negative decimal offset is also accepted. An empty\nnext_cursor terminates pagination, but a supplied empty `cursor` is\ninvalid. Malformed, negative, or repeated values return 400. It is not\nan event feed cursor.\n",
+        "description": "Opaque cursor returned as next_cursor. Omit for the first page. Task\nboard routes return a URL-safe keyset marker that includes the stable\nordering tuple, project collection revision, fixed read timestamp, and\ntask-collection revision; retained collection routes continue to accept a\nURL-safe base64 offset and raw non-negative decimal offset. An empty\nnext_cursor terminates pagination, but a supplied empty `cursor` is\ninvalid. Malformed, negative, or repeated values return 400. A changed\ntask collection invalidates a board cursor with 409\n`task_collection_changed`; discard it and restart from the first page.\nIt is not an event feed cursor.\n",
         "schema": {
           "type": "string",
           "minLength": 1
         },
-        "example": "MjU"
+        "example": "tc1.eyJ2IjoxLCJzb3J0IjoiYm9hcmQiLCJkZXNjIjpmYWxzZSwicHJvamVjdF9pZCI6InAiLCJyZXZpc2lvbiI6MCwicmVhZF9hdCI6IjIwMjYtMDEtMDFUMDA6MDA6MDBaIiwidGFza19jb2xsZWN0aW9uX3JldmlzaW9uIjowLCJjb2x1bW5faWQiOiJjIiwicG9zaXRpb24iOjAsIm51bWJlciI6MSwiaWQiOiJ0In0"
+      },
+      "TaskSort": {
+        "name": "sort",
+        "in": "query",
+        "required": false,
+        "description": "Stable server-side task ordering. Board order is the default.",
+        "schema": {
+          "type": "string",
+          "enum": [
+            "board",
+            "position",
+            "number",
+            "created_at",
+            "updated_at",
+            "priority",
+            "title"
+          ]
+        },
+        "example": "position"
+      },
+      "TaskOrder": {
+        "name": "order",
+        "in": "query",
+        "required": false,
+        "description": "Direction for the selected task sort; defaults to ascending.",
+        "schema": {
+          "type": "string",
+          "enum": [
+            "asc",
+            "desc"
+          ]
+        },
+        "example": "asc"
       },
       "BeforeTimelineCursor": {
         "name": "before",
@@ -5539,12 +8278,23 @@
         "name": "If-Match",
         "in": "header",
         "required": true,
-        "description": "Exact last observed task or audit-finding ETag. The value must be\nquoted as \"vN\" with N a positive decimal version. Missing If-Match\nreturns 428, malformed values return 400, and a stale task version\nreturns 409 with the current task in error.details.current (reduced to\nid/version for bearer tokens without tasks:read).\n",
+        "description": "Exact last observed task, audit-finding, or comment ETag. The value must\nbe quoted as \"vN\" with N a positive decimal version. Missing If-Match\nreturns 428, malformed values return 400, and a stale resource version\nreturns 409 (task conflicts include the current task in\nerror.details.current when the caller can read task details).\n",
         "schema": {
           "type": "string",
           "pattern": "^\"v[1-9][0-9]*\"$"
         },
         "example": "\"v7\""
+      },
+      "ProjectColumnIfMatch": {
+        "name": "If-Match",
+        "in": "header",
+        "required": false,
+        "description": "Optional last observed project or column ETag for an optimistic\nadministration edit. Values use the quoted \"vN\" format. Omit this\nheader only for legacy unguarded writes; stale guarded edits return\n409 with the current resource version in error details.\n",
+        "schema": {
+          "type": "string",
+          "pattern": "^\"v[1-9][0-9]*\"$"
+        },
+        "example": "\"v3\""
       },
       "TaskState": {
         "name": "state",
@@ -5945,6 +8695,37 @@
           }
         }
       },
+      "TaskCollectionConflict": {
+        "description": "A task collection keyset cursor is no longer valid because the\nproject changed after the cursor was issued. Discard the cursor and\nrestart the collection from its first page; the details object\nincludes `restart: true` and the observed collection revisions.\n",
+        "headers": {
+          "X-Request-ID": {
+            "$ref": "#/components/headers/XRequestID"
+          },
+          "X-Roadmap-Revision": {
+            "$ref": "#/components/headers/XRoadmapRevision"
+          }
+        },
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/TaskCollectionConflictErrorResponse"
+            },
+            "example": {
+              "error": {
+                "code": "task_collection_changed",
+                "message": "task collection changed; restart pagination from the first page",
+                "details": {
+                  "expected_revision": 42,
+                  "current_revision": 43,
+                  "expected_task_collection_revision": 7,
+                  "current_task_collection_revision": 8,
+                  "restart": true
+                }
+              }
+            }
+          }
+        }
+      },
       "DependencyConflict": {
         "description": "Dependency mutations use stable conflict codes. `dependency_cycle`,\n`dependency_already_exists`, `dependency_in_use`, `stale_task`,\n`task_already_claimed`, and `idempotency_key_reused` are returned with\nHTTP 409 when the graph or mutation precondition conflicts with current\nstate. Lifecycle guards also return `unmet_dependencies` when claim,\nstart, finish, resolution, or semantic-column transitions would cross a\nboundary with an unsatisfied prerequisite. Conflict details are bounded\nby the 200-edge graph limit and scope-aware: a bearer token without\n`tasks:read` receives no relation IDs, keys, titles, timestamps,\nsatisfaction flags, or cycle paths; only safe metadata such as a count,\ndirection, or limit may remain.\n",
         "headers": {
@@ -6214,6 +8995,14 @@
           "completed"
         ]
       },
+      "ChecklistCompletionPolicy": {
+        "type": "string",
+        "enum": [
+          "warn",
+          "require"
+        ],
+        "description": "Whether completing a task with open checklist items warns or is rejected."
+      },
       "AuditRunStatus": {
         "type": "string",
         "enum": [
@@ -6328,6 +9117,67 @@
             "pattern": "^[0-9a-f]{40}$",
             "description": "Git commit deployed by the release pipeline, when supplied by the runtime.",
             "example": "0123456789abcdef0123456789abcdef01234567"
+          }
+        },
+        "additionalProperties": false
+      },
+      "IssueMetrics": {
+        "type": "object",
+        "required": [
+          "reopened",
+          "window_days",
+          "since",
+          "as_of"
+        ],
+        "properties": {
+          "reopened": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "Distinct live bug tasks reopened during the inclusive trailing seven-day UTC interval."
+          },
+          "window_days": {
+            "type": "integer",
+            "const": 7,
+            "description": "Fixed trailing window used for the reopened metric."
+          },
+          "since": {
+            "type": "string",
+            "format": "date-time",
+            "description": "Inclusive UTC lower bound of the metric interval."
+          },
+          "as_of": {
+            "type": "string",
+            "format": "date-time",
+            "description": "Inclusive UTC upper bound and server evaluation time."
+          }
+        },
+        "additionalProperties": false
+      },
+      "SidebarCounts": {
+        "type": "object",
+        "required": [
+          "issues",
+          "my_work",
+          "view"
+        ],
+        "properties": {
+          "issues": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "Number of live bug tasks visible in the effective project ceiling."
+          },
+          "my_work": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "Number of tasks represented by the requested My Work view in the effective project ceiling."
+          },
+          "view": {
+            "type": "string",
+            "enum": [
+              "live",
+              "assigned"
+            ],
+            "description": "My Work view used for the my_work count."
           }
         },
         "additionalProperties": false
@@ -6613,8 +9463,10 @@
           "description",
           "color",
           "favorite",
+          "checklist_completion_policy",
           "created_at",
-          "updated_at"
+          "updated_at",
+          "version"
         ],
         "properties": {
           "id": {
@@ -6646,6 +9498,10 @@
           },
           "favorite": {
             "type": "boolean"
+          },
+          "checklist_completion_policy": {
+            "$ref": "#/components/schemas/ChecklistCompletionPolicy",
+            "description": "Project completion behavior for tasks with open checklist items."
           },
           "archived_at": {
             "$ref": "#/components/schemas/Timestamp"
@@ -6679,6 +9535,787 @@
           "column_count": {
             "type": "integer",
             "minimum": 0
+          },
+          "version": {
+            "type": "integer",
+            "minimum": 1,
+            "description": "Optimistic version for guarded administration edits."
+          }
+        },
+        "additionalProperties": false
+      },
+      "PortableActorReference": {
+        "type": "object",
+        "required": [
+          "id",
+          "kind",
+          "name"
+        ],
+        "properties": {
+          "id": {
+            "$ref": "#/components/schemas/Identifier"
+          },
+          "kind": {
+            "$ref": "#/components/schemas/ActorKind"
+          },
+          "name": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 200
+          },
+          "description": {
+            "type": "string",
+            "maxLength": 20000
+          },
+          "disabled_at": {
+            "$ref": "#/components/schemas/NullableTimestamp"
+          }
+        },
+        "additionalProperties": false
+      },
+      "PortableBug": {
+        "type": "object",
+        "required": [
+          "reporter_id",
+          "actual_behavior",
+          "expected_behavior",
+          "reproduction_steps",
+          "environment",
+          "affected_version"
+        ],
+        "properties": {
+          "reporter_id": {
+            "$ref": "#/components/schemas/Identifier"
+          },
+          "severity": {
+            "$ref": "#/components/schemas/BugSeverity"
+          },
+          "actual_behavior": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 100000
+          },
+          "expected_behavior": {
+            "type": "string",
+            "maxLength": 100000
+          },
+          "reproduction_steps": {
+            "type": "string",
+            "maxLength": 100000
+          },
+          "environment": {
+            "type": "string",
+            "maxLength": 100000
+          },
+          "affected_version": {
+            "type": "string",
+            "maxLength": 100000
+          },
+          "resolution": {
+            "$ref": "#/components/schemas/BugResolution"
+          },
+          "resolved_by": {
+            "$ref": "#/components/schemas/Identifier"
+          },
+          "resolved_at": {
+            "$ref": "#/components/schemas/NullableTimestamp"
+          },
+          "duplicate_of": {
+            "$ref": "#/components/schemas/Identifier"
+          }
+        },
+        "additionalProperties": false
+      },
+      "PortableProject": {
+        "type": "object",
+        "required": [
+          "id",
+          "key",
+          "slug",
+          "name",
+          "description",
+          "color",
+          "favorite",
+          "created_at",
+          "updated_at"
+        ],
+        "properties": {
+          "id": {
+            "$ref": "#/components/schemas/Identifier"
+          },
+          "key": {
+            "type": "string",
+            "pattern": "^[A-Z][A-Z0-9_-]{0,15}$"
+          },
+          "slug": {
+            "type": "string",
+            "pattern": "^[a-z0-9][a-z0-9-]{0,63}$",
+            "maxLength": 64
+          },
+          "name": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 200
+          },
+          "description": {
+            "type": "string",
+            "maxLength": 20000
+          },
+          "color": {
+            "$ref": "#/components/schemas/Color"
+          },
+          "favorite": {
+            "type": "boolean"
+          },
+          "archived_at": {
+            "$ref": "#/components/schemas/NullableTimestamp"
+          },
+          "created_at": {
+            "$ref": "#/components/schemas/Timestamp"
+          },
+          "updated_at": {
+            "$ref": "#/components/schemas/Timestamp"
+          }
+        },
+        "additionalProperties": false
+      },
+      "PortableColumn": {
+        "type": "object",
+        "required": [
+          "id",
+          "project_id",
+          "name",
+          "semantic_state",
+          "position",
+          "created_at",
+          "updated_at"
+        ],
+        "properties": {
+          "id": {
+            "$ref": "#/components/schemas/Identifier"
+          },
+          "project_id": {
+            "$ref": "#/components/schemas/Identifier"
+          },
+          "name": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 100
+          },
+          "semantic_state": {
+            "$ref": "#/components/schemas/SemanticState"
+          },
+          "position": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "created_at": {
+            "$ref": "#/components/schemas/Timestamp"
+          },
+          "updated_at": {
+            "$ref": "#/components/schemas/Timestamp"
+          }
+        },
+        "additionalProperties": false
+      },
+      "PortableLabel": {
+        "type": "object",
+        "required": [
+          "id",
+          "project_id",
+          "name",
+          "color",
+          "created_at",
+          "updated_at"
+        ],
+        "properties": {
+          "id": {
+            "$ref": "#/components/schemas/Identifier"
+          },
+          "project_id": {
+            "$ref": "#/components/schemas/Identifier"
+          },
+          "name": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 100
+          },
+          "color": {
+            "$ref": "#/components/schemas/Color"
+          },
+          "created_at": {
+            "$ref": "#/components/schemas/Timestamp"
+          },
+          "updated_at": {
+            "$ref": "#/components/schemas/Timestamp"
+          }
+        },
+        "additionalProperties": false
+      },
+      "PortableTask": {
+        "type": "object",
+        "required": [
+          "id",
+          "number",
+          "project_id",
+          "kind",
+          "column_id",
+          "title",
+          "description",
+          "priority",
+          "position",
+          "version",
+          "created_at",
+          "updated_at"
+        ],
+        "properties": {
+          "id": {
+            "$ref": "#/components/schemas/Identifier"
+          },
+          "number": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "project_id": {
+            "$ref": "#/components/schemas/Identifier"
+          },
+          "kind": {
+            "$ref": "#/components/schemas/TaskKind"
+          },
+          "column_id": {
+            "$ref": "#/components/schemas/Identifier"
+          },
+          "title": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 500
+          },
+          "description": {
+            "type": "string",
+            "maxLength": 100000
+          },
+          "priority": {
+            "$ref": "#/components/schemas/Priority"
+          },
+          "position": {
+            "type": "number",
+            "minimum": 0,
+            "maximum": 1000000000000
+          },
+          "assignee_id": {
+            "$ref": "#/components/schemas/Identifier"
+          },
+          "claimed_by": {
+            "$ref": "#/components/schemas/Identifier"
+          },
+          "claim_expires_at": {
+            "$ref": "#/components/schemas/NullableTimestamp"
+          },
+          "due_at": {
+            "$ref": "#/components/schemas/NullableTimestamp"
+          },
+          "version": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "completed_at": {
+            "$ref": "#/components/schemas/NullableTimestamp"
+          },
+          "created_at": {
+            "$ref": "#/components/schemas/Timestamp"
+          },
+          "updated_at": {
+            "$ref": "#/components/schemas/Timestamp"
+          },
+          "bug": {
+            "$ref": "#/components/schemas/PortableBug"
+          }
+        },
+        "additionalProperties": false
+      },
+      "PortableComment": {
+        "type": "object",
+        "required": [
+          "id",
+          "task_id",
+          "actor_id",
+          "body",
+          "created_at",
+          "updated_at"
+        ],
+        "properties": {
+          "id": {
+            "$ref": "#/components/schemas/Identifier"
+          },
+          "task_id": {
+            "$ref": "#/components/schemas/Identifier"
+          },
+          "actor_id": {
+            "$ref": "#/components/schemas/Identifier"
+          },
+          "body": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 20000
+          },
+          "created_at": {
+            "$ref": "#/components/schemas/Timestamp"
+          },
+          "updated_at": {
+            "$ref": "#/components/schemas/Timestamp"
+          }
+        },
+        "additionalProperties": false
+      },
+      "PortableTaskLabel": {
+        "type": "object",
+        "required": [
+          "task_id",
+          "label_id"
+        ],
+        "properties": {
+          "task_id": {
+            "$ref": "#/components/schemas/Identifier"
+          },
+          "label_id": {
+            "$ref": "#/components/schemas/Identifier"
+          }
+        },
+        "additionalProperties": false
+      },
+      "PortableDependency": {
+        "type": "object",
+        "required": [
+          "task_id",
+          "prerequisite_task_id",
+          "created_at"
+        ],
+        "properties": {
+          "task_id": {
+            "$ref": "#/components/schemas/Identifier"
+          },
+          "prerequisite_task_id": {
+            "$ref": "#/components/schemas/Identifier"
+          },
+          "created_by": {
+            "$ref": "#/components/schemas/Identifier"
+          },
+          "created_at": {
+            "$ref": "#/components/schemas/Timestamp"
+          }
+        },
+        "additionalProperties": false
+      },
+      "PortableTaskLink": {
+        "type": "object",
+        "required": [
+          "source_task_id",
+          "target_task_id",
+          "link_type",
+          "created_at"
+        ],
+        "properties": {
+          "source_task_id": {
+            "$ref": "#/components/schemas/Identifier"
+          },
+          "target_task_id": {
+            "$ref": "#/components/schemas/Identifier"
+          },
+          "link_type": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 200
+          },
+          "created_at": {
+            "$ref": "#/components/schemas/Timestamp"
+          }
+        },
+        "additionalProperties": false
+      },
+      "PortableEvent": {
+        "type": "object",
+        "required": [
+          "cursor",
+          "id",
+          "type",
+          "payload",
+          "created_at"
+        ],
+        "properties": {
+          "cursor": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "id": {
+            "$ref": "#/components/schemas/Identifier"
+          },
+          "type": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 200
+          },
+          "actor_id": {
+            "$ref": "#/components/schemas/Identifier"
+          },
+          "project_id": {
+            "$ref": "#/components/schemas/Identifier"
+          },
+          "task_id": {
+            "$ref": "#/components/schemas/Identifier"
+          },
+          "payload": {
+            "type": "object",
+            "additionalProperties": true
+          },
+          "created_at": {
+            "$ref": "#/components/schemas/Timestamp"
+          }
+        },
+        "additionalProperties": false
+      },
+      "PortableRelationships": {
+        "type": "object",
+        "required": [
+          "task_labels",
+          "dependencies",
+          "task_links"
+        ],
+        "properties": {
+          "task_labels": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/PortableTaskLabel"
+            }
+          },
+          "dependencies": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/PortableDependency"
+            }
+          },
+          "task_links": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/PortableTaskLink"
+            }
+          }
+        },
+        "additionalProperties": false
+      },
+      "PortableActivity": {
+        "type": "object",
+        "required": [
+          "events",
+          "agent_work",
+          "agent_work_history"
+        ],
+        "properties": {
+          "events": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/PortableEvent"
+            }
+          },
+          "agent_work": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "additionalProperties": true
+            }
+          },
+          "agent_work_history": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "additionalProperties": true
+            }
+          }
+        },
+        "additionalProperties": false
+      },
+      "PortableArchive": {
+        "type": "object",
+        "required": [
+          "format",
+          "version",
+          "exported_at",
+          "source",
+          "projects",
+          "columns",
+          "tasks",
+          "labels",
+          "relationships",
+          "activity",
+          "comments"
+        ],
+        "properties": {
+          "format": {
+            "type": "string",
+            "const": "helm.portable"
+          },
+          "version": {
+            "type": "integer",
+            "const": 1
+          },
+          "exported_at": {
+            "$ref": "#/components/schemas/Timestamp"
+          },
+          "source": {
+            "type": "object",
+            "required": [
+              "product",
+              "api"
+            ],
+            "properties": {
+              "product": {
+                "type": "string"
+              },
+              "api": {
+                "type": "string"
+              }
+            },
+            "additionalProperties": false
+          },
+          "projects": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/PortableProject"
+            }
+          },
+          "columns": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/PortableColumn"
+            }
+          },
+          "tasks": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/PortableTask"
+            }
+          },
+          "labels": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/PortableLabel"
+            }
+          },
+          "actors": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/PortableActorReference"
+            }
+          },
+          "relationships": {
+            "$ref": "#/components/schemas/PortableRelationships"
+          },
+          "activity": {
+            "$ref": "#/components/schemas/PortableActivity"
+          },
+          "comments": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/PortableComment"
+            }
+          }
+        },
+        "additionalProperties": false
+      },
+      "PortableImportRequest": {
+        "type": "object",
+        "required": [
+          "archive"
+        ],
+        "properties": {
+          "archive": {
+            "$ref": "#/components/schemas/PortableArchive"
+          },
+          "dry_run": {
+            "type": "boolean",
+            "default": false
+          },
+          "conflict": {
+            "type": "string",
+            "enum": [
+              "remap",
+              "fail"
+            ],
+            "default": "remap"
+          },
+          "target_project": {
+            "$ref": "#/components/schemas/Identifier"
+          }
+        },
+        "additionalProperties": false
+      },
+      "PortableArchiveRequestBody": {
+        "oneOf": [
+          {
+            "$ref": "#/components/schemas/PortableArchive"
+          },
+          {
+            "$ref": "#/components/schemas/PortableImportRequest"
+          }
+        ]
+      },
+      "PortableImportRemap": {
+        "type": "object",
+        "required": [
+          "entity",
+          "source",
+          "target",
+          "reason"
+        ],
+        "properties": {
+          "entity": {
+            "type": "string"
+          },
+          "source": {
+            "type": "string"
+          },
+          "target": {
+            "type": "string"
+          },
+          "field": {
+            "type": "string"
+          },
+          "reason": {
+            "type": "string"
+          }
+        },
+        "additionalProperties": false
+      },
+      "PortableImportReport": {
+        "type": "object",
+        "required": [
+          "format",
+          "version",
+          "dry_run",
+          "conflict",
+          "counts",
+          "remaps",
+          "warnings",
+          "errors"
+        ],
+        "properties": {
+          "format": {
+            "type": "string"
+          },
+          "version": {
+            "type": "integer"
+          },
+          "dry_run": {
+            "type": "boolean"
+          },
+          "conflict": {
+            "type": "string",
+            "enum": [
+              "remap",
+              "fail"
+            ]
+          },
+          "counts": {
+            "type": "object",
+            "additionalProperties": {
+              "type": "integer",
+              "minimum": 0
+            }
+          },
+          "remaps": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/PortableImportRemap"
+            }
+          },
+          "warnings": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "errors": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "additionalProperties": true
+            }
+          }
+        },
+        "additionalProperties": false
+      },
+      "BoardDescriptor": {
+        "type": "object",
+        "required": [
+          "id",
+          "project_id",
+          "name",
+          "slug",
+          "default",
+          "enabled"
+        ],
+        "properties": {
+          "id": {
+            "$ref": "#/components/schemas/Identifier"
+          },
+          "project_id": {
+            "$ref": "#/components/schemas/Identifier"
+          },
+          "name": {
+            "type": "string"
+          },
+          "slug": {
+            "type": "string"
+          },
+          "default": {
+            "type": "boolean"
+          },
+          "enabled": {
+            "type": "boolean"
+          }
+        },
+        "additionalProperties": false
+      },
+      "BoardCollection": {
+        "type": "object",
+        "required": [
+          "data",
+          "next_cursor",
+          "multi_board"
+        ],
+        "properties": {
+          "data": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/BoardDescriptor"
+            }
+          },
+          "next_cursor": {
+            "type": "string"
+          },
+          "multi_board": {
+            "type": "object",
+            "required": [
+              "enabled",
+              "decision",
+              "migration_required",
+              "url_compatibility"
+            ],
+            "properties": {
+              "enabled": {
+                "type": "boolean"
+              },
+              "decision": {
+                "type": "string",
+                "const": "deferred"
+              },
+              "migration_required": {
+                "type": "boolean"
+              },
+              "url_compatibility": {
+                "type": "string"
+              }
+            },
+            "additionalProperties": false
           }
         },
         "additionalProperties": false
@@ -6719,6 +10356,10 @@
           "favorite": {
             "type": "boolean",
             "default": false
+          },
+          "checklist_completion_policy": {
+            "$ref": "#/components/schemas/ChecklistCompletionPolicy",
+            "default": "warn"
           }
         },
         "additionalProperties": false
@@ -6950,6 +10591,10 @@
           "archived": {
             "type": "boolean",
             "description": "Archive or restore the project."
+          },
+          "checklist_completion_policy": {
+            "$ref": "#/components/schemas/ChecklistCompletionPolicy",
+            "description": "Warn by default, or require every checklist item before completion."
           }
         },
         "additionalProperties": false
@@ -6986,8 +10631,10 @@
           "name",
           "semantic_state",
           "position",
+          "ordering_version",
           "created_at",
-          "updated_at"
+          "updated_at",
+          "version"
         ],
         "properties": {
           "id": {
@@ -7008,11 +10655,25 @@
             "type": "integer",
             "minimum": 0
           },
+          "archived_at": {
+            "$ref": "#/components/schemas/Timestamp"
+          },
+          "ordering_version": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 1,
+            "description": "Incremented whenever task ordering in this column changes."
+          },
           "created_at": {
             "$ref": "#/components/schemas/Timestamp"
           },
           "updated_at": {
             "$ref": "#/components/schemas/Timestamp"
+          },
+          "version": {
+            "type": "integer",
+            "minimum": 1,
+            "description": "Optimistic version for guarded administration edits."
           }
         },
         "additionalProperties": false
@@ -7054,6 +10715,10 @@
           "position": {
             "type": "integer",
             "minimum": 0
+          },
+          "archived": {
+            "type": "boolean",
+            "description": "Archive or restore the column. Archiving rehomes its tasks to a same-state live column."
           }
         },
         "additionalProperties": false
@@ -7425,7 +11090,7 @@
         "required": [
           "source"
         ],
-        "description": "Guarded raw board move intent. Supply one or more agreeing aliases\nfrom each destination/source group; canonical names are\n`destination_column_id` and `expected_source_column_id`. `source` is\nrequired provenance and `reason` is optional. The server assigns the\ndestination position atomically, so `position` and other fields are\nrejected. Only backlog and ready destination columns are allowed.\n",
+        "description": "Guarded raw board move intent. Supply one or more agreeing aliases\nfrom each destination/source group; canonical names are\n`destination_column_id` and `expected_source_column_id`. `source` is\nrequired provenance and `reason` is optional. The server assigns the\ndestination position atomically, so `position` and other fields are\nrejected. Anchor-enabled requests can place a card precisely before,\nafter, first, last, or between visible neighbors.\n",
         "properties": {
           "destination_column_id": {
             "$ref": "#/components/schemas/Identifier"
@@ -7484,6 +11149,75 @@
             "minLength": 1,
             "maxLength": 10000,
             "description": "Optional bounded explanation; when supplied it must not be empty."
+          },
+          "before_task_id": {
+            "$ref": "#/components/schemas/Identifier",
+            "description": "Place immediately before this destination-column anchor."
+          },
+          "before_task": {
+            "$ref": "#/components/schemas/Identifier",
+            "description": "Alias for `before_task_id`."
+          },
+          "before": {
+            "$ref": "#/components/schemas/Identifier",
+            "description": "Alias for `before_task_id`."
+          },
+          "after_task_id": {
+            "$ref": "#/components/schemas/Identifier",
+            "description": "Place immediately after this destination-column anchor."
+          },
+          "after_task": {
+            "$ref": "#/components/schemas/Identifier",
+            "description": "Alias for `after_task_id`."
+          },
+          "after": {
+            "$ref": "#/components/schemas/Identifier",
+            "description": "Alias for `after_task_id`."
+          },
+          "placement": {
+            "type": "string",
+            "enum": [
+              "first",
+              "before",
+              "between",
+              "after",
+              "last"
+            ],
+            "description": "Explicit first/last placement or anchor relationship."
+          },
+          "expected_ordering_version": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0,
+            "description": "Convenience revision guard applied to both columns."
+          },
+          "ordering_version": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0,
+            "description": "Alias for `expected_ordering_version`."
+          },
+          "expected_source_ordering_version": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "source_ordering_version": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0,
+            "description": "Alias for `expected_source_ordering_version`."
+          },
+          "expected_destination_ordering_version": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "destination_ordering_version": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0,
+            "description": "Alias for `expected_destination_ordering_version`."
           }
         },
         "allOf": [
@@ -7558,6 +11292,14 @@
         ],
         "additionalProperties": false
       },
+      "TaskReorderRequest": {
+        "description": "Precise guarded board placement; this shape is shared with the anchor-enabled task move endpoint.",
+        "allOf": [
+          {
+            "$ref": "#/components/schemas/TaskMoveRequest"
+          }
+        ]
+      },
       "TaskDependencyRequest": {
         "type": "object",
         "required": [
@@ -7630,6 +11372,256 @@
         },
         "additionalProperties": false
       },
+      "TaskHierarchyReference": {
+        "type": "object",
+        "required": [
+          "id",
+          "number",
+          "key",
+          "project_id",
+          "title",
+          "kind",
+          "column_id",
+          "semantic_state",
+          "version"
+        ],
+        "description": "Compact bounded parent/child reference. It never embeds a full task or nested relation collection.",
+        "properties": {
+          "id": {
+            "$ref": "#/components/schemas/Identifier"
+          },
+          "number": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "key": {
+            "type": "string",
+            "pattern": "^[A-Z][A-Z0-9_-]{0,15}-[1-9][0-9]*$"
+          },
+          "project_id": {
+            "$ref": "#/components/schemas/Identifier"
+          },
+          "title": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 500
+          },
+          "kind": {
+            "$ref": "#/components/schemas/TaskKind"
+          },
+          "column_id": {
+            "$ref": "#/components/schemas/Identifier"
+          },
+          "semantic_state": {
+            "$ref": "#/components/schemas/SemanticState"
+          },
+          "state": {
+            "$ref": "#/components/schemas/SemanticState"
+          },
+          "version": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 1
+          },
+          "parent_id": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/Identifier"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "completed_at": {
+            "$ref": "#/components/schemas/NullableTimestamp"
+          },
+          "agent_work": {
+            "$ref": "#/components/schemas/AgentWork"
+          }
+        },
+        "additionalProperties": false
+      },
+      "HierarchySummary": {
+        "type": "object",
+        "required": [
+          "child_count",
+          "completed_child_count",
+          "completion_percent",
+          "state_counts",
+          "blocked_child_count",
+          "live_agent_work_count",
+          "action_needed_count",
+          "stale_agent_work_count"
+        ],
+        "description": "Server-derived direct-child rollups computed from live task, semantic-state, dependency, and agent-work rows.",
+        "properties": {
+          "child_count": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 200
+          },
+          "completed_child_count": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 200
+          },
+          "completion_percent": {
+            "type": "number",
+            "minimum": 0,
+            "maximum": 100
+          },
+          "state_counts": {
+            "type": "object",
+            "additionalProperties": {
+              "type": "integer",
+              "minimum": 0
+            }
+          },
+          "blocked_child_count": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 200
+          },
+          "live_agent_work_count": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 200
+          },
+          "action_needed_count": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 200
+          },
+          "stale_agent_work_count": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 200
+          }
+        },
+        "additionalProperties": false
+      },
+      "TaskHierarchy": {
+        "type": "object",
+        "required": [
+          "children",
+          "ancestors",
+          "descendants",
+          "summary"
+        ],
+        "description": "Bounded hierarchy view. Children are direct; ancestors and descendants are capped at 20 levels/200 references.",
+        "properties": {
+          "parent": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/TaskHierarchyReference"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "children": {
+            "type": "array",
+            "maxItems": 200,
+            "items": {
+              "$ref": "#/components/schemas/TaskHierarchyReference"
+            }
+          },
+          "ancestors": {
+            "type": "array",
+            "maxItems": 20,
+            "items": {
+              "$ref": "#/components/schemas/TaskHierarchyReference"
+            }
+          },
+          "descendants": {
+            "type": "array",
+            "maxItems": 200,
+            "items": {
+              "$ref": "#/components/schemas/TaskHierarchyReference"
+            }
+          },
+          "summary": {
+            "$ref": "#/components/schemas/HierarchySummary"
+          }
+        },
+        "additionalProperties": false
+      },
+      "TaskHierarchyReferenceCollection": {
+        "type": "object",
+        "required": [
+          "data",
+          "next_cursor"
+        ],
+        "properties": {
+          "data": {
+            "type": "array",
+            "maxItems": 200,
+            "items": {
+              "$ref": "#/components/schemas/TaskHierarchyReference"
+            }
+          },
+          "next_cursor": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "additionalProperties": false
+      },
+      "TaskHierarchyParentRequest": {
+        "type": "object",
+        "minProperties": 1,
+        "anyOf": [
+          {
+            "required": [
+              "parent"
+            ]
+          },
+          {
+            "required": [
+              "parent_id"
+            ]
+          },
+          {
+            "required": [
+              "parent_task_id"
+            ]
+          }
+        ],
+        "description": "Parent task reference. `parent_id` and `parent_task_id` are accepted aliases.",
+        "properties": {
+          "parent": {
+            "$ref": "#/components/schemas/Identifier"
+          },
+          "parent_id": {
+            "$ref": "#/components/schemas/Identifier"
+          },
+          "parent_task_id": {
+            "$ref": "#/components/schemas/Identifier"
+          }
+        },
+        "additionalProperties": false
+      },
+      "TaskHierarchyChildRequest": {
+        "type": "object",
+        "minProperties": 1,
+        "description": "Child task reference. `child_id` and `child_task_id` are accepted aliases.",
+        "properties": {
+          "child": {
+            "$ref": "#/components/schemas/Identifier"
+          },
+          "child_id": {
+            "$ref": "#/components/schemas/Identifier"
+          },
+          "child_task_id": {
+            "$ref": "#/components/schemas/Identifier"
+          }
+        },
+        "additionalProperties": false
+      },
       "DependencySummary": {
         "type": "object",
         "required": [
@@ -7661,6 +11653,209 @@
         },
         "additionalProperties": false
       },
+      "TaskChecklistItem": {
+        "type": "object",
+        "required": [
+          "id",
+          "task_id",
+          "text",
+          "position",
+          "completed",
+          "completed_at",
+          "completed_by",
+          "created_at",
+          "updated_at"
+        ],
+        "properties": {
+          "id": {
+            "$ref": "#/components/schemas/Identifier"
+          },
+          "task_id": {
+            "$ref": "#/components/schemas/Identifier"
+          },
+          "text": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 1000
+          },
+          "position": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 99
+          },
+          "completed": {
+            "type": "boolean"
+          },
+          "completed_at": {
+            "$ref": "#/components/schemas/NullableTimestamp"
+          },
+          "completed_by": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/Identifier"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "created_at": {
+            "$ref": "#/components/schemas/Timestamp"
+          },
+          "updated_at": {
+            "$ref": "#/components/schemas/Timestamp"
+          }
+        },
+        "additionalProperties": false
+      },
+      "TaskChecklistSummary": {
+        "type": "object",
+        "required": [
+          "total",
+          "completed",
+          "open",
+          "percent",
+          "completion_policy",
+          "warning"
+        ],
+        "properties": {
+          "total": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 100
+          },
+          "completed": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 100
+          },
+          "open": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 100
+          },
+          "percent": {
+            "type": "number",
+            "minimum": 0,
+            "maximum": 100
+          },
+          "completion_policy": {
+            "$ref": "#/components/schemas/ChecklistCompletionPolicy"
+          },
+          "warning": {
+            "type": "boolean",
+            "description": "True when a completed task has open items under warn policy."
+          }
+        },
+        "additionalProperties": false
+      },
+      "TaskChecklistCollection": {
+        "type": "object",
+        "required": [
+          "task_id",
+          "version",
+          "data",
+          "summary"
+        ],
+        "properties": {
+          "task_id": {
+            "$ref": "#/components/schemas/Identifier"
+          },
+          "version": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 1
+          },
+          "data": {
+            "type": "array",
+            "maxItems": 100,
+            "items": {
+              "$ref": "#/components/schemas/TaskChecklistItem"
+            }
+          },
+          "summary": {
+            "$ref": "#/components/schemas/TaskChecklistSummary"
+          }
+        },
+        "additionalProperties": false
+      },
+      "TaskChecklistItemRequest": {
+        "type": "object",
+        "description": "Text is required; title is accepted as a compatibility alias.",
+        "oneOf": [
+          {
+            "required": [
+              "text"
+            ]
+          },
+          {
+            "required": [
+              "title"
+            ]
+          }
+        ],
+        "properties": {
+          "text": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 1000
+          },
+          "title": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 1000,
+            "description": "Compatibility alias for text."
+          },
+          "completed": {
+            "type": "boolean",
+            "default": false
+          },
+          "position": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 100
+          }
+        },
+        "additionalProperties": false
+      },
+      "TaskChecklistItemPatchRequest": {
+        "type": "object",
+        "minProperties": 1,
+        "properties": {
+          "text": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 1000
+          },
+          "completed": {
+            "type": "boolean"
+          },
+          "position": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 99
+          }
+        },
+        "additionalProperties": false
+      },
+      "TaskChecklistReorderRequest": {
+        "type": "object",
+        "required": [
+          "item_ids"
+        ],
+        "properties": {
+          "item_ids": {
+            "type": "array",
+            "minItems": 1,
+            "maxItems": 100,
+            "uniqueItems": true,
+            "items": {
+              "$ref": "#/components/schemas/Identifier"
+            }
+          }
+        },
+        "additionalProperties": false
+      },
       "Task": {
         "type": "object",
         "required": [
@@ -7678,7 +11873,9 @@
           "created_at",
           "updated_at",
           "labels",
-          "comment_count"
+          "comment_count",
+          "checklist",
+          "checklist_summary"
         ],
         "properties": {
           "id": {
@@ -7776,6 +11973,53 @@
           "dependency_summary": {
             "$ref": "#/components/schemas/DependencySummary",
             "description": "Bounded direct dependency counts; omitted by legacy servers that predate dependency support."
+          },
+          "checklist": {
+            "type": "array",
+            "maxItems": 100,
+            "items": {
+              "$ref": "#/components/schemas/TaskChecklistItem"
+            }
+          },
+          "checklist_summary": {
+            "$ref": "#/components/schemas/TaskChecklistSummary"
+          },
+          "parent_task_id": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/Identifier"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Live same-project parent task ID; omitted when no parent is linked."
+          },
+          "parent_id": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/Identifier"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Compatibility alias for parent_task_id."
+          },
+          "parent": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/TaskHierarchyReference"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Compact parent reference when a live parent is linked."
+          },
+          "hierarchy_summary": {
+            "$ref": "#/components/schemas/HierarchySummary",
+            "description": "Server-derived direct-child rollup; arrays and counts never include deleted or cross-project rows."
           }
         },
         "additionalProperties": false
@@ -8304,6 +12548,39 @@
           "bug": {
             "$ref": "#/components/schemas/BugCreateDetails",
             "description": "Required when kind is `bug`; omitted for kind `task`."
+          },
+          "parent": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/Identifier"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Optional live same-project parent task ID or project-local key."
+          },
+          "parent_id": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/Identifier"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Compatibility alias for parent."
+          },
+          "parent_task_id": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/Identifier"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Compatibility alias for parent."
           }
         },
         "additionalProperties": false
@@ -8389,6 +12666,39 @@
           "bug": {
             "$ref": "#/components/schemas/BugPatchDetails",
             "description": "Partial bug details; only valid for bug tasks."
+          },
+          "parent": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/Identifier"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Link a live same-project parent task, or null to clear it."
+          },
+          "parent_id": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/Identifier"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Compatibility alias for parent."
+          },
+          "parent_task_id": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/Identifier"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Compatibility alias for parent."
           }
         },
         "additionalProperties": false
@@ -8555,6 +12865,7 @@
           "task_id",
           "actor_id",
           "body",
+          "version",
           "created_at",
           "updated_at"
         ],
@@ -8574,6 +12885,12 @@
             "maxLength": 20000,
             "description": "Markdown comment body."
           },
+          "version": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 1,
+            "description": "Optimistic-concurrency version; use it as If-Match on mutations."
+          },
           "created_at": {
             "$ref": "#/components/schemas/Timestamp"
           },
@@ -8581,6 +12898,53 @@
             "$ref": "#/components/schemas/Timestamp"
           }
         },
+        "additionalProperties": false
+      },
+      "CommentUpdateRequest": {
+        "type": "object",
+        "description": "Either body or text must contain a non-empty value. If both are\nsupplied and non-empty, body wins; an empty body falls back to text.\n",
+        "properties": {
+          "body": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "maxLength": 20000,
+            "description": "Replacement Markdown comment body."
+          },
+          "text": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "maxLength": 20000,
+            "description": "Compatibility alias used when body is empty or omitted."
+          }
+        },
+        "anyOf": [
+          {
+            "required": [
+              "body"
+            ],
+            "properties": {
+              "body": {
+                "type": "string",
+                "minLength": 1
+              }
+            }
+          },
+          {
+            "required": [
+              "text"
+            ],
+            "properties": {
+              "text": {
+                "type": "string",
+                "minLength": 1
+              }
+            }
+          }
+        ],
         "additionalProperties": false
       },
       "CommentCreateRequest": {
@@ -9499,6 +13863,65 @@
           }
         ]
       },
+      "TaskCollectionConflictErrorResponse": {
+        "type": "object",
+        "required": [
+          "error"
+        ],
+        "properties": {
+          "error": {
+            "type": "object",
+            "required": [
+              "code",
+              "message",
+              "details"
+            ],
+            "properties": {
+              "code": {
+                "const": "task_collection_changed"
+              },
+              "message": {
+                "type": "string",
+                "minLength": 1
+              },
+              "details": {
+                "type": "object",
+                "required": [
+                  "restart"
+                ],
+                "properties": {
+                  "expected_revision": {
+                    "type": "integer",
+                    "format": "int64",
+                    "minimum": 0
+                  },
+                  "current_revision": {
+                    "type": "integer",
+                    "format": "int64",
+                    "minimum": 0
+                  },
+                  "expected_task_collection_revision": {
+                    "type": "integer",
+                    "format": "int64",
+                    "minimum": 0
+                  },
+                  "current_task_collection_revision": {
+                    "type": "integer",
+                    "format": "int64",
+                    "minimum": 0
+                  },
+                  "restart": {
+                    "const": true
+                  }
+                },
+                "additionalProperties": false
+              }
+            },
+            "additionalProperties": false
+          }
+        },
+        "additionalProperties": false
+      },
       "TaskClaimUnavailableDetails": {
         "description": "Humans and bearer tokens with tasks:read may receive the full current\ntask or active-claim diagnostics. Bearer tokens without tasks:read\nreceive only id/version retry metadata for a task conflict, or an\nempty object for a column active-claim conflict.\n",
         "oneOf": [
@@ -9623,6 +14046,205 @@
           "next_cursor": {
             "type": "string",
             "description": "Empty string when there is no next page."
+          }
+        },
+        "additionalProperties": false
+      },
+      "SearchSort": {
+        "type": "object",
+        "required": [
+          "field",
+          "direction"
+        ],
+        "properties": {
+          "field": {
+            "type": "string",
+            "enum": [
+              "updated_at",
+              "created_at",
+              "due_at",
+              "title",
+              "key",
+              "priority",
+              "state",
+              "position"
+            ]
+          },
+          "direction": {
+            "type": "string",
+            "enum": [
+              "asc",
+              "desc"
+            ]
+          }
+        },
+        "additionalProperties": false
+      },
+      "SavedView": {
+        "type": "object",
+        "required": [
+          "id",
+          "owner_id",
+          "name",
+          "filters",
+          "sort",
+          "shared",
+          "created_at",
+          "updated_at"
+        ],
+        "properties": {
+          "id": {
+            "$ref": "#/components/schemas/Identifier"
+          },
+          "owner_id": {
+            "$ref": "#/components/schemas/Identifier"
+          },
+          "name": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 200
+          },
+          "description": {
+            "type": "string",
+            "maxLength": 2000
+          },
+          "filters": {
+            "type": "object",
+            "description": "Search filter values. Supported keys are q, key, title, description, label, state, priority, assignee, claim_owner, project, project_ids, due_from, and due_to.",
+            "additionalProperties": true
+          },
+          "sort": {
+            "type": "array",
+            "maxItems": 8,
+            "items": {
+              "$ref": "#/components/schemas/SearchSort"
+            }
+          },
+          "shared": {
+            "type": "boolean"
+          },
+          "created_at": {
+            "$ref": "#/components/schemas/Timestamp"
+          },
+          "updated_at": {
+            "$ref": "#/components/schemas/Timestamp"
+          }
+        },
+        "additionalProperties": false
+      },
+      "SavedViewCreateRequest": {
+        "type": "object",
+        "required": [
+          "name",
+          "filters"
+        ],
+        "properties": {
+          "name": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 200
+          },
+          "description": {
+            "type": "string",
+            "maxLength": 2000
+          },
+          "filters": {
+            "type": "object",
+            "additionalProperties": true
+          },
+          "sort": {
+            "type": "array",
+            "maxItems": 8,
+            "items": {
+              "$ref": "#/components/schemas/SearchSort"
+            }
+          },
+          "shared": {
+            "type": "boolean"
+          }
+        },
+        "additionalProperties": false
+      },
+      "SavedViewPatchRequest": {
+        "type": "object",
+        "minProperties": 1,
+        "properties": {
+          "name": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 200
+          },
+          "description": {
+            "type": "string",
+            "maxLength": 2000
+          },
+          "filters": {
+            "type": "object",
+            "additionalProperties": true
+          },
+          "sort": {
+            "type": "array",
+            "maxItems": 8,
+            "items": {
+              "$ref": "#/components/schemas/SearchSort"
+            }
+          },
+          "shared": {
+            "type": "boolean"
+          }
+        },
+        "additionalProperties": false
+      },
+      "SavedViewCollection": {
+        "type": "object",
+        "required": [
+          "data",
+          "next_cursor"
+        ],
+        "properties": {
+          "data": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/SavedView"
+            }
+          },
+          "next_cursor": {
+            "type": "string",
+            "description": "Empty string when there is no next page."
+          }
+        },
+        "additionalProperties": false
+      },
+      "GlobalSearchResponse": {
+        "type": "object",
+        "required": [
+          "data",
+          "next_cursor"
+        ],
+        "properties": {
+          "data": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/Task"
+            }
+          },
+          "next_cursor": {
+            "type": "string",
+            "description": "Empty string when there is no next page."
+          },
+          "projects": {
+            "type": "array",
+            "description": "Matching visible projects included when q is supplied.",
+            "items": {
+              "$ref": "#/components/schemas/Project"
+            }
+          },
+          "views": {
+            "type": "array",
+            "description": "Matching visible saved views included when q is supplied.",
+            "items": {
+              "$ref": "#/components/schemas/SavedView"
+            }
           }
         },
         "additionalProperties": false

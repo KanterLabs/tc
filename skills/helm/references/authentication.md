@@ -31,4 +31,17 @@ The JSON file may contain:
 
 The credential file must be owned by the current user and have no group or world permissions; mode `0600` is recommended. The helper refuses a broader mode. Cloudflare fields are optional for deployments whose API is not behind Cloudflare Access.
 
+`HELM_TOKEN` is the Helm application credential issued to an agent actor. It
+authorizes API scopes such as `tasks:read`, `tasks:write`, `tasks:claim`, and
+`events:read`. `HELM_CF_ACCESS_CLIENT_ID` and
+`HELM_CF_ACCESS_CLIENT_SECRET` are separate Cloudflare Access edge credentials
+used only to cross the protected tunnel. Supplying Cloudflare credentials
+cannot replace a missing Helm token, and the two kinds of credential must not
+be copied into one another's fields.
+
 Create a dedicated agent identity and grant only the scopes needed for tracking: `projects:read`, `tasks:read`, `tasks:write`, `tasks:claim`, and `events:read`. Restrict the token to relevant projects when practical. Token plaintext is returned only once by Helm and must never be committed, pasted into Helm tasks, or printed in logs. The stable API origin remains `https://tc.shanekanterman.dev`, with requests under `/api/v1`.
+
+To verify endpoint reachability and the Helm application identity without
+performing a mutation, run `python3 scripts/helm.py auth-check`. The command
+returns only bounded actor metadata and emits a sanitized machine-readable
+error on failure; credential values never appear in its output.

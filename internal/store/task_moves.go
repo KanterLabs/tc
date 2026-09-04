@@ -26,6 +26,22 @@ type TaskMoveInput struct {
 	ExpectedSourceColumnID string
 	Source                 string
 	Reason                 string
+	// BeforeTaskID and AfterTaskID are optional visible-card anchors. When
+	// either is supplied, the move is a precise reorder rather than the
+	// legacy append-only move. Supplying both places the task between the two
+	// anchors, even when filtered cards occupy the gap.
+	BeforeTaskID string
+	AfterTaskID  string
+	// Placement can be first, last, before, or after. A blank placement is
+	// inferred from the supplied anchors; with no anchors it retains the
+	// append-only move contract.
+	Placement string
+	// Column revisions guard neighbors that do not share the task's ETag.
+	// ExpectedOrderingVersion is a convenient value for same-column callers;
+	// the source/destination-specific fields take precedence when supplied.
+	ExpectedOrderingVersion            int64
+	ExpectedSourceOrderingVersion      int64
+	ExpectedDestinationOrderingVersion int64
 }
 
 // TaskMoveRequest is retained as a descriptive alias for HTTP/application
@@ -72,6 +88,12 @@ func validateTaskMoveInput(input TaskMoveInput) (TaskMoveInput, error) {
 // the active semantic state. Expired or malformed claims are cleared as part
 // of this move; this is the only automatic claim cleanup performed here.
 func (s *Store) MoveTask(ctx context.Context, id string, input TaskMoveInput, expected int64, actorID string) (Task, error) {
+	if preciseTaskMove(input) {
+		// Keep the historical /move contract append-only unless an explicit
+		// anchor or placement was supplied. This lets audit reconciliation and
+		// older callers continue to use the same guarded endpoint unchanged.
+		return s.reorderTask(ctx, id, input, expected, actorID, true)
+	}
 	validated, err := validateTaskMoveInput(input)
 	if err != nil {
 		return Task{}, err
@@ -101,6 +123,9 @@ func (s *Store) MoveTask(ctx context.Context, id string, input TaskMoveInput, ex
 	if destination.ProjectID != current.ProjectID {
 		return Task{}, invalid("destination column belongs to another project", nil)
 	}
+	if destination.ArchivedAt != nil {
+		return Task{}, invalid("destination column is archived", nil)
+	}
 	if !taskMoveDestinationStateAllowed(destination.SemanticState) {
 		return Task{}, invalid("destination column must have backlog or ready semantic state", nil)
 	}
@@ -123,8 +148,8 @@ func (s *Store) MoveTask(ctx context.Context, id string, input TaskMoveInput, ex
 				AND deleted_at IS NULL
 				AND completed_at IS NULL
 				AND version < 9223372036854775807
-				AND EXISTS (SELECT 1 FROM columns source_column WHERE source_column.id=tasks.column_id AND source_column.project_id=tasks.project_id AND source_column.semantic_state IN ('backlog','ready','active','blocked'))
-				AND EXISTS (SELECT 1 FROM columns destination_column WHERE destination_column.id=? AND destination_column.project_id=tasks.project_id AND destination_column.semantic_state IN ('backlog','ready'))
+				AND EXISTS (SELECT 1 FROM columns source_column WHERE source_column.id=tasks.column_id AND source_column.project_id=tasks.project_id AND source_column.archived_at IS NULL AND source_column.semantic_state IN ('backlog','ready','active','blocked'))
+				AND EXISTS (SELECT 1 FROM columns destination_column WHERE destination_column.id=? AND destination_column.project_id=tasks.project_id AND destination_column.archived_at IS NULL AND destination_column.semantic_state IN ('backlog','ready'))
 				AND (claimed_by IS NULL OR claim_expires_at IS NULL OR julianday(claim_expires_at) IS NULL OR julianday(claim_expires_at)<=julianday('now'))`,
 			validated.DestinationColumnID,
 			validated.DestinationColumnID,
@@ -152,13 +177,13 @@ func (s *Store) MoveTask(ctx context.Context, id string, input TaskMoveInput, ex
 		// acquired SQLite's writer lock so the event cannot describe an older
 		// column classification than the move it records.
 		var eventSource, eventDestination Column
-		if err := tx.QueryRowContext(ctx, `SELECT id, project_id, name, semantic_state, position, created_at, updated_at FROM columns WHERE id=?`, validated.ExpectedSourceColumnID).Scan(
-			&eventSource.ID, &eventSource.ProjectID, &eventSource.Name, &eventSource.SemanticState, &eventSource.Position, &eventSource.CreatedAt, &eventSource.UpdatedAt,
+		if err := tx.QueryRowContext(ctx, `SELECT id, project_id, name, semantic_state, position, ordering_version, created_at, updated_at FROM columns WHERE id=?`, validated.ExpectedSourceColumnID).Scan(
+			&eventSource.ID, &eventSource.ProjectID, &eventSource.Name, &eventSource.SemanticState, &eventSource.Position, &eventSource.OrderingVersion, &eventSource.CreatedAt, &eventSource.UpdatedAt,
 		); err != nil {
 			return err
 		}
-		if err := tx.QueryRowContext(ctx, `SELECT id, project_id, name, semantic_state, position, created_at, updated_at FROM columns WHERE id=?`, validated.DestinationColumnID).Scan(
-			&eventDestination.ID, &eventDestination.ProjectID, &eventDestination.Name, &eventDestination.SemanticState, &eventDestination.Position, &eventDestination.CreatedAt, &eventDestination.UpdatedAt,
+		if err := tx.QueryRowContext(ctx, `SELECT id, project_id, name, semantic_state, position, ordering_version, created_at, updated_at FROM columns WHERE id=?`, validated.DestinationColumnID).Scan(
+			&eventDestination.ID, &eventDestination.ProjectID, &eventDestination.Name, &eventDestination.SemanticState, &eventDestination.Position, &eventDestination.OrderingVersion, &eventDestination.CreatedAt, &eventDestination.UpdatedAt,
 		); err != nil {
 			return err
 		}
@@ -176,22 +201,26 @@ func (s *Store) MoveTask(ctx context.Context, id string, input TaskMoveInput, ex
 				"name":           eventDestination.Name,
 				"semantic_state": eventDestination.SemanticState,
 			},
-			"from_column_id":      eventSource.ID,
-			"to_column_id":        eventDestination.ID,
-			"from_column":         eventSource.Name,
-			"to_column":           eventDestination.Name,
-			"from_semantic_state": eventSource.SemanticState,
-			"to_semantic_state":   eventDestination.SemanticState,
-			"from_column_state":   eventSource.SemanticState,
-			"to_column_state":     eventDestination.SemanticState,
-			"old_position":        current.Position,
-			"new_position":        newPosition,
-			"version":             resultingVersion,
-			"resulting_version":   resultingVersion,
-			"actor":               actorID,
-			"actor_id":            actorID,
-			"source":              validated.Source,
-			"reason":              validated.Reason,
+			"from_column_id":          eventSource.ID,
+			"to_column_id":            eventDestination.ID,
+			"from_column":             eventSource.Name,
+			"to_column":               eventDestination.Name,
+			"from_semantic_state":     eventSource.SemanticState,
+			"to_semantic_state":       eventDestination.SemanticState,
+			"from_column_state":       eventSource.SemanticState,
+			"to_column_state":         eventDestination.SemanticState,
+			"old_position":            current.Position,
+			"new_position":            newPosition,
+			"version":                 resultingVersion,
+			"resulting_version":       resultingVersion,
+			"actor":                   actorID,
+			"actor_id":                actorID,
+			"source":                  validated.Source,
+			"reason":                  validated.Reason,
+			"placement":               "last",
+			"rebalanced":              false,
+			"ordering_version":        eventDestination.OrderingVersion,
+			"source_ordering_version": eventSource.OrderingVersion,
 		}
 		_, err := insertEvent(ctx, tx, "task.moved", actorID, current.ProjectID, id, payload)
 		return err

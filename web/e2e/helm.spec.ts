@@ -110,15 +110,12 @@ test.describe('Helm workspace', () => {
 
     // Open the task with its accessible card button and edit the labeled
     // title/priority controls in the task drawer.
-    await movedCard
-      .getByRole('button', {
-        name: new RegExp(`${escapeRegExp(taskKey as string)}.*${escapeRegExp(taskTitle)}`)
-      })
-      .click();
+    await movedCard.locator('[data-task-trigger]').click();
     const drawer = page.locator('.task-drawer');
     await expect(drawer).toBeVisible();
     await expect(drawer.getByLabel('Task title')).toHaveValue(taskTitle);
-    await expect(drawer.getByLabel('Task title')).toBeFocused();
+    await expect(drawer.locator('[data-dialog-initial-focus]')).toBeFocused();
+    await expect(drawer.getByLabel('Task title')).not.toBeFocused();
     await drawer.getByRole('button', { name: 'Close task details', exact: true }).focus();
     await page.keyboard.press('Shift+Tab');
     await expect(drawer.getByRole('button', { name: 'Delete task', exact: true })).toBeFocused();
@@ -126,11 +123,7 @@ test.describe('Helm workspace', () => {
     await expect(drawer.getByRole('button', { name: 'Close task details', exact: true })).toBeFocused();
     await page.keyboard.press('Escape');
     await expect(drawer).toBeHidden();
-    await movedCard
-      .getByRole('button', {
-        name: new RegExp(`${escapeRegExp(taskKey as string)}.*${escapeRegExp(taskTitle)}`)
-      })
-      .click();
+    await movedCard.locator('[data-task-trigger]').click();
     await expect(drawer).toBeVisible();
     await drawer.getByLabel('Task title').fill(editedTaskTitle);
     await drawer.getByLabel('Priority').selectOption('high');
@@ -142,13 +135,17 @@ test.describe('Helm workspace', () => {
 
     const deleteLabel = drawer.getByRole('button', { name: `Delete label ${labelName}`, exact: true });
     await expect(deleteLabel).toBeVisible();
-    page.once('dialog', (dialog) => dialog.accept());
     await deleteLabel.click();
+    const labelDialog = page.getByRole('alertdialog');
+    await expect(labelDialog).toContainText(`Delete label “${labelName}”?`);
+    await labelDialog.getByRole('button', { name: 'Delete label', exact: true }).click();
     await expect(deleteLabel).toHaveCount(0);
     await expect(movedCard.locator('.label-chip')).toHaveCount(0);
 
-    page.once('dialog', (dialog) => dialog.accept());
     await drawer.getByRole('button', { name: 'Delete task', exact: true }).click();
+    const taskDialog = page.getByRole('alertdialog');
+    await expect(taskDialog).toContainText(`Delete ${taskKey}?`);
+    await taskDialog.getByRole('button', { name: 'Delete task', exact: true }).click();
     await expect(drawer).toBeHidden();
     await expect(board.locator('.task-card').filter({ hasText: taskKey as string })).toHaveCount(0);
 
@@ -164,10 +161,10 @@ test.describe('Helm workspace', () => {
     const commandTrigger = page.getByRole('button', { name: 'Search anything', exact: true });
     await commandTrigger.click();
     const commandDialog = page.getByRole('dialog', { name: 'Search Helm' });
-    const commandInput = commandDialog.getByRole('textbox', { name: 'Search projects and views' });
+    const commandInput = commandDialog.getByRole('combobox', { name: 'Search projects and views, tasks, issues, and actions' });
     await expect(commandInput).toBeFocused();
     await page.keyboard.press('Shift+Tab');
-    await expect(commandDialog.getByRole('button').last()).toBeFocused();
+    await expect(commandDialog.getByRole('option').last()).toBeFocused();
     await page.keyboard.press('Tab');
     await expect(commandInput).toBeFocused();
     await page.keyboard.press('Escape');
@@ -183,6 +180,115 @@ test.describe('Helm workspace', () => {
     for (const label of ['Board', 'Issues', 'My work', 'Roadmap', 'Settings']) {
       await expect(navigation.getByRole('button', { name: label, exact: true })).toBeVisible();
     }
+  });
+
+  test('lets an administrator manage project metadata and columns with confirmations', async ({ page, request }) => {
+    const statusResponse = await request.get('/api/v1/auth/status');
+    const status = (await statusResponse.json()) as { mode?: string };
+    expect(status.mode, 'The E2E server must run with HELM_AUTH_MODE=disabled').toBe('disabled');
+
+    const runId = `${Date.now().toString(36)}${Math.random().toString(36).slice(2, 7)}`.toUpperCase();
+    const projectName = `Admin E2E ${runId}`;
+    const projectKey = `ADM${runId}`.slice(0, 16);
+
+    await page.goto('/');
+    await page.getByRole('button', { name: 'New project', exact: true }).click();
+    const projectDialog = page.getByRole('dialog', { name: 'Create a project' });
+    await projectDialog.getByLabel('Project name').fill(projectName);
+    await projectDialog.getByLabel('Project key').fill(projectKey);
+    await projectDialog.getByRole('button', { name: 'Create project', exact: true }).click();
+    await expect(page.getByRole('heading', { name: projectName, exact: true })).toBeVisible();
+
+    await page.getByRole('navigation', { name: 'Primary navigation' }).getByRole('button', { name: 'Settings', exact: true }).first().click();
+    const administration = page.getByRole('heading', { name: 'Projects & columns', exact: true });
+    await expect(administration).toBeVisible();
+    const adminSection = page.locator('section[aria-labelledby="project-admin-heading"]');
+    await expect(adminSection.locator('#admin-project-select')).toHaveValue(/.+/);
+
+    await adminSection.getByLabel('Project name').fill(`${projectName} renamed`);
+    await adminSection.getByLabel('Description').fill('Managed through the administrator flow.');
+    await adminSection.getByLabel('Checklist completion policy').selectOption('require');
+    await adminSection.getByRole('button', { name: 'Save project', exact: true }).click();
+    const projectSaveConfirmation = page.getByRole('alertdialog', { name: `Save ${projectName} renamed settings?` });
+    await expect(projectSaveConfirmation).toBeVisible();
+    await expect(projectSaveConfirmation).toContainText('stable project key and URL stay unchanged');
+    await projectSaveConfirmation.getByRole('button', { name: 'Save project', exact: true }).click();
+    await expect(projectSaveConfirmation).toBeHidden();
+    const savedProjectResponse = await request.get(`/api/v1/projects/${encodeURIComponent(projectKey)}`);
+    expect(savedProjectResponse.ok()).toBeTruthy();
+    await expect(savedProjectResponse.json()).resolves.toMatchObject({
+      name: `${projectName} renamed`,
+      description: 'Managed through the administrator flow.',
+      checklist_completion_policy: 'require'
+    });
+
+    await adminSection.getByLabel('New column name').fill('Intake');
+    await adminSection.locator('.admin-column-create select').selectOption('backlog');
+    await adminSection.getByRole('button', { name: /Add column/ }).click();
+    const addConfirmation = page.getByRole('alertdialog', { name: 'Add Intake?' });
+    await expect(addConfirmation).toBeVisible();
+    await addConfirmation.getByRole('button', { name: 'Add column', exact: true }).click();
+    await expect(addConfirmation).toBeHidden();
+    const intakeRow = adminSection.locator('.admin-column-row').filter({ has: page.locator('input[aria-label^="Column name for Intake"]') });
+    await expect(intakeRow).toBeVisible();
+
+    await intakeRow.getByRole('button', { name: 'Move Intake up', exact: true }).click();
+    const moveConfirmation = page.getByRole('alertdialog', { name: 'Move Intake?' });
+    await expect(moveConfirmation).toBeVisible();
+    await moveConfirmation.getByRole('button', { name: 'Move column', exact: true }).click();
+    await expect(moveConfirmation).toBeHidden();
+
+    await intakeRow.getByLabel('Column name for Intake').fill('Intake renamed');
+    await intakeRow.getByRole('button', { name: 'Save', exact: true }).click();
+    const columnSaveConfirmation = page.getByRole('alertdialog', { name: 'Save Intake renamed?' });
+    await expect(columnSaveConfirmation).toBeVisible();
+    await columnSaveConfirmation.getByRole('button', { name: 'Save column', exact: true }).click();
+    await expect(columnSaveConfirmation).toBeHidden();
+    const renamedIntakeRow = adminSection.locator('.admin-column-row').filter({ has: page.locator('input[aria-label="Column name for Intake renamed"]') });
+    await expect(renamedIntakeRow).toBeVisible();
+
+    await renamedIntakeRow.getByRole('button', { name: 'Archive', exact: true }).click();
+    const archiveConfirmation = page.getByRole('alertdialog', { name: 'Archive Intake renamed?' });
+    await expect(archiveConfirmation).toBeVisible();
+    await expect(archiveConfirmation).toContainText('Tasks in this column will move');
+    await archiveConfirmation.getByRole('button', { name: 'Archive column', exact: true }).click();
+    await expect(archiveConfirmation).toBeHidden();
+    await expect(renamedIntakeRow).toHaveClass(/archived/);
+
+    for (const name of ['After archive first', 'After archive second']) {
+      await adminSection.getByLabel('New column name').fill(name);
+      await adminSection.locator('.admin-column-create select').selectOption('backlog');
+      await adminSection.getByRole('button', { name: /Add column/ }).click();
+      const createConfirmation = page.getByRole('alertdialog', { name: `Add ${name}?` });
+      await expect(createConfirmation).toBeVisible();
+      await createConfirmation.getByRole('button', { name: 'Add column', exact: true }).click();
+      await expect(createConfirmation).toBeHidden();
+      await expect(adminSection.locator('.admin-column-row').filter({ has: page.locator(`input[aria-label="Column name for ${name}"]`) })).toBeVisible();
+    }
+    const postArchiveRows = adminSection.locator('.admin-column-row');
+    const renderedColumnNames = await postArchiveRows.evaluateAll((rows) => rows.map((row) => row.querySelector('input')?.value || ''));
+    expect(renderedColumnNames.indexOf('After archive first')).toBeLessThan(renderedColumnNames.indexOf('Intake renamed'));
+    expect(renderedColumnNames.indexOf('After archive second')).toBeLessThan(renderedColumnNames.indexOf('Intake renamed'));
+    const firstPostArchiveRow = adminSection.locator('.admin-column-row').filter({ has: page.locator('input[aria-label="Column name for After archive first"]') });
+    const secondPostArchiveRow = adminSection.locator('.admin-column-row').filter({ has: page.locator('input[aria-label="Column name for After archive second"]') });
+    await expect(firstPostArchiveRow.getByRole('button', { name: 'Move After archive first up', exact: true })).toBeEnabled();
+    await expect(firstPostArchiveRow.getByRole('button', { name: 'Move After archive first down', exact: true })).toBeEnabled();
+    await expect(secondPostArchiveRow.getByRole('button', { name: 'Move After archive second up', exact: true })).toBeEnabled();
+    await expect(secondPostArchiveRow.getByRole('button', { name: 'Move After archive second down', exact: true })).toBeDisabled();
+
+    await adminSection.getByRole('button', { name: 'Archive project', exact: true }).click();
+    const projectConfirmation = page.getByRole('alertdialog', { name: `Archive ${projectName} renamed?` });
+    await expect(projectConfirmation).toBeVisible();
+    await projectConfirmation.getByRole('button', { name: 'Archive project', exact: true }).click();
+    await expect(projectConfirmation).toBeHidden();
+    await expect(adminSection.getByText('Archived', { exact: true })).toBeVisible();
+
+    await adminSection.getByRole('button', { name: 'Restore project', exact: true }).click();
+    const restoreConfirmation = page.getByRole('alertdialog', { name: `Restore ${projectName} renamed?` });
+    await expect(restoreConfirmation).toBeVisible();
+    await restoreConfirmation.getByRole('button', { name: 'Restore project', exact: true }).click();
+    await expect(restoreConfirmation).toBeHidden();
+    await expect(adminSection.getByText('Active', { exact: true })).toBeVisible();
   });
 
   test('reports, triages, resolves, and reopens a bug', async ({ page }) => {
@@ -248,8 +354,8 @@ test.describe('Helm workspace', () => {
     await drawer.getByRole('button', { name: 'Close task details', exact: true }).click();
     await page.getByRole('button', { name: 'Search anything', exact: true }).click();
     const commandDialog = page.getByRole('dialog', { name: 'Search Helm' });
-    await commandDialog.getByRole('textbox', { name: 'Search projects and views' }).fill(bugTitle);
-    await commandDialog.getByRole('button', { name: new RegExp(escapeRegExp(bugTitle)) }).click();
+    await commandDialog.getByRole('combobox', { name: 'Search projects and views, tasks, issues, and actions' }).fill(bugTitle);
+    await commandDialog.getByRole('option', { name: new RegExp(escapeRegExp(bugTitle)) }).click();
     await expect(drawer.getByLabel('Task title')).toHaveValue(bugTitle);
   });
 });

@@ -52,6 +52,10 @@ func TestHeartbeatAgentWorkTouchesOnlySnapshotTimestamp(t *testing.T) {
 	if err := database.QueryRowContext(ctx, `SELECT COUNT(1) FROM events WHERE task_id=?`, task.ID).Scan(&eventsBefore); err != nil {
 		t.Fatalf("count events before heartbeat: %v", err)
 	}
+	var revisionBefore int64
+	if err := database.QueryRowContext(ctx, `SELECT task_collection_revision FROM projects WHERE id=?`, task.ProjectID).Scan(&revisionBefore); err != nil {
+		t.Fatalf("read project agent-work revision before heartbeat: %v", err)
+	}
 
 	heartbeated, err := data.HeartbeatAgentWork(ctx, task.ID, "heartbeat/run-1", actor.ID)
 	if err != nil {
@@ -86,6 +90,45 @@ func TestHeartbeatAgentWorkTouchesOnlySnapshotTimestamp(t *testing.T) {
 	}
 	if commentsAfter != commentsBefore || eventsAfter != eventsBefore {
 		t.Fatalf("heartbeat added durable noise: comments %d/%d events %d/%d", commentsBefore, commentsAfter, eventsBefore, eventsAfter)
+	}
+	var revisionAfter int64
+	if err := database.QueryRowContext(ctx, `SELECT task_collection_revision FROM projects WHERE id=?`, task.ProjectID).Scan(&revisionAfter); err != nil {
+		t.Fatalf("read project agent-work revision after heartbeat: %v", err)
+	}
+	if revisionAfter != revisionBefore+1 {
+		t.Fatalf("heartbeat project revision = %d, want %d", revisionAfter, revisionBefore+1)
+	}
+}
+
+func TestTaskAgentWorkRevisionAdvancesForSameValueUpdate(t *testing.T) {
+	ctx := context.Background()
+	database, err := db.Open(ctx, ":memory:")
+	if err != nil {
+		t.Fatalf("open database: %v", err)
+	}
+	defer database.Close()
+	data := New(database)
+	actor, _, task := createAgentWorkFixture(t, data, ctx, "HEARTBEATSAME")
+	claimed, err := data.ClaimTask(ctx, task.ID, actor.ID, time.Hour, task.Version)
+	if err != nil {
+		t.Fatalf("claim task: %v", err)
+	}
+	if _, err := data.PublishAgentWork(ctx, task.ID, AgentWorkInput{OperationID: "heartbeat/same-value", State: "working", Summary: "Same value trigger"}, claimed.Version, actor.ID); err != nil {
+		t.Fatalf("publish agent work: %v", err)
+	}
+	var before int64
+	if err := database.QueryRowContext(ctx, `SELECT task_collection_revision FROM projects WHERE id=?`, task.ProjectID).Scan(&before); err != nil {
+		t.Fatalf("read revision before same-value update: %v", err)
+	}
+	if _, err := database.ExecContext(ctx, `UPDATE task_agent_work SET updated_at=updated_at WHERE task_id=?`, task.ID); err != nil {
+		t.Fatalf("same-value snapshot update: %v", err)
+	}
+	var after int64
+	if err := database.QueryRowContext(ctx, `SELECT task_collection_revision FROM projects WHERE id=?`, task.ProjectID).Scan(&after); err != nil {
+		t.Fatalf("read revision after same-value update: %v", err)
+	}
+	if after != before+1 {
+		t.Fatalf("same-value snapshot revision = %d, want %d", after, before+1)
 	}
 }
 

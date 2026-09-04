@@ -869,6 +869,9 @@ func populateProductionFixture(t *testing.T, ctx context.Context, database *sql.
 	if prefix >= 10 {
 		populateAuditFixture(t, ctx, database)
 	}
+	if prefix >= 15 {
+		exec(`INSERT INTO task_checklist_items(id, task_id, text, position, completed, created_at, updated_at) VALUES ('checklist-1', 'task-1', 'Preserve this acceptance criterion', 0, 0, '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')`)
+	}
 }
 
 func populateAuditFixture(t *testing.T, ctx context.Context, database *sql.DB) {
@@ -914,6 +917,41 @@ func assertMigratedAdditiveValues(t *testing.T, ctx context.Context, database *s
 		if err := database.QueryRowContext(ctx, `SELECT COUNT(*) FROM bug_details WHERE task_id='bug-1'`).Scan(&bugs); err != nil || bugs != 0 {
 			t.Fatalf("pre-008 bug details = %d, %v; want none", bugs, err)
 		}
+	}
+	var checklistCount int
+	if err := database.QueryRowContext(ctx, `SELECT COUNT(*) FROM task_checklist_items WHERE task_id='task-1'`).Scan(&checklistCount); err != nil {
+		t.Fatalf("checklist table after migration: %v", err)
+	}
+	if prefix >= 15 {
+		if checklistCount != 1 {
+			t.Fatalf("checklist rows after retained-data migration = %d, want 1", checklistCount)
+		}
+		if err := database.QueryRowContext(ctx, `SELECT text FROM task_checklist_items WHERE id='checklist-1'`).Scan(&value); err != nil || value != "Preserve this acceptance criterion" {
+			t.Fatalf("checklist retained value = %q, %v", value, err)
+		}
+	} else if checklistCount != 0 {
+		t.Fatalf("new checklist table unexpectedly populated during migration = %d", checklistCount)
+	}
+	if err := database.QueryRowContext(ctx, `SELECT checklist_completion_policy FROM projects WHERE id='project'`).Scan(&value); err != nil || value != "warn" {
+		t.Fatalf("checklist completion policy after migration = %q, %v; want warn", value, err)
+	}
+	var collectionRevision int64
+	wantCollectionRevision := int64(0)
+	if prefix >= 20 {
+		// When the fixture is populated after migration 020, its two retained
+		// task inserts are intentionally observed by the compatibility triggers.
+		wantCollectionRevision = 2
+	}
+	if err := database.QueryRowContext(ctx, `SELECT task_collection_revision FROM projects WHERE id='project'`).Scan(&collectionRevision); err != nil || collectionRevision != wantCollectionRevision {
+		t.Fatalf("task collection revision after migration = %d, %v; want %d", collectionRevision, err, wantCollectionRevision)
+	}
+	var commentVersion int64
+	if err := database.QueryRowContext(ctx, `SELECT version FROM comments WHERE id='comment-1'`).Scan(&commentVersion); err != nil || commentVersion != 1 {
+		t.Fatalf("comment lifecycle version = %d, %v; want default 1", commentVersion, err)
+	}
+	var deletedAt sql.NullString
+	if err := database.QueryRowContext(ctx, `SELECT deleted_at FROM comments WHERE id='comment-1'`).Scan(&deletedAt); err != nil || deletedAt.Valid {
+		t.Fatalf("comment lifecycle tombstone = %v, %v; want live NULL", deletedAt, err)
 	}
 }
 

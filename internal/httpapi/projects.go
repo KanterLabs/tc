@@ -6,6 +6,8 @@ import (
 	"errors"
 	"net/http"
 	"sort"
+	"strconv"
+	"strings"
 
 	"github.com/KanterLabs/helm/internal/auth"
 	"github.com/KanterLabs/helm/internal/store"
@@ -61,12 +63,13 @@ func (s *Server) projects(w http.ResponseWriter, r *http.Request, identity auth.
 			return
 		}
 		var payload struct {
-			Key         *string `json:"key"`
-			Slug        *string `json:"slug"`
-			Name        *string `json:"name"`
-			Description *string `json:"description"`
-			Color       *string `json:"color"`
-			Favorite    *bool   `json:"favorite"`
+			Key                       *string `json:"key"`
+			Slug                      *string `json:"slug"`
+			Name                      *string `json:"name"`
+			Description               *string `json:"description"`
+			Color                     *string `json:"color"`
+			Favorite                  *bool   `json:"favorite"`
+			ChecklistCompletionPolicy *string `json:"checklist_completion_policy"`
 		}
 		fields, err := decodeJSONObject(r, &payload)
 		if err != nil {
@@ -77,7 +80,7 @@ func (s *Server) projects(w http.ResponseWriter, r *http.Request, identity auth.
 			s.writeStoreError(w, err)
 			return
 		}
-		if err := rejectJSONNull(fields, "key", "slug", "name", "description", "color", "favorite"); err != nil {
+		if err := rejectJSONNull(fields, "key", "slug", "name", "description", "color", "favorite", "checklist_completion_policy"); err != nil {
 			s.writeStoreError(w, err)
 			return
 		}
@@ -87,7 +90,7 @@ func (s *Server) projects(w http.ResponseWriter, r *http.Request, identity auth.
 				return
 			}
 		}
-		projectInput := store.ProjectInput{Key: payload.Key, Slug: payload.Slug, Name: payload.Name, Description: payload.Description, Color: payload.Color, Favorite: payload.Favorite}
+		projectInput := store.ProjectInput{Key: payload.Key, Slug: payload.Slug, Name: payload.Name, Description: payload.Description, Color: payload.Color, Favorite: payload.Favorite, ChecklistCompletionPolicy: payload.ChecklistCompletionPolicy}
 		s.mutation(w, r, identity, func() (int, []byte, string, error) {
 			project, err := s.Store.CreateProject(r.Context(), projectInput, identity.Actor.ID)
 			if err != nil {
@@ -98,7 +101,7 @@ func (s *Server) projects(w http.ResponseWriter, r *http.Request, identity auth.
 			if err != nil {
 				return 0, nil, "", err
 			}
-			return http.StatusCreated, body, "", nil
+			return http.StatusCreated, body, projectETag(project.Version), nil
 		})
 	default:
 		s.writeError(w, http.StatusMethodNotAllowed, "method_not_allowed", "method not allowed", nil)
@@ -143,23 +146,25 @@ func (s *Server) project(w http.ResponseWriter, r *http.Request, identity auth.I
 		if !requireScope(w, identity, "projects:read") {
 			return
 		}
+		w.Header().Set("ETag", projectETag(project.Version))
 		s.writeJSON(w, http.StatusOK, project)
 	case http.MethodPatch:
 		var payload struct {
-			Key         *string `json:"key"`
-			Slug        *string `json:"slug"`
-			Name        *string `json:"name"`
-			Description *string `json:"description"`
-			Color       *string `json:"color"`
-			Favorite    *bool   `json:"favorite"`
-			Archived    *bool   `json:"archived"`
+			Key                       *string `json:"key"`
+			Slug                      *string `json:"slug"`
+			Name                      *string `json:"name"`
+			Description               *string `json:"description"`
+			Color                     *string `json:"color"`
+			Favorite                  *bool   `json:"favorite"`
+			Archived                  *bool   `json:"archived"`
+			ChecklistCompletionPolicy *string `json:"checklist_completion_policy"`
 		}
 		fields, err := decodeJSONObject(r, &payload)
 		if err != nil {
 			s.writeError(w, http.StatusBadRequest, "invalid_json", "request body is invalid", nil)
 			return
 		}
-		if err := rejectJSONNull(fields, "key", "slug", "name", "description", "color", "favorite", "archived"); err != nil {
+		if err := rejectJSONNull(fields, "key", "slug", "name", "description", "color", "favorite", "archived", "checklist_completion_policy"); err != nil {
 			s.writeStoreError(w, err)
 			return
 		}
@@ -169,13 +174,22 @@ func (s *Server) project(w http.ResponseWriter, r *http.Request, identity auth.I
 				return
 			}
 		}
-		if payload.Key == nil && payload.Slug == nil && payload.Name == nil && payload.Description == nil && payload.Color == nil && payload.Favorite == nil && payload.Archived == nil {
+		if payload.Key == nil && payload.Slug == nil && payload.Name == nil && payload.Description == nil && payload.Color == nil && payload.Favorite == nil && payload.Archived == nil && payload.ChecklistCompletionPolicy == nil {
 			s.writeError(w, http.StatusBadRequest, "invalid_request", "patch must include at least one project field", nil)
 			return
 		}
-		input := store.ProjectInput{Key: payload.Key, Slug: payload.Slug, Name: payload.Name, Description: payload.Description, Color: payload.Color, Favorite: payload.Favorite, Archived: payload.Archived}
+		input := store.ProjectInput{Key: payload.Key, Slug: payload.Slug, Name: payload.Name, Description: payload.Description, Color: payload.Color, Favorite: payload.Favorite, Archived: payload.Archived, ChecklistCompletionPolicy: payload.ChecklistCompletionPolicy}
+		var expected *int64
+		if strings.TrimSpace(r.Header.Get("If-Match")) != "" {
+			version, versionErr := parseVersion(r)
+			if versionErr != nil {
+				s.writeStoreError(w, versionErr)
+				return
+			}
+			expected = &version
+		}
 		s.mutation(w, r, identity, func() (int, []byte, string, error) {
-			updated, err := s.Store.UpdateProject(r.Context(), project.ID, input, identity.Actor.ID)
+			updated, err := s.Store.UpdateProjectWithVersion(r.Context(), project.ID, input, identity.Actor.ID, expected)
 			if err != nil {
 				return 0, nil, "", err
 			}
@@ -183,7 +197,7 @@ func (s *Server) project(w http.ResponseWriter, r *http.Request, identity auth.I
 			if err != nil {
 				return 0, nil, "", err
 			}
-			return http.StatusOK, body, "", nil
+			return http.StatusOK, body, projectETag(updated.Version), nil
 		})
 	default:
 		s.writeError(w, http.StatusMethodNotAllowed, "method_not_allowed", "method not allowed", nil)
@@ -218,7 +232,12 @@ func (s *Server) columns(w http.ResponseWriter, r *http.Request, identity auth.I
 			s.writeError(w, http.StatusBadRequest, "invalid_request", err.Error(), nil)
 			return
 		}
-		columns, more, err := s.Store.ListColumnsPage(r.Context(), project.ID, limit, offset)
+		includeArchived, err := parseOptionalBool(r, "archived")
+		if err != nil {
+			s.writeError(w, http.StatusBadRequest, "invalid_request", err.Error(), nil)
+			return
+		}
+		columns, more, err := s.Store.ListColumnsPageFiltered(r.Context(), project.ID, limit, offset, includeArchived)
 		if err != nil {
 			s.writeInternal(w, err)
 			return
@@ -258,7 +277,7 @@ func (s *Server) columns(w http.ResponseWriter, r *http.Request, identity auth.I
 			if err != nil {
 				return 0, nil, "", err
 			}
-			return http.StatusCreated, body, "", nil
+			return http.StatusCreated, body, columnETag(column.Version), nil
 		})
 	default:
 		s.writeError(w, http.StatusMethodNotAllowed, "method_not_allowed", "method not allowed", nil)
@@ -288,6 +307,7 @@ func (s *Server) column(w http.ResponseWriter, r *http.Request, identity auth.Id
 			if !requireScope(w, identity, "projects:read") {
 				return
 			}
+			w.Header().Set("ETag", columnETag(column.Version))
 			s.writeJSON(w, http.StatusOK, column)
 			return
 		}
@@ -298,23 +318,33 @@ func (s *Server) column(w http.ResponseWriter, r *http.Request, identity auth.Id
 		Name          *string `json:"name"`
 		SemanticState *string `json:"semantic_state"`
 		Position      *int    `json:"position"`
+		Archived      *bool   `json:"archived"`
 	}
 	fields, err := decodeJSONObject(r, &payload)
 	if err != nil {
 		s.writeError(w, http.StatusBadRequest, "invalid_json", "request body is invalid", nil)
 		return
 	}
-	if err := rejectJSONNull(fields, "name", "semantic_state", "position"); err != nil {
+	if err := rejectJSONNull(fields, "name", "semantic_state", "position", "archived"); err != nil {
 		s.writeStoreError(w, err)
 		return
 	}
-	if payload.Name == nil && payload.SemanticState == nil && payload.Position == nil {
+	if payload.Name == nil && payload.SemanticState == nil && payload.Position == nil && payload.Archived == nil {
 		s.writeError(w, http.StatusBadRequest, "invalid_request", "patch must include at least one column field", nil)
 		return
 	}
-	input := store.ColumnInput{Name: payload.Name, SemanticState: payload.SemanticState, Position: payload.Position}
+	input := store.ColumnInput{Name: payload.Name, SemanticState: payload.SemanticState, Position: payload.Position, Archived: payload.Archived}
+	var expected *int64
+	if strings.TrimSpace(r.Header.Get("If-Match")) != "" {
+		version, versionErr := parseVersion(r)
+		if versionErr != nil {
+			s.writeStoreError(w, versionErr)
+			return
+		}
+		expected = &version
+	}
 	s.mutation(w, r, identity, func() (int, []byte, string, error) {
-		updated, err := s.Store.UpdateColumnWithClaimOverride(r.Context(), id, input, identity.Actor.ID, !identity.IsToken && identity.Actor.Admin)
+		updated, err := s.Store.UpdateColumnWithVersion(r.Context(), id, input, identity.Actor.ID, !identity.IsToken && identity.Actor.Admin, expected)
 		if err != nil {
 			return 0, nil, "", err
 		}
@@ -322,7 +352,7 @@ func (s *Server) column(w http.ResponseWriter, r *http.Request, identity auth.Id
 		if err != nil {
 			return 0, nil, "", err
 		}
-		return http.StatusOK, body, "", nil
+		return http.StatusOK, body, columnETag(updated.Version), nil
 	})
 }
 
@@ -444,6 +474,10 @@ func validHTTPColor(value string) bool {
 	}
 	return true
 }
+
+func projectETag(version int64) string { return `"v` + strconv.FormatInt(version, 10) + `"` }
+
+func columnETag(version int64) string { return `"v` + strconv.FormatInt(version, 10) + `"` }
 
 // marshalProjectForIdentity keeps successful project mutations least-privilege.
 // A bearer credential with projects:write but without projects:read may still

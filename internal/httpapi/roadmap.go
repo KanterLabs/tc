@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"strconv"
+	"strings"
 
 	"github.com/KanterLabs/helm/internal/auth"
 	"github.com/KanterLabs/helm/internal/store"
@@ -248,14 +249,21 @@ func redactEventsForIdentity(identity auth.Identity, events []store.Event) []sto
 	result := make([]store.Event, len(events))
 	copy(result, events)
 	for i := range result {
-		if result[i].Type != "task.progressed" || len(result[i].Payload) == 0 {
+		if len(result[i].Payload) == 0 {
 			continue
 		}
 		var payload map[string]any
 		if err := json.Unmarshal(result[i].Payload, &payload); err != nil || payload == nil {
 			continue
 		}
-		if !redactAgentWorkNarrative(payload) {
+		changed := false
+		if result[i].Type == "task.progressed" {
+			changed = redactAgentWorkNarrative(payload)
+		}
+		if strings.HasPrefix(result[i].Type, "task.checklist_") {
+			changed = redactChecklistNarrative(payload) || changed
+		}
+		if !changed {
 			continue
 		}
 		if encoded, err := json.Marshal(payload); err == nil {
@@ -263,6 +271,20 @@ func redactEventsForIdentity(identity auth.Identity, events []store.Event) []sto
 		}
 	}
 	return result
+}
+
+func redactChecklistNarrative(payload map[string]any) bool {
+	changed := false
+	for _, field := range []string{"text", "title", "description"} {
+		if _, ok := payload[field]; ok {
+			delete(payload, field)
+			changed = true
+		}
+	}
+	if nested, ok := payload["item"].(map[string]any); ok {
+		changed = redactChecklistNarrative(nested) || changed
+	}
+	return changed
 }
 
 func redactAgentWorkNarrative(payload map[string]any) bool {

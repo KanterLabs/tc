@@ -321,7 +321,7 @@ test('shows live agent work across the board, drawer, and My Work', async ({ pag
   const compactPulse = workingCard.locator('.agent-pulse');
   await expect(compactPulse).toContainText('Working');
   await expect(compactPulse).toContainText('Implementing the browser workflow');
-  await expect(compactPulse).toContainText('1/2');
+  await expect(compactPulse).toContainText('Progress: 1 of 2 checkpoints (50%)');
 
   const missingCard = board.locator('.task-card').filter({ hasText: missingTask.title });
   await expect(missingCard).toBeVisible();
@@ -335,7 +335,7 @@ test('shows live agent work across the board, drawer, and My Work', async ({ pag
   await boardWorkFilter.selectOption('missing');
   await expect(missingCard).toBeVisible();
   await expect(missingCard.locator('.agent-pulse')).toContainText('No live pulse');
-  await expect(missingCard.locator('.agent-pulse')).toHaveAttribute('aria-label', /No live pulse/);
+  await expect(missingCard.locator('.agent-pulse')).toHaveAccessibleName('No live pulse');
   await expect(workingCard).toBeHidden();
   await expect(completedCard).toBeHidden();
   await boardWorkFilter.selectOption('stale');
@@ -390,6 +390,7 @@ test('shows live agent work across the board, drawer, and My Work', async ({ pag
   await expect(drawer.locator('.agent-work-details')).toContainText('Keep the title draft until review.');
   await expect(drawer.getByLabel('Task title')).toHaveValue(draftTitle);
 
+  page.once('dialog', (dialog) => dialog.accept());
   await drawer.getByRole('button', { name: 'Close task details', exact: true }).click();
   await expect(drawer).toBeHidden();
   const sidebar = page.locator('nav.sidebar');
@@ -424,15 +425,19 @@ test('shows live agent work across the board, drawer, and My Work', async ({ pag
   await rowIn(actionGroup, staleTask.title, projectBName, activeB.name);
   await rowIn(actionGroup, staleWaitingTask.title, projectBName, activeB.name);
   await expect(rowFor(actionGroup, waitingTask.title).locator('.agent-pulse')).toContainText('Waiting');
-  await expect(rowFor(actionGroup, staleTask.title).locator('.agent-pulse')).toHaveAttribute('aria-label', /^Stale,/);
-  await expect(rowFor(actionGroup, staleWaitingTask.title).locator('.agent-pulse')).toHaveAttribute('aria-label', /^Waiting, Waiting update is stale/);
+  await expect(rowFor(actionGroup, staleTask.title).locator('.agent-pulse')).toHaveAccessibleName('Stale');
+  await expect(rowFor(actionGroup, staleTask.title).locator('.agent-pulse')).toHaveAccessibleDescription(/Working update is stale/);
+  await expect(rowFor(actionGroup, staleWaitingTask.title).locator('.agent-pulse')).toHaveAccessibleName('Waiting');
+  await expect(rowFor(actionGroup, staleWaitingTask.title).locator('.agent-pulse')).toHaveAccessibleDescription(/Stale update/);
 
   await liveFilters.getByRole('button', { name: 'Stale', exact: true }).click();
   const staleGroup = page.locator('section[aria-labelledby="stale-heading"]');
   await rowIn(staleGroup, staleTask.title, projectBName, activeB.name);
   await rowIn(staleGroup, staleWaitingTask.title, projectBName, activeB.name);
-  await expect(rowFor(staleGroup, staleTask.title).locator('.agent-pulse')).toHaveAttribute('aria-label', /^Stale,/);
-  await expect(rowFor(staleGroup, staleWaitingTask.title).locator('.agent-pulse')).toHaveAttribute('aria-label', /^Waiting, Waiting update is stale/);
+  await expect(rowFor(staleGroup, staleTask.title).locator('.agent-pulse')).toHaveAccessibleName('Stale');
+  await expect(rowFor(staleGroup, staleTask.title).locator('.agent-pulse')).toHaveAccessibleDescription(/Working update is stale/);
+  await expect(rowFor(staleGroup, staleWaitingTask.title).locator('.agent-pulse')).toHaveAccessibleName('Waiting');
+  await expect(rowFor(staleGroup, staleWaitingTask.title).locator('.agent-pulse')).toHaveAccessibleDescription(/Stale update/);
 
   // The fixture's claim is expired only in browser reads. The drawer must
   // offer a fresh claim instead of incorrectly offering claim renewal.
@@ -446,17 +451,17 @@ test('shows live agent work across the board, drawer, and My Work', async ({ pag
   await liveFilters.getByRole('button', { name: 'Waiting', exact: true }).click();
   const waitingGroup = page.locator('section[aria-labelledby="waiting-heading"]');
   await rowIn(waitingGroup, waitingTask.title, projectAName, blockedA.name);
-  await expect(rowFor(waitingGroup, waitingTask.title).locator('.agent-pulse')).toHaveAttribute('aria-label', /^Waiting,/);
+  await expect(rowFor(waitingGroup, waitingTask.title).locator('.agent-pulse')).toHaveAccessibleName('Waiting');
 
   await liveFilters.getByRole('button', { name: 'Verifying', exact: true }).click();
   const verifyingGroup = page.locator('section[aria-labelledby="verifying-heading"]');
   await rowIn(verifyingGroup, verifyingTask.title, projectBName, readyB.name);
-  await expect(rowFor(verifyingGroup, verifyingTask.title).locator('.agent-pulse')).toHaveAttribute('aria-label', /^Verifying,/);
+  await expect(rowFor(verifyingGroup, verifyingTask.title).locator('.agent-pulse')).toHaveAccessibleName('Verifying');
 
   await liveFilters.getByRole('button', { name: 'Working', exact: true }).click();
   const workingGroup = page.locator('section[aria-labelledby="working-heading"]');
   await rowIn(workingGroup, workingTask.title, projectAName, activeA.name);
-  await expect(rowFor(workingGroup, workingTask.title).locator('.agent-pulse')).toHaveAttribute('aria-label', /^Working,/);
+  await expect(rowFor(workingGroup, workingTask.title).locator('.agent-pulse')).toHaveAccessibleName('Working');
 
   await liveFilters.getByRole('button', { name: 'All', exact: true }).click();
   for (const heading of ['Action needed', 'Stale', 'Waiting', 'Verifying', 'Working']) {
@@ -480,7 +485,7 @@ test('shows live agent work across the board, drawer, and My Work', async ({ pag
   await liveWorkingGroup.locator('.live-work-row').filter({ hasText: workingTask.title }).click();
   await expect(drawer).toBeVisible();
   await expect(drawer.locator('.agent-work-panel')).toBeVisible();
-  await expect(drawer.getByRole('button', { name: 'Save changes', exact: true })).toBeVisible();
+  await expect(drawer.getByRole('button', { name: 'Saved', exact: true })).toBeVisible();
   await expect(drawer.getByRole('button', { name: /Complete/ })).toBeVisible();
   await drawer.getByRole('button', { name: 'Close task details', exact: true }).click();
   await expect(drawer).toBeHidden();
@@ -500,7 +505,7 @@ test('shows live agent work across the board, drawer, and My Work', async ({ pag
   await rowFor(page.locator('section[aria-labelledby="working-heading"]'), workingTask.title).click();
   await expect(drawer).toBeVisible();
   await expect(drawer.locator('.agent-work-panel')).toBeVisible();
-  await expect(drawer.getByRole('button', { name: 'Save changes', exact: true })).toBeVisible();
+  await expect(drawer.getByRole('button', { name: 'Saved', exact: true })).toBeVisible();
   const dimensions = await page.evaluate(() => ({
     viewport: window.innerWidth,
     documentWidth: document.documentElement.scrollWidth,

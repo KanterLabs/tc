@@ -55,6 +55,31 @@ function formatCountdown(value: string, now: number): string {
   return `${days}d${hours % 24 ? ` ${hours % 24}h` : ''} left`;
 }
 
+function claimExpiresSoon(value: string, now: number): boolean {
+  const expires = parseDate(value);
+  return Number.isFinite(expires) && expires > now && expires - now <= 5 * 60 * 1000;
+}
+
+/** Return a locale-independent exact timestamp for screen readers and tests. */
+export function agentPulseExactTimestamp(value: string): string {
+  const parsed = new Date(value);
+  return Number.isNaN(parsed.getTime()) ? value : parsed.toISOString();
+}
+
+/** Keep the relative update wording identical between visible and SR text. */
+export function agentPulseRelativeTimestamp(value: string, now: number): string {
+  const parsed = parseDate(value);
+  if (!Number.isFinite(parsed)) return 'unknown update time';
+  const difference = Math.round((parsed - now) / 60000);
+  const absolute = Math.abs(difference);
+  if (absolute < 1) return 'just now';
+  if (absolute < 60) return `${absolute}m ${difference < 0 ? 'ago' : 'from now'}`;
+  const hours = Math.round(absolute / 60);
+  if (hours < 24) return `${hours}h ${difference < 0 ? 'ago' : 'from now'}`;
+  const days = Math.round(hours / 24);
+  return `${days}d ${difference < 0 ? 'ago' : 'from now'}`;
+}
+
 /**
  * Build the short accessible description shared by board cards, the drawer,
  * and component tests. It intentionally only treats agent_work.updated_at as
@@ -76,6 +101,9 @@ export function agentPulseAccessibleLabel(task: Task, now: number, actorLabel = 
   const agent = actorLabel || work?.actor_id || '';
   const countdown = task.claim_expires_at ? formatCountdown(task.claim_expires_at, now) : '';
   const claimExpired = Boolean(task.claim_expires_at && parseDate(task.claim_expires_at) <= now);
+  const updateRelative = updatedAt ? agentPulseRelativeTimestamp(updatedAt, now) : '';
+  const updateExact = updatedAt ? agentPulseExactTimestamp(updatedAt) : '';
+  const claimExact = task.claim_expires_at ? agentPulseExactTimestamp(task.claim_expires_at) : '';
   const parts = [
     stateLabel,
     stale ? (state === 'waiting' ? 'Waiting update is stale' : `${baseLabel} update is stale`) : '',
@@ -84,7 +112,12 @@ export function agentPulseAccessibleLabel(task: Task, now: number, actorLabel = 
     progress,
     agent ? `agent ${agent}` : '',
     owner ? `claimed by ${owner}` : '',
+    updateRelative ? `updated ${updateRelative} (${updateExact})` : '',
     countdown ? (claimExpired ? 'claim expired' : `claim ${countdown}`) : '',
+    claimExact ? `claim expires ${claimExact}` : '',
+    claimExpiresSoon(task.claim_expires_at || '', now) ? 'claim expiring soon' : '',
+    task.claimed_by && task.version ? `task version v${task.version}` : '',
+    task.claimed_by && !task.claim_expires_at ? 'claim expiry unavailable' : '',
     missing ? 'no live update reported' : ''
   ];
   return parts.filter(Boolean).join(', ');

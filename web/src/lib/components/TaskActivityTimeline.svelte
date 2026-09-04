@@ -1,5 +1,6 @@
 <script lang="ts">
-  import type { TaskTimelineFilter, TaskTimelineItem } from '../types';
+  import { renderMarkdown } from '../markdown';
+  import type { Comment, TaskTimelineFilter, TaskTimelineItem } from '../types';
 
   export let items: TaskTimelineItem[] = [];
   export let filter: TaskTimelineFilter = 'all';
@@ -10,6 +11,17 @@
   export let onFilterChange: (next: TaskTimelineFilter) => void = () => undefined;
   export let onLoadOlder: () => void | Promise<void> = () => undefined;
   export let onRetry: () => void | Promise<void> = () => undefined;
+  export let currentActorId = '';
+  export let canManageComments = false;
+  export let onEditComment: (comment: Comment, body: string) => void | Promise<void> = () => undefined;
+  export let onConfirmDelete: (comment: Comment) => boolean | Promise<boolean> = () => true;
+  export let onDeleteComment: (comment: Comment) => void | Promise<void> = () => undefined;
+
+  let editingCommentId: string | null = null;
+  let editingBody = '';
+  let commentMutationId: string | null = null;
+  let commentMutationError = '';
+  let commentMutationErrorId: string | null = null;
 
   const filterOptions: Array<{ value: TaskTimelineFilter; label: string }> = [
     { value: 'all', label: 'All' },
@@ -52,7 +64,9 @@
       'task.claim_renewed': 'renewed the claim',
       'bug.triaged': 'triaged the bug',
       'bug.resolved': 'resolved the bug',
-      'bug.reopened': 'reopened the bug'
+      'bug.reopened': 'reopened the bug',
+      'comment.updated': 'edited a comment',
+      'comment.deleted': 'deleted a comment'
     };
     return labels[type] || type.replace(/[._-]+/g, ' ').replace(/\b\w/g, (letter) => letter.toUpperCase());
   }
@@ -90,6 +104,57 @@
       minute: '2-digit',
       timeZoneName: 'short'
     }).format(date);
+  }
+
+  function canEditComment(comment: Comment): boolean {
+    return Boolean(comment.actor_id && (comment.actor_id === currentActorId || canManageComments));
+  }
+
+  function startEditing(comment: Comment): void {
+    editingCommentId = comment.id;
+    editingBody = comment.body;
+    commentMutationError = '';
+    commentMutationErrorId = null;
+  }
+
+  function cancelEditing(): void {
+    editingCommentId = null;
+    editingBody = '';
+    commentMutationError = '';
+    commentMutationErrorId = null;
+  }
+
+  async function saveComment(comment: Comment): Promise<void> {
+    if (!editingBody.trim() || commentMutationId) return;
+    commentMutationId = comment.id;
+    commentMutationError = '';
+    commentMutationErrorId = null;
+    try {
+      await onEditComment(comment, editingBody);
+      cancelEditing();
+    } catch (error) {
+      commentMutationError = error instanceof Error ? error.message : 'The comment could not be saved.';
+      commentMutationErrorId = comment.id;
+    } finally {
+      commentMutationId = null;
+    }
+  }
+
+  async function deleteComment(comment: Comment): Promise<void> {
+    if (commentMutationId) return;
+    if (!(await onConfirmDelete(comment))) return;
+    commentMutationId = comment.id;
+    commentMutationError = '';
+    commentMutationErrorId = null;
+    try {
+      await onDeleteComment(comment);
+      if (editingCommentId === comment.id) cancelEditing();
+    } catch (error) {
+      commentMutationError = error instanceof Error ? error.message : 'The comment could not be deleted.';
+      commentMutationErrorId = comment.id;
+    } finally {
+      commentMutationId = null;
+    }
   }
 </script>
 
@@ -140,7 +205,29 @@
                 {#if item.progress.checkpoint_total !== null && item.progress.checkpoint_total !== undefined}<div><dt>Checkpoints</dt><dd>{item.progress.checkpoint_completed ?? 0} of {item.progress.checkpoint_total}</dd></div>{/if}
               </dl>
             {:else if item.kind === 'comment' && item.comment}
-              <div class="task-timeline-comment">{item.comment.body}</div>
+              {@const comment = item.comment}
+              {#if editingCommentId === comment.id}
+                <div class="task-timeline-comment-edit">
+                  <textarea rows="4" bind:value={editingBody} aria-label="Edit comment"></textarea>
+                  <div class="task-timeline-comment-actions">
+                    <button class="button primary" type="button" disabled={!editingBody.trim() || commentMutationId === comment.id} on:click={() => void saveComment(comment)}>
+                      {#if commentMutationId === comment.id}<span class="button-spinner"></span>{/if}Save
+                    </button>
+                    <button class="text-button" type="button" disabled={commentMutationId === comment.id} on:click={cancelEditing}>Cancel</button>
+                  </div>
+                </div>
+              {:else}
+                <div class="task-timeline-comment">{@html renderMarkdown(comment.body)}</div>
+                {#if canEditComment(comment)}
+                  <div class="task-timeline-comment-actions">
+                    <button class="text-button" type="button" on:click={() => startEditing(comment)}>Edit</button>
+                    <button class="text-button danger-text-button" type="button" disabled={commentMutationId === comment.id} on:click={() => void deleteComment(comment)}>Delete</button>
+                  </div>
+                {/if}
+              {/if}
+              {#if commentMutationError && (editingCommentId === comment.id || commentMutationId === comment.id || commentMutationErrorId === comment.id)}
+                <div class="task-timeline-comment-error" role="alert">{commentMutationError}</div>
+              {/if}
             {:else if item.kind === 'task_change' && item.change}
               <p class="task-timeline-summary">{changeLabel(item)}{#if changeContext(item)}<span> · {changeContext(item)}</span>{/if}</p>
             {/if}

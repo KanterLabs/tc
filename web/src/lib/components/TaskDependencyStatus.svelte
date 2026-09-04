@@ -54,15 +54,15 @@
 
 <style>
   .dependency-badges { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 8px; }
-  .dependency-badge { display: inline-flex; align-items: center; gap: 4px; padding: 3px 6px; border: 1px solid transparent; border-radius: 5px; font-size: 8px; font-weight: 800; line-height: 1.2; }
+  .dependency-badge { display: inline-flex; align-items: center; gap: 4px; padding: 3px 6px; border: 1px solid transparent; border-radius: 5px; font-size: 11px; font-weight: 800; line-height: 1.2; }
   .dependency-badge.blocked { color: var(--red); border-color: color-mix(in srgb, var(--red), transparent 72%); background: var(--red-soft); }
   .dependency-badge.ready { color: var(--green); border-color: color-mix(in srgb, var(--green), transparent 72%); background: var(--green-soft); }
   .dependency-badge.dependents { color: var(--purple); border-color: color-mix(in srgb, var(--purple), transparent 76%); background: var(--purple-soft); }
   .dependency-notice { display: flex; align-items: flex-start; gap: 9px; margin: 12px 22px 0; padding: 10px 11px; border: 1px solid color-mix(in srgb, var(--red), transparent 68%); border-radius: 9px; color: var(--red); background: var(--red-soft); }
   .notice-icon { flex: 0 0 auto; padding-top: 1px; font-size: 13px; }
   .dependency-notice > span:last-child { min-width: 0; display: grid; gap: 2px; }
-  .dependency-notice strong { font-size: 10px; }
-  .dependency-notice small { color: var(--ink-soft); font-size: 9px; line-height: 1.4; }
+  .dependency-notice strong { font-size: 11px; }
+  .dependency-notice small { color: var(--ink-soft); font-size: 11px; line-height: 1.4; }
   :global(.task-card.dependency-blocked) { border-color: color-mix(in srgb, var(--red), var(--border) 52%); box-shadow: 0 2px 9px color-mix(in srgb, var(--red), transparent 88%); }
   :global(.task-card.dependency-blocked:hover) { border-color: color-mix(in srgb, var(--red), var(--border) 28%); }
   @media (max-width: 520px) {

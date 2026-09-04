@@ -1,9 +1,72 @@
+<script module lang="ts">
+  export type BoardRefreshScope = 'full' | 'targeted';
+  export type BoardMetadataErrorState = {
+    full: string;
+    targeted: Readonly<Record<string, string>>;
+  };
+  /** Full metadata success clears all uncertainty; targeted refreshes own their columns. */
+  export function boardMetadataErrorAfterRefresh(
+    current: BoardMetadataErrorState,
+    scope: BoardRefreshScope,
+    columnIds: readonly string[],
+    nextError: string
+  ): BoardMetadataErrorState {
+    if (scope === 'full') return { full: nextError, targeted: {} };
+    const targeted = { ...current.targeted };
+    columnIds.forEach((columnId) => {
+      if (nextError) targeted[columnId] = nextError;
+      else delete targeted[columnId];
+    });
+    return { full: current.full, targeted };
+  }
+
+  export function boardMetadataErrorMessage(state: BoardMetadataErrorState): string {
+    return state.full || Object.values(state.targeted)[0] || '';
+  }
+
+  /** Refresh ownership is per target column, not a global latest-request flag. */
+  export function boardRefreshTargetsAreCurrent(
+    refreshes: Readonly<Record<string, number>>,
+    columnIds: readonly string[],
+    refreshToken: number
+  ): boolean {
+    return columnIds.every((columnId) => refreshes[columnId] === refreshToken);
+  }
+
+  /** Merge only the columns owned by a targeted response; other responses cannot clobber them. */
+  export function mergeOwnedBoardMetadata<T extends { id: string }>(
+    current: readonly T[],
+    refreshed: readonly T[],
+    ownedColumnIds: readonly string[]
+  ): T[] {
+    const owned = new Set(ownedColumnIds);
+    const refreshedById = new Map(refreshed.map((column) => [column.id, column]));
+    return current.map((column) => owned.has(column.id) ? refreshedById.get(column.id) || column : column);
+  }
+
+  /** Success/reconciliation announcements require both live mutation context and reload success. */
+  export function boardMutationReloadCanAnnounce(
+    mutationIsCurrent: boolean,
+    reloadSucceeded: boolean
+  ): boolean {
+    return mutationIsCurrent && reloadSucceeded;
+  }
+
+  /** A truncated global event page may hide a newer event for this board. */
+  export function boardEventPageRequiresRefresh(
+    boardChanged: boolean,
+    nextCursor: string | null | undefined
+  ): boolean {
+    return boardChanged || Boolean(nextCursor);
+  }
+</script>
+
 <script lang="ts">
   import { onMount, tick } from 'svelte';
   import { flip } from 'svelte/animate';
   import { backOut } from 'svelte/easing';
   import { fade, fly, scale } from 'svelte/transition';
-  import { API_PREFIX, api, listAllIssues, listAllTasks, unwrapActor } from './lib/api';
+  import { API_PREFIX, api, listAllIssues, listAllTasks, portableImportReportFromError, unwrapActor, type TaskListParams } from './lib/api';
   import {
     actorId,
     actorName,
@@ -30,15 +93,13 @@
     legacyRoadmapStorageKeys,
     loadRecentProjects,
     matchesAgentWorkFilter,
-    moveTaskLocal,
-    nextPosition,
     projectInitials,
     readMigratedStorage,
     parseTaskRoute,
     rememberProject,
+    taskOrderingAnchors,
     taskDeepLink,
     shouldShowAgentPulse,
-    sortTasks,
     toInputDate,
     type BoardFilters
   } from './lib/state';
@@ -48,6 +109,7 @@
     dependencyEventTaskIds,
     dependencyMoveExplanation
   } from './lib/dependencies';
+  import { hierarchyBadgeLabel, hierarchyEventTaskIds } from './lib/hierarchy';
   import {
     ApiError,
     type ActivityEvent,
@@ -60,30 +122,41 @@
     type Column,
     type CodexAccountStatus,
     type CodexDeviceLogin,
+    type IssueMetrics,
+    type Comment,
     type Label,
     type Project,
     type RoadmapActivityFilter,
     type RoadmapSummary,
+    type SidebarCounts,
+    type SavedView,
     type Task,
     type TaskDraftSuggestion,
     type TaskReference,
+    type TaskHierarchyReference,
     type TaskTimelineFilter,
     type TaskTimelineKind,
     type TaskTimelineItem,
     type TaskRouteIntent,
-    type Priority
+    type Priority,
+    type SemanticState,
+    type PortableArchive,
+    type PortableImportReport
   } from './lib/types';
   import AgentPulse from './lib/components/AgentPulse.svelte';
   import AgentWorkPanel from './lib/components/AgentWorkPanel.svelte';
   import AuditReview from './lib/components/AuditReview.svelte';
   import BoardTimeline from './lib/components/BoardTimeline.svelte';
+  import ConfirmDialog from './lib/components/ConfirmDialog.svelte';
   import HelmMark from './lib/components/HelmMark.svelte';
   import LiveWorkRow from './lib/components/LiveWorkRow.svelte';
   import RoadmapActivity from './lib/components/RoadmapActivity.svelte';
   import RoadmapLiveWork from './lib/components/RoadmapLiveWork.svelte';
   import TaskActivityTimeline from './lib/components/TaskActivityTimeline.svelte';
+  import TaskChecklist from './lib/components/TaskChecklist.svelte';
   import TaskDependencies from './lib/components/TaskDependencies.svelte';
   import TaskDependencyStatus from './lib/components/TaskDependencyStatus.svelte';
+  import TaskHierarchy from './lib/components/TaskHierarchy.svelte';
   import {
     mergeAuthoritativeTask,
     mergeAuthoritativeTaskList,
@@ -92,25 +165,99 @@
     type TaskMutationRecord,
     type TaskMutationScope
   } from './lib/liveness';
+  import {
+    isEditableTarget,
+    platformShortcut,
+    themeFromMediaPreference,
+    toastAccessibility,
+    type ToastAccessibility
+  } from './lib/ui';
+  import {
+    buildCommandChoices,
+    commandChoiceId,
+    filterCommandChoices,
+    nextCommandIndex,
+    type CommandChoice,
+    type CommandView
+  } from './lib/commandPalette';
+  import { queueBoardTimelineLoad } from './lib/boardTimeline';
+  import {
+    mergeTimelineItems,
+    reconcileTimelineComments,
+    type TimelineCommentReconciliation,
+    type TimelineCommentReconciliationResult
+  } from './lib/timeline';
+  import {
+    boardColumnHasKnownGlobalBounds,
+    boardColumnRequestIsCurrent,
+    boardOrderingFiltersActive,
+    boardOrderingRefreshReason,
+    boardOrderingUsesPhysicalOrder,
+    claimBoardColumnRequest,
+    isRecoverableBoardCursorConflict,
+    makeBoardOrderingGate,
+    sortBoardTasks as sortBoardTaskList,
+    type BoardOrderingGate,
+    type BoardTaskSort
+  } from './lib/boardOrdering';
 
-  type View = 'board' | 'timeline' | 'issues' | 'my-work' | 'roadmap' | 'audits' | 'settings';
+  type View = CommandView;
   type AuthView = 'login' | 'setup';
   type ToastKind = 'success' | 'error' | 'info';
-  type CommandChoice = {
-    kind: 'project' | 'view' | 'issue';
-    id: string;
+  type ToastAction = {
     label: string;
-    hint: string;
-    project?: Project;
-    view?: View;
-    task?: Task;
+    run: () => void | Promise<void>;
+    pending?: boolean;
+  };
+  type ToastItem = { id: number; kind: ToastKind; message: string; action?: ToastAction } & ToastAccessibility;
+  type ConfirmRequest = {
+    title: string;
+    message: string;
+    confirmLabel: string;
+    fallbackSelector?: string;
+    resolve: (confirmed: boolean) => void;
   };
   type WorkFilter = 'all' | 'action-needed' | 'working' | 'waiting' | 'verifying' | 'stale' | 'handoff' | 'missing';
   type MyWorkView = 'live' | 'assigned';
+  type CountStatus = 'unknown' | 'loading' | 'known' | 'error';
   type DrawerView = 'details' | 'activity';
   type MyWorkRow = { task: Task; project?: Project; column?: Column };
   type TaskModalSuggestionField = 'title' | 'description' | 'priority';
   type TaskModalAppliedFields = Record<TaskModalSuggestionField, boolean>;
+  type DialogReturnFocus = { element: HTMLElement | null; fallbackSelector: string };
+  type OpenTaskOptions = {
+    skipDiscardGuard?: boolean;
+    returnFocus?: DialogReturnFocus | null;
+  };
+  type AdminConfirmation = {
+    title: string;
+    message: string;
+    confirmLabel: string;
+    action: () => Promise<void>;
+  };
+  type BoardSort = BoardTaskSort;
+  type BoardColumnPage = {
+    tasks: Task[];
+    nextCursor: string;
+    loading: boolean;
+    loaded: boolean;
+    error: string;
+  };
+  type BoardLoadOptions = { criteriaRevision?: number };
+  type BoardColumnLoadOptions = {
+    reset?: boolean;
+    mutationSnapshot?: number;
+    recoveryNotice?: boolean;
+    announceChanges?: boolean;
+  };
+  type BoardMutationContext = {
+    requestId: number;
+    boardRequest: number;
+    session: number;
+    mutationRevision: number;
+    projectId: string;
+    projectSlug: string;
+  };
 
   const priorityLabels: Record<Priority, string> = {
     low: 'Low',
@@ -142,6 +289,7 @@
   const labelPalette = ['#6d5efc', '#2ea879', '#d49534', '#dc626f', '#4b9cf5'];
   const scopeOptions = ['projects:read', 'projects:write', 'tasks:read', 'tasks:write', 'tasks:claim', 'events:read'];
   const livenessRefreshIntervalMs = 60 * 1000;
+  const claimWarningThresholdMs = 5 * 60 * 1000;
 
   let booting = true;
   let authStatus: AuthStatus | null = null;
@@ -172,11 +320,30 @@
   let labels: Label[] = [];
   let boardLoading = false;
   let boardError = '';
+  let boardMetadataErrors: BoardMetadataErrorState = { full: '', targeted: {} };
+  let boardPartial = false;
+  let boardOffline = false;
+  let boardReconciliationNotice = '';
+  let boardPages: Record<string, BoardColumnPage> = {};
+  let boardColumnGenerations: Record<string, number> = {};
+  let boardColumnRefreshSequence = 0;
+  let boardColumnRefreshes: Record<string, number> = {};
+  let boardCriteriaRevision = 0;
+  let boardCriteriaTransition = false;
+  let boardMutationRequest = 0;
+  let boardFilterTimer: number | undefined;
+  let boardSort: BoardSort = 'position';
+  let boardOrder: 'asc' | 'desc' = 'asc';
+  const boardPageSize = 50;
+  const boardRenderLimit = 100;
   let issueTasks: Task[] = [];
   let issueColumns: Column[] = [];
   let issuesLoading = false;
   let issuesError = '';
   let issueRequest = 0;
+  let issueMetricsData: IssueMetrics | null = null;
+  let issueMetricsStatus: CountStatus = 'unknown';
+  let issueMetricsRequest = 0;
   let filters: BoardFilters = { query: '', priority: 'all', label: 'all', assignee: 'all', state: 'all', dependency: 'all' };
   let boardWorkFilter: WorkFilter = 'all';
   let issueFilters: BoardFilters = {
@@ -193,10 +360,24 @@
   let issueProjectFilter = 'all';
   let projectSwitcherOpen = false;
   let projectSwitcherQuery = '';
+  let projectPickerTrigger: HTMLButtonElement | null = null;
+  let projectSwitcherPopover: HTMLDivElement | null = null;
   let commandOpen = false;
   let commandQuery = '';
   let commandIndex = 0;
   let commandInput: HTMLInputElement;
+  let commandShortcut = platformShortcut('');
+  let boardSearchInput: HTMLInputElement | null = null;
+  let issueSearchInput: HTMLInputElement | null = null;
+  let commandIssuesLoading = false;
+  let commandIssuesError = '';
+  let commandIssuesRequest = 0;
+  let activeCommandOptionId = '';
+  let commandSearchTasks: Task[] = [];
+  let commandSearchProjects: Project[] = [];
+  let commandSearchViews: SavedView[] = [];
+  let commandSearchLoading = false;
+  let commandSearchRequest = 0;
   let projectListRequest = 0;
   let projectSwitchVersion = 0;
   let boardRequest = 0;
@@ -212,11 +393,14 @@
     'my-work-live': new Map(),
     'my-work-assigned': new Map()
   };
-  let dialogReturnFocus: { element: HTMLElement | null; fallbackSelector: string } | null = null;
+  let dialogReturnFocus: DialogReturnFocus | null = null;
+  let confirmRequest: ConfirmRequest | null = null;
 
   let drawerTask: Task | null = null;
   let drawerDependencyPanel: { refreshRelationships: () => Promise<boolean> } | null = null;
   let drawerDependencyRefresh = 0;
+  let drawerHierarchyPanel: { refreshRelationships: () => Promise<boolean> } | null = null;
+  let drawerHierarchyRefresh = 0;
   // The route intent is kept separate from drawer rendering so the drawer can
   // add its Activity tab without changing dashboard link semantics.
   let taskRouteIntent: TaskRouteIntent = 'details';
@@ -243,6 +427,7 @@
   let boardTimelineFilter: TaskTimelineFilter = 'all';
   let boardTimelineProjectId = '';
   let boardTimelineRequest = 0;
+  let boardTimelineLoadQueue: Promise<boolean> = Promise.resolve(true);
   let draftTitle = '';
   let draftDescription = '';
   let draftPriority: Priority = 'normal';
@@ -261,10 +446,22 @@
   let reopenReasonDraft = '';
   let blockReasonDraft = '';
   let blockReasonOpen = false;
+  // Keep the drawer's saved baseline separate from the authoritative task
+  // model. Background refreshes may update the latter without replacing the
+  // fields a person is currently editing.
+  let drawerSavedTaskDraftFingerprint = '';
+  let drawerSavedActionDraftFingerprint = '';
+  let drawerTaskDraftFingerprintValue = '';
+  let drawerActionDraftFingerprintValue = '';
+  let drawerTaskDraftDirty = false;
+  let drawerDraftDirty = false;
 
   let draggingTaskId = '';
+  let dragOverColumnId = '';
   let quickAddColumn = '';
   let quickAddTitle: Record<string, string> = {};
+  let quickAddInput: HTMLInputElement | null = null;
+  let quickAddReturnFocus: HTMLButtonElement | null = null;
   let taskActionLoading = '';
   let labelDeleting = '';
 
@@ -273,8 +470,27 @@
   let myWorkError = '';
   let myWorkFilter: WorkFilter = 'all';
   let myWorkView: MyWorkView = 'live';
+  let sidebarCounts: SidebarCounts | null = null;
+  let sidebarCountsStatus: CountStatus = 'unknown';
+  let sidebarCountsRequest = 0;
   let myWorkColumnsByProject: Record<string, Column[]> = {};
   let myWorkColumnsLoading = false;
+  let searchTasks: Task[] = [];
+  let searchColumnsByProject: Record<string, Column[]> = {};
+  let searchSavedViews: SavedView[] = [];
+  let searchViewId = '';
+  let searchQuery = '';
+  let searchPriority = 'all';
+  let searchState = 'all';
+  let searchSortField = 'updated_at';
+  let searchSortDirection: 'asc' | 'desc' = 'desc';
+  let searchNextCursor = '';
+  let searchLoading = false;
+  let searchError = '';
+  let searchRequest = 0;
+  let savedViewName = '';
+  let savedViewShared = false;
+  let savedViewSaving = false;
   let roadmap: RoadmapSummary | null = null;
   let roadmapProjectId: string | undefined;
   let roadmapLoading = false;
@@ -313,6 +529,30 @@
   let codexLoading = false;
   let codexError = '';
 
+  // Project administration intentionally lives alongside the existing
+  // settings state. The board continues to consume only live columns while
+  // this view keeps archived rows available for restore.
+  let adminProjects: Project[] = [];
+  let adminProjectId = '';
+  let adminProject: Project | undefined;
+  let adminProjectName = '';
+  let adminProjectDescription = '';
+  let adminProjectColor = '#6d5efc';
+  let adminChecklistPolicy: 'warn' | 'require' = 'warn';
+  let adminColumns: Column[] = [];
+  let adminLiveColumns: Column[] = [];
+  let adminLiveColumnIndexes = new Map<string, number>();
+  let adminLoading = false;
+  let adminSaving = false;
+  let adminColumnsLoading = false;
+  let adminColumnSaving = '';
+  let adminError = '';
+  let adminColumnName = '';
+  let adminColumnState: SemanticState = 'backlog';
+  let adminColumnCreating = false;
+  let adminConfirmation: AdminConfirmation | null = null;
+  let adminConfirmationBusy = false;
+
   let showProjectModal = false;
   let projectCreating = false;
   let projectFormError = '';
@@ -320,6 +560,10 @@
   let projectNameDraft = '';
   let projectDescriptionDraft = '';
   let projectColorDraft = '#6d5efc';
+  let portableFileInput: HTMLInputElement;
+  let portableBusy = false;
+  let portablePreview: { archive: PortableArchive; fileName: string; report: PortableImportReport } | null = null;
+  let portablePreviewError = '';
   let showTaskModal = false;
   let taskModalLoading = false;
   let taskModalCreating = false;
@@ -332,6 +576,7 @@
   let taskModalPriority: Priority = 'normal';
   let taskModalDueDate = '';
   let taskModalAssignee = '';
+  let taskModalParentId: string | null = null;
   let taskModalIdea = '';
   let taskModalSuggestion: TaskDraftSuggestion | null = null;
   let taskModalAssisting = false;
@@ -382,9 +627,12 @@
   let announcementTimer: number | undefined;
   let workTransitionSnapshot = new Map<string, string>();
   let toastSequence = 0;
-  let toasts: { id: number; kind: ToastKind; message: string }[] = [];
+  let toasts: ToastItem[] = [];
 
   $: activeProject = projects.find((project) => project.slug === activeProjectSlug);
+  $: adminProject = adminProjects.find((project) => project.id === adminProjectId);
+  $: adminLiveColumns = adminColumns.filter((column) => !column.archived_at).sort((a, b) => a.position - b.position);
+  $: adminLiveColumnIndexes = new Map(adminLiveColumns.map((column, index) => [column.id, index]));
   $: visibleTasks = filterTasks(tasks, columns, filters).filter((task) => matchesWorkFilter(task, boardWorkFilter, pulseClock));
   $: boardWorkCounts = agentWorkStatusCounts(tasks, pulseClock, (task) => semanticStateForTask(task));
   $: visibleIssues = filterTasks(
@@ -393,12 +641,12 @@
     issueFilters
   );
   $: issueReporterOptions = Array.from(new Set(issueTasks.map((task) => bugReporterId(task)).filter(Boolean))).sort();
-  $: issueMetrics = {
+  $: issueHealthMetrics = {
     open: issueTasks.filter((task) => !task.bug?.resolution).length,
     untriaged: issueTasks.filter((task) => !task.bug?.severity && !task.bug?.resolution).length,
     severe: issueTasks.filter((task) => !task.bug?.resolution && (task.bug?.severity === 's1' || task.bug?.severity === 's2')).length,
     recentlyResolved: issueTasks.filter((task) => task.bug?.resolved_at && Date.now() - Date.parse(task.bug.resolved_at) <= 7 * 24 * 60 * 60 * 1000).length,
-    reopened: new Set(events.filter((event) => event.type === 'bug.reopened' && event.task_id).map((event) => event.task_id)).size
+    reopened: issueMetricsStatus === 'known' ? issueMetricsData?.reopened ?? null : null
   };
   $: if (view === 'issues') syncIssueViewURL(issueFilters, issueProjectFilter);
   $: sortedColumns = [...columns].sort((a, b) => a.position - b.position);
@@ -407,7 +655,7 @@
   // mutations could otherwise leave cards/counts rendered in their old
   // column until an unrelated update occurred.
   $: tasksByColumn = sortedColumns.reduce<Record<string, Task[]>>((groups, column) => {
-    groups[column.id] = sortTasks(visibleTasks.filter((task) => task.column_id === column.id));
+    groups[column.id] = sortBoardTasks(visibleTasks.filter((task) => task.column_id === column.id));
     return groups;
   }, {});
   $: favoriteProjects = projects.filter((project) => project.favorite);
@@ -417,8 +665,17 @@
   $: filteredSwitcherProjects = projects.filter((project) =>
     `${project.name} ${project.key}`.toLowerCase().includes(projectSwitcherQuery.trim().toLowerCase())
   );
-  $: commandChoices = buildCommandChoices(commandQuery);
-  $: if (commandChoices.length && commandIndex >= commandChoices.length) commandIndex = commandChoices.length - 1;
+  $: commandChoices = filterCommandChoices(buildCommandChoices({
+    projects,
+    tasks,
+    issueTasks,
+    searchProjects: commandSearchProjects,
+    searchTasks: commandSearchTasks,
+    savedViews: commandSearchViews,
+    theme
+  }), commandQuery);
+  $: if (commandIndex >= commandChoices.length) commandIndex = Math.max(0, commandChoices.length - 1);
+  $: activeCommandOptionId = commandChoices[commandIndex] ? commandChoiceId(commandChoices[commandIndex]) : '';
   $: myWorkRows = myWorkTasks.map((task) => ({
     task,
     project: projectForTask(task),
@@ -451,6 +708,36 @@
   $: taskModalDescriptionApplied = Boolean(taskModalSuggestion && taskModalAppliedFields.description && taskModalDescription === suggestionDescription(taskModalSuggestion));
   $: taskModalPriorityApplied = Boolean(taskModalSuggestion && taskModalAppliedFields.priority && taskModalPriority === taskModalSuggestion.priority);
   $: taskModalAllFieldsApplied = taskModalTitleApplied && taskModalDescriptionApplied && taskModalPriorityApplied;
+  // Keep these reactive expressions explicit: Svelte tracks identifiers in a
+  // statement, not values reached indirectly through a helper function.
+  $: drawerTaskDraftFingerprintValue = JSON.stringify([
+    draftTitle,
+    draftDescription,
+    draftPriority,
+    draftDueDate,
+    draftAssignee,
+    draftLabels,
+    draftBugActual,
+    draftBugExpected,
+    draftBugReproduction,
+    draftBugEnvironment,
+    draftBugVersion
+  ]);
+  $: drawerActionDraftFingerprintValue = JSON.stringify([
+    triageSeverityDraft,
+    resolutionDraft,
+    duplicateOfDraft,
+    resolutionNoteDraft,
+    reopenReasonDraft,
+    blockReasonDraft,
+    commentBody
+  ]);
+  $: drawerTaskDraftDirty = Boolean(drawerTask && drawerTaskDraftFingerprintValue !== drawerSavedTaskDraftFingerprint);
+  $: drawerDraftDirty = Boolean(
+    drawerTask
+    && (drawerTaskDraftDirty || drawerActionDraftFingerprintValue !== drawerSavedActionDraftFingerprint)
+  );
+  $: searchView = searchSavedViews.find((item) => item.id === searchViewId);
 
   const focusableSelector = [
     'a[href]',
@@ -508,7 +795,9 @@
       if (!node.isConnected || node.contains(document.activeElement)) return;
       const initial = node.querySelector<HTMLElement>('[data-dialog-initial-focus]');
       const focusable = focusableElements(node);
-      const target = initial && focusable.includes(initial) ? initial : focusable[0];
+      // A dialog may deliberately place initial focus on a neutral, programmatic
+      // target (tabindex=-1) instead of moving a user straight into a field.
+      const target = initial && isFocusableVisible(initial) ? initial : focusable[0];
       (target || node).focus();
     });
 
@@ -521,6 +810,208 @@
 
   function matchesWorkFilter(task: Task, filter: WorkFilter, now = pulseClock): boolean {
     return matchesAgentWorkFilter(task, filter, now, semanticStateForTask(task));
+  }
+
+  function emptyBoardColumnPage(): BoardColumnPage {
+    return { tasks: [], nextCursor: '', loading: false, loaded: false, error: '' };
+  }
+
+  function claimBoardColumnRequestGeneration(columnId: string): number {
+    const claim = claimBoardColumnRequest(boardColumnGenerations, columnId);
+    boardColumnGenerations = claim.generations;
+    return claim.generation;
+  }
+
+  function invalidateBoardColumnRequests(columnIds: string[]) {
+    let next = boardColumnGenerations;
+    [...new Set(columnIds)].forEach((columnId) => {
+      next = claimBoardColumnRequest(next, columnId).generations;
+    });
+    boardColumnGenerations = next;
+  }
+
+  function beginBoardColumnRefresh(columnIds: string[]): number {
+    const refreshToken = ++boardColumnRefreshSequence;
+    const next = { ...boardColumnRefreshes };
+    [...new Set(columnIds)].forEach((columnId) => {
+      next[columnId] = refreshToken;
+    });
+    boardColumnRefreshes = next;
+    return refreshToken;
+  }
+
+  function endBoardColumnRefresh(columnIds: string[], refreshToken: number) {
+    const next = { ...boardColumnRefreshes };
+    [...new Set(columnIds)].forEach((columnId) => {
+      if (next[columnId] === refreshToken) delete next[columnId];
+    });
+    boardColumnRefreshes = next;
+  }
+
+  function beginBoardMutation(): BoardMutationContext | null {
+    if (!activeProject || !user) return null;
+    clearAnnouncement();
+    return {
+      requestId: ++boardMutationRequest,
+      boardRequest,
+      session: sessionGeneration,
+      mutationRevision: taskMutationRevision,
+      projectId: activeProject.id,
+      projectSlug: activeProjectSlug
+    };
+  }
+
+  function boardMutationIsCurrent(context: BoardMutationContext): boolean {
+    return context.requestId === boardMutationRequest
+      && context.boardRequest === boardRequest
+      && context.session === sessionGeneration
+      && context.mutationRevision === taskMutationRevision
+      && context.projectId === activeProject?.id
+      && context.projectSlug === activeProjectSlug
+      && Boolean(user);
+  }
+
+  function boardFiltersActive(): boolean {
+    return Boolean(
+      filters.query.trim()
+      || filters.priority !== 'all'
+      || filters.label !== 'all'
+      || filters.assignee !== 'all'
+      || filters.state !== 'all'
+      || filters.dependency !== 'all'
+      || boardWorkFilter !== 'all'
+    );
+  }
+
+  /** Build one bounded, server-filtered request for one board column. */
+  function boardTaskParams(columnId: string, cursor = ''): TaskListParams {
+    const params: TaskListParams = {
+      column: columnId,
+      sort: boardSort,
+      order: boardOrder,
+      limit: boardPageSize
+    };
+    if (cursor) params.cursor = cursor;
+    if (filters.state !== 'all') params.state = filters.state;
+    if (filters.priority !== 'all') params.priority = filters.priority;
+    if (filters.label !== 'all') params.label = filters.label;
+    if (filters.assignee !== 'all') params.assignee = filters.assignee;
+    if (filters.dependency !== 'all') params.dependency = filters.dependency;
+    if (filters.query.trim()) params.q = filters.query.trim();
+    if (boardWorkFilter === 'action-needed') {
+      params.action_needed = true;
+    } else if (boardWorkFilter !== 'all') {
+      params.agent_state = boardWorkFilter;
+    }
+    return params;
+  }
+
+  function sortBoardTasks(items: Task[]): Task[] {
+    return sortBoardTaskList(items, boardSort, boardOrder);
+  }
+
+  function flattenBoardPages(): Task[] {
+    const seen = new Set<string>();
+    const flattened: Task[] = [];
+    sortedColumns.forEach((column) => {
+      for (const task of boardPages[column.id]?.tasks || []) {
+        if (seen.has(task.id)) continue;
+        seen.add(task.id);
+        flattened.push(task);
+      }
+    });
+    return flattened;
+  }
+
+  function boardTaskMatches(task: Task, columnId = task.column_id): boolean {
+    return Boolean(
+      activeProject
+      && task.project_id === activeProject.id
+      && task.column_id === columnId
+      && filterTasks([task], columns, filters).length
+      && matchesWorkFilter(task, boardWorkFilter)
+    );
+  }
+
+  /** Keep a just-mutated task visible only when its loaded page can represent it. */
+  function syncBoardTaskPages(updated: Task, announceChanges = true) {
+    if (!Object.keys(boardPages).length) return;
+    let changed = false;
+    const nextPages: Record<string, BoardColumnPage> = { ...boardPages };
+    Object.entries(boardPages).forEach(([columnId, page]) => {
+      const hadTask = page.tasks.some((task) => task.id === updated.id);
+      const shouldInclude = boardTaskMatches(updated, columnId) && (hadTask || page.loaded);
+      const retained = page.tasks.filter((task) => task.id !== updated.id);
+      if (shouldInclude) retained.push(updated);
+      const nextTasks = sortBoardTasks(retained);
+      if (
+        nextTasks.length !== page.tasks.length
+        || nextTasks.some((task, index) => task.id !== page.tasks[index]?.id || task.version !== page.tasks[index]?.version)
+      ) {
+        changed = true;
+        nextPages[columnId] = { ...page, tasks: nextTasks };
+      }
+      if (announceChanges && hadTask && !shouldInclude) {
+        boardReconciliationNotice = `${updated.key} moved outside the loaded board page or current filters.`;
+        announce(boardReconciliationNotice);
+      }
+    });
+    if (changed) {
+      boardPages = nextPages;
+      tasks = flattenBoardPages();
+      observeWorkTransitions(tasks, announceChanges);
+    }
+  }
+
+  function removeTaskFromBoardPages(taskId: string) {
+    let changed = false;
+    const nextPages: Record<string, BoardColumnPage> = { ...boardPages };
+    Object.entries(boardPages).forEach(([columnId, page]) => {
+      if (!page.tasks.some((task) => task.id === taskId)) return;
+      changed = true;
+      nextPages[columnId] = { ...page, tasks: page.tasks.filter((task) => task.id !== taskId) };
+    });
+    if (changed) {
+      boardPages = nextPages;
+      tasks = flattenBoardPages();
+    }
+  }
+
+  function scheduleBoardReload() {
+    boardCriteriaRevision += 1;
+    boardCriteriaTransition = true;
+    const criteriaRevision = boardCriteriaRevision;
+    if (boardFilterTimer) window.clearTimeout(boardFilterTimer);
+    boardFilterTimer = window.setTimeout(() => {
+      boardFilterTimer = undefined;
+      if (criteriaRevision === boardCriteriaRevision && view === 'board' && activeProject) {
+        void loadBoard({ criteriaRevision });
+      } else if (criteriaRevision === boardCriteriaRevision) {
+        boardCriteriaTransition = false;
+      }
+    }, 160);
+  }
+
+  function mergeBoardPageTasks(
+    existing: Task[],
+    fetched: Task[],
+    protectedMutations: ReadonlyMap<string, TaskMutationKind>
+  ): Task[] {
+    const fetchedById = new Map(fetched.map((task) => [task.id, task]));
+    const localById = new Map(existing.map((task) => [task.id, task]));
+    const merged = new Map<string, Task>();
+    existing.forEach((task) => merged.set(task.id, task));
+    fetched.forEach((task) => {
+      if (protectedMutations.get(task.id) === 'remove') return;
+      const local = localById.get(task.id);
+      merged.set(task.id, mergeAuthoritativeTask(local, task));
+    });
+    protectedMutations.forEach((kind, taskId) => {
+      if (kind !== 'upsert' || fetchedById.has(taskId) || merged.has(taskId)) return;
+      const local = tasks.find((task) => task.id === taskId);
+      if (local) merged.set(taskId, local);
+    });
+    return [...merged.values()].filter((task) => boardTaskMatches(task));
   }
 
   function sortWorkRows(rows: MyWorkRow[]): MyWorkRow[] {
@@ -599,6 +1090,12 @@
     return `${Math.floor(hours / 24)}d${hours % 24 ? ` ${hours % 24}h` : ''} left`;
   }
 
+  function claimExpiresSoon(task: Task, now = pulseClock): boolean {
+    if (!task.claim_expires_at || !claimIsActive(task, now)) return false;
+    const expires = Date.parse(task.claim_expires_at);
+    return Number.isFinite(expires) && expires - now <= claimWarningThresholdMs;
+  }
+
   function claimExpiryExact(value?: string): string {
     if (!value) return '';
     const parsed = new Date(value);
@@ -620,13 +1117,13 @@
     return `${work.state || ''}:${isWorkStale(task)}:${Boolean(work.action_needed)}`;
   }
 
-  function observeWorkTransitions(nextTasks: Task[]) {
+  function observeWorkTransitions(nextTasks: Task[], announceTransitions = true) {
     const next = new Map(workTransitionSnapshot);
     nextTasks.forEach((task) => {
       const key = workTransitionKey(task);
       next.set(task.id, key);
       const previous = workTransitionSnapshot.get(task.id);
-      if (previous && key && previous !== key) {
+      if (announceTransitions && previous && key && previous !== key) {
         const status = isWorkStale(task) && workState(task) !== 'waiting' ? 'stale' : workState(task) || 'updated';
         announce(`${task.key} is now ${status}${isActionNeeded(task) ? ' · action needed' : ''}.`);
       }
@@ -642,23 +1139,62 @@
     }, 3500);
   }
 
+  function clearAnnouncement() {
+    liveAnnouncement = '';
+    if (announcementTimer) {
+      window.clearTimeout(announcementTimer);
+      announcementTimer = undefined;
+    }
+    boardReconciliationNotice = '';
+  }
+
+  function browserPlatform(): string {
+    if (typeof navigator === 'undefined') return '';
+    const navigatorWithUserAgentData = navigator as Navigator & { userAgentData?: { platform?: string } };
+    return navigatorWithUserAgentData.userAgentData?.platform || navigator.platform || navigator.userAgent || '';
+  }
+
+  function systemTheme(): 'light' | 'dark' {
+    const prefersDark = typeof window !== 'undefined'
+      && typeof window.matchMedia === 'function'
+      && window.matchMedia('(prefers-color-scheme: dark)').matches;
+    return themeFromMediaPreference(prefersDark);
+  }
+
   onMount(() => {
-    theme = (readMigratedStorage(localStorage, helmStorageKeys.theme, legacyRoadmapStorageKeys.theme) as 'light' | 'dark' | null) || 'light';
+    const storedTheme = readMigratedStorage(localStorage, helmStorageKeys.theme, legacyRoadmapStorageKeys.theme);
+    theme = storedTheme === 'light' || storedTheme === 'dark' ? storedTheme : systemTheme();
+    commandShortcut = platformShortcut(browserPlatform());
     applyTheme();
     recentProjectIds = loadRecentProjects(localStorage);
+    boardOffline = !navigator.onLine;
+    const onlineHandler = () => {
+      boardOffline = false;
+      if (activeProject && view === 'board') void loadBoard();
+    };
+    const offlineHandler = () => {
+      boardOffline = true;
+    };
+    window.addEventListener('online', onlineHandler);
+    window.addEventListener('offline', offlineHandler);
     const cleanup = () => {
       if (pollTimer) window.clearInterval(pollTimer);
       if (pulseTimer) window.clearInterval(pulseTimer);
       if (livenessRefreshTimer) window.clearInterval(livenessRefreshTimer);
       if (announcementTimer) window.clearTimeout(announcementTimer);
+      if (boardFilterTimer) window.clearTimeout(boardFilterTimer);
+      window.removeEventListener('online', onlineHandler);
+      window.removeEventListener('offline', offlineHandler);
     };
     void bootstrap();
     const keyHandler = (event: KeyboardEvent) => handleKeydown(event);
     window.addEventListener('keydown', keyHandler);
+    window.addEventListener('pointerdown', handleProjectSwitcherPointerDown);
     window.addEventListener('popstate', handlePopState);
     return () => {
       cleanup();
       window.removeEventListener('keydown', keyHandler);
+      window.removeEventListener('pointerdown', handleProjectSwitcherPointerDown);
       window.removeEventListener('popstate', handlePopState);
     };
   });
@@ -776,8 +1312,11 @@
     // Invalidate reads before awaiting the network logout. Otherwise a poll
     // or list request can still resolve while the logout request is pending,
     // and its response could repopulate the session being cleared below.
+    clearAnnouncement();
     sessionGeneration += 1;
     user = null;
+    boardMutationRequest += 1;
+    taskActionLoading = '';
     projectListRequest += 1;
     boardRequest += 1;
     roadmapRequest += 1;
@@ -787,7 +1326,7 @@
     boardTimelineRequest += 1;
     taskModalColumnsRequest += 1;
     issueRequest += 1;
-    if (drawerTask) closeDrawer();
+    if (drawerTask) closeDrawer(true);
     activeProjectSlug = '';
     auditIdFromRoute = '';
     roadmapProjectId = undefined;
@@ -797,8 +1336,20 @@
     labels = [];
     issueTasks = [];
     issueColumns = [];
+    issueMetricsData = null;
+    issueMetricsStatus = 'unknown';
+    issueMetricsRequest += 1;
     myWorkTasks = [];
     myWorkColumnsByProject = {};
+    sidebarCounts = null;
+    sidebarCountsStatus = 'unknown';
+    sidebarCountsRequest += 1;
+    searchTasks = [];
+    searchColumnsByProject = {};
+    searchNextCursor = '';
+    searchSavedViews = [];
+    searchViewId = '';
+    searchError = '';
     roadmap = null;
     roadmapLiveTasks = [];
     roadmapLiveColumnsByProject = {};
@@ -819,6 +1370,11 @@
     codexStatusLoading = false;
     codexLoading = false;
     codexError = '';
+    adminProjects = [];
+    adminProjectId = '';
+    adminColumns = [];
+    adminError = '';
+    adminConfirmation = null;
     if (pollTimer) window.clearInterval(pollTimer);
     if (pulseTimer) window.clearInterval(pulseTimer);
     if (livenessRefreshTimer) window.clearInterval(livenessRefreshTimer);
@@ -878,6 +1434,16 @@
         || sessionGeneration !== requestedSession
         || !user
       ) return;
+      // Navigation counts and issue health are deliberately scalar requests;
+      // bootstrap never downloads the full Issues or My Work collections just
+      // to render their badges.
+      await Promise.all([loadIssueMetrics(), loadSidebarCounts()]);
+      if (
+        requestId !== projectListRequest
+        || selectionVersion !== projectSwitchVersion
+        || sessionGeneration !== requestedSession
+        || !user
+      ) return;
       const path = window.location.pathname;
       if (taskRoute && target) {
         roadmapProjectId = undefined;
@@ -896,10 +1462,15 @@
         roadmapProjectId = undefined;
         view = 'roadmap';
         await loadRoadmap();
+      } else if (/^\/search\/?$/.test(path)) {
+        roadmapProjectId = undefined;
+        applySearchRouteFilters(new URL(window.location.href).searchParams);
+        view = 'search';
+        await loadSearch();
       } else if (/^\/settings\/?$/.test(path)) {
         roadmapProjectId = undefined;
         view = 'settings';
-        await Promise.all([loadAgents(), loadCodexAccount()]);
+        await Promise.all([loadAgents(), loadCodexAccount(), loadProjectAdmin()]);
       } else if (routeSlug && isProjectAuditLocation()) {
         roadmapProjectId = undefined;
         auditIdFromRoute = getAuditIdFromLocation();
@@ -922,27 +1493,37 @@
     }
   }
 
-  async function loadBoard(): Promise<boolean> {
+  async function loadBoard(options: BoardLoadOptions = {}): Promise<boolean> {
+    if (options.criteriaRevision === undefined && boardFilterTimer) {
+      window.clearTimeout(boardFilterTimer);
+      boardFilterTimer = undefined;
+    }
     const requestId = ++boardRequest;
     boardLivenessRequest += 1;
     const requestedSession = sessionGeneration;
     const mutationSnapshot = taskMutationRevision;
     const requestedSlug = activeProjectSlug;
+    const requestedCriteriaRevision = options.criteriaRevision ?? boardCriteriaRevision;
+    invalidateBoardColumnRequests(Object.keys(boardPages));
     if (!requestedSlug) {
       boardLoading = false;
+      if (requestedCriteriaRevision === boardCriteriaRevision) boardCriteriaTransition = false;
       return true;
     }
     const project = projects.find((item) => item.slug === requestedSlug);
     if (!project) {
       boardLoading = false;
+      if (requestedCriteriaRevision === boardCriteriaRevision) boardCriteriaTransition = false;
       return true;
     }
     boardLoading = true;
+    boardMetadataErrors = boardMetadataErrorAfterRefresh(boardMetadataErrors, 'full', [], '');
     boardError = '';
+    boardPartial = false;
+    boardReconciliationNotice = '';
     try {
-      const [columnResult, taskResult, labelResult] = await Promise.all([
+      const [columnResult, labelResult] = await Promise.all([
         api.listAllColumns(project.id),
-        listAllTasks(project.id, { limit: 200 }),
         api.listAllLabels(project.id)
       ]);
       if (
@@ -951,15 +1532,18 @@
         || sessionGeneration !== requestedSession
         || !user
       ) return false;
+      boardMetadataErrors = boardMetadataErrorAfterRefresh(boardMetadataErrors, 'full', [], '');
+      boardError = boardMetadataErrorMessage(boardMetadataErrors);
       columns = columnResult.data;
-      tasks = mergeAuthoritativeTaskList(
-        tasks,
-        taskResult.data,
-        mutationsForRequest('board', mutationSnapshot)
-      );
       labels = labelResult.data;
+      invalidateBoardColumnRequests(Object.keys(boardPages));
+      boardPages = Object.fromEntries(columns.map((column) => [column.id, emptyBoardColumnPage()]));
+      tasks = [];
       observeWorkTransitions(tasks);
-      return true;
+      const pageResults = await Promise.all(
+        [...columns].sort((a, b) => a.position - b.position).map((column) => loadBoardColumn(column.id, { reset: true, mutationSnapshot }))
+      );
+      return pageResults.every(Boolean);
     } catch (error) {
       if (
         requestId === boardRequest
@@ -967,17 +1551,208 @@
         && sessionGeneration === requestedSession
         && user
       ) {
-        boardError = friendlyError(error, 'This board could not be loaded.');
+        boardMetadataErrors = boardMetadataErrorAfterRefresh(
+          boardMetadataErrors,
+          'full',
+          [],
+          friendlyError(error, 'This board could not be loaded.')
+        );
+        boardError = boardMetadataErrorMessage(boardMetadataErrors);
       }
       return false;
     } finally {
-      if (requestId === boardRequest && sessionGeneration === requestedSession) boardLoading = false;
+      if (requestId === boardRequest && sessionGeneration === requestedSession) {
+        boardLoading = false;
+        if (requestedCriteriaRevision === boardCriteriaRevision) boardCriteriaTransition = false;
+      }
     }
   }
 
-  async function loadBoardTimeline(
+  async function loadBoardColumn(
+    columnId: string,
+    options: BoardColumnLoadOptions = {}
+  ): Promise<boolean> {
+    const {
+      reset = false,
+      mutationSnapshot = taskMutationRevision,
+      recoveryNotice = false,
+      announceChanges = true
+    } = options;
+    const page = boardPages[columnId] || emptyBoardColumnPage();
+    if ((!reset && page.loading) || (!reset && !page.nextCursor)) return true;
+    const requestedBoardRequest = boardRequest;
+    const requestedSession = sessionGeneration;
+    const requestedSlug = activeProjectSlug;
+    const project = projects.find((item) => item.slug === requestedSlug);
+    if (!project || !user) return false;
+    const requestedProjectId = project.id;
+    const columnGeneration = claimBoardColumnRequestGeneration(columnId);
+    const requestIsCurrent = () => (
+      requestedBoardRequest === boardRequest
+      && requestedSession === sessionGeneration
+      && requestedSlug === activeProjectSlug
+      && activeProject?.id === requestedProjectId
+      && Boolean(user)
+      && boardColumnRequestIsCurrent(boardColumnGenerations, columnId, columnGeneration)
+    );
+    const cursor = reset ? '' : page.nextCursor;
+    const existingColumnTasks = reset
+      ? tasks.filter((task) => task.column_id === columnId)
+      : page.tasks;
+    boardPages = {
+      ...boardPages,
+      [columnId]: { ...page, loading: true, error: '' }
+    };
+    try {
+      const result = await api.listTasks(project.id, boardTaskParams(columnId, cursor));
+      if (!requestIsCurrent()) return false;
+      const protectedMutations = mutationsForRequest('board', mutationSnapshot);
+      const merged = reset
+        ? mergeAuthoritativeTaskList(existingColumnTasks, result.data, protectedMutations)
+        : mergeBoardPageTasks(existingColumnTasks, result.data, protectedMutations);
+      const nextPage: BoardColumnPage = {
+        tasks: sortBoardTasks(merged.filter((task) => task.column_id === columnId)),
+        nextCursor: result.next_cursor || '',
+        loading: false,
+        loaded: true,
+        error: ''
+      };
+      boardPages = { ...boardPages, [columnId]: nextPage };
+      tasks = flattenBoardPages();
+      boardPartial = Object.values(boardPages).some((item) => Boolean(item.error || item.nextCursor));
+      boardOffline = false;
+      observeWorkTransitions(tasks, announceChanges);
+      if (announceChanges && recoveryNotice && requestIsCurrent()) {
+        const refreshedMessage = 'This column changed while loading more tasks; its first page was refreshed.';
+        boardReconciliationNotice = refreshedMessage;
+        announce(refreshedMessage);
+      }
+      return true;
+    } catch (error) {
+      if (!requestIsCurrent()) return false;
+      if (error instanceof ApiError && isRecoverableBoardCursorConflict(error.status, error.code, reset, cursor)) {
+        const currentPage = boardPages[columnId] || page;
+        const recoveryMessage = 'This column changed while loading more tasks. Refreshing its first page.';
+        boardReconciliationNotice = recoveryMessage;
+        announce(recoveryMessage);
+        toast('info', recoveryMessage);
+        // Clear the in-flight marker before the reset so loadBoardColumn does
+        // not short-circuit on the stale page request. The reset path is
+        // deliberately one-shot; if it also conflicts, the normal page error
+        // state gives the person an explicit retry action.
+        boardPages = {
+          ...boardPages,
+          [columnId]: { ...currentPage, loading: false, error: '' }
+        };
+        boardPartial = true;
+        return loadBoardColumn(columnId, { reset: true, mutationSnapshot, recoveryNotice: true });
+      }
+      const offlineNow = typeof navigator !== 'undefined' && !navigator.onLine;
+      const message = boardOffline || offlineNow
+        ? 'You are offline. Reconnect and retry this column.'
+        : friendlyError(error, 'This column could not be loaded.');
+      boardOffline = offlineNow;
+      const currentPage = boardPages[columnId] || page;
+      boardPages = {
+        ...boardPages,
+        [columnId]: { ...currentPage, loading: false, loaded: true, error: message }
+      };
+      boardPartial = true;
+      return false;
+    } finally {
+      // A newer board or same-column request may have replaced this page while
+      // this request was in flight. Its owner is responsible for clearing the
+      // loading state and committing its response.
+      const current = boardPages[columnId];
+      if (requestIsCurrent() && current?.loading) {
+        boardPages = { ...boardPages, [columnId]: { ...current, loading: false } };
+      }
+    }
+  }
+
+  /** Invalidate and reload only pages whose physical ordering changed. */
+  async function reloadBoardColumns(columnIds: string[]): Promise<boolean> {
+    const ids = [...new Set(columnIds)].filter((id) => Boolean(boardPages[id]));
+    if (!ids.length || !activeProject) return true;
+    const requestedProjectId = activeProject.id;
+    const requestedSlug = activeProjectSlug;
+    const requestedBoardRequest = boardRequest;
+    const requestedSession = sessionGeneration;
+    const refreshToken = beginBoardColumnRefresh(ids);
+    // Invalidate pending page responses before waiting for refreshed column
+    // metadata. The old response must not repopulate a terminal page while
+    // this targeted refresh is in flight.
+    invalidateBoardColumnRequests(ids);
+    // A newer refresh may claim one or more of these columns. Only overlapping
+    // targets make this refresh stale; disjoint column refreshes remain safe to
+    // complete independently while the board/session checks below protect the
+    // shared project context.
+    const refreshIsCurrent = () => (
+      boardRefreshTargetsAreCurrent(boardColumnRefreshes, ids, refreshToken)
+      && requestedBoardRequest === boardRequest
+      && requestedSession === sessionGeneration
+      && activeProjectSlug === requestedSlug
+      && activeProject?.id === requestedProjectId
+      && Boolean(user)
+    );
+    try {
+      let columnsRefreshed = true;
+      try {
+        // Task responses carry the moved row but not the affected column
+        // revisions. Refresh those revisions before the next mutation so a
+        // subsequent anchor request is not rejected with our own stale value.
+        const result = await api.listAllColumns(requestedProjectId);
+        if (!refreshIsCurrent()) return false;
+        const previousMetadataError = boardMetadataErrorMessage(boardMetadataErrors);
+        columns = mergeOwnedBoardMetadata(columns, result.data, ids);
+        boardMetadataErrors = boardMetadataErrorAfterRefresh(boardMetadataErrors, 'targeted', ids, '');
+        const nextMetadataError = boardMetadataErrorMessage(boardMetadataErrors);
+        if (boardError === previousMetadataError) boardError = nextMetadataError;
+      } catch (error) {
+        if (!refreshIsCurrent()) return false;
+        columnsRefreshed = false;
+        const metadataError = friendlyError(error, 'Board metadata could not be refreshed. Retry before using global ordering.');
+        const previousMetadataError = boardMetadataErrorMessage(boardMetadataErrors);
+        boardMetadataErrors = boardMetadataErrorAfterRefresh(
+          boardMetadataErrors,
+          'targeted',
+          ids,
+          metadataError
+        );
+        const nextMetadataError = boardMetadataErrorMessage(boardMetadataErrors);
+        if (!boardError || boardError === previousMetadataError) boardError = nextMetadataError;
+      }
+      if (!refreshIsCurrent()) return false;
+      const mutationSnapshot = taskMutationRevision;
+      const nextPages: Record<string, BoardColumnPage> = { ...boardPages };
+      ids.forEach((columnId) => {
+        nextPages[columnId] = emptyBoardColumnPage();
+      });
+      boardPages = nextPages;
+      tasks = flattenBoardPages();
+      boardPartial = Object.values(boardPages).some((item) => Boolean(item.error || item.nextCursor));
+      observeWorkTransitions(tasks, false);
+      if (!refreshIsCurrent()) return false;
+      const results = await Promise.all(ids.map((columnId) => loadBoardColumn(columnId, {
+        reset: true,
+        mutationSnapshot,
+        announceChanges: false
+      })));
+      return columnsRefreshed && results.every(Boolean);
+    } finally {
+      endBoardColumnRefresh(ids, refreshToken);
+    }
+  }
+
+  function loadMoreBoardColumn(columnId: string) {
+    const page = boardPages[columnId];
+    if (!page?.nextCursor || page.loading) return;
+    void loadBoardColumn(columnId);
+  }
+
+  async function loadBoardTimelinePage(
     projectId = activeProject?.id,
-    options: { older?: boolean; reset?: boolean } = {}
+    options: { older?: boolean; reset?: boolean; reconciliation?: TimelineCommentReconciliation; filter?: TaskTimelineFilter } = {}
   ): Promise<boolean> {
     const { older = false, reset = false } = options;
     if (!projectId) return true;
@@ -990,7 +1765,7 @@
     const requestId = ++boardTimelineRequest;
     const requestedSession = sessionGeneration;
     const requestedProjectId = projectId;
-    const requestedFilter = boardTimelineFilter;
+    const requestedFilter = options.filter || boardTimelineFilter;
     const previousCursor = boardTimelineNextCursor;
     const hadItems = boardTimelineItems.length > 0;
     if (older) boardTimelineLoadingOlder = true;
@@ -1010,13 +1785,8 @@
         || activeProject?.id !== requestedProjectId
         || boardTimelineFilter !== requestedFilter
       ) return false;
-      const merged = new Map<string, TaskTimelineItem>();
-      const rows = older ? [...boardTimelineItems, ...result.data] : [...result.data, ...(reset ? [] : boardTimelineItems)];
-      rows.forEach((item) => merged.set(item.id, item));
-      boardTimelineItems = [...merged.values()].sort((a, b) => {
-        const time = Date.parse(b.created_at) - Date.parse(a.created_at);
-        return time || b.cursor.localeCompare(a.cursor) || b.id.localeCompare(a.id);
-      });
+      const existingItems = older ? boardTimelineItems : reset ? [] : boardTimelineItems;
+      boardTimelineItems = mergeTimelineItems(existingItems, result.data || [], options.reconciliation);
       boardTimelineProjectId = requestedProjectId;
       boardTimelineNextCursor = older || !hadItems || reset || !previousCursor ? (result.next_cursor || '') : previousCursor;
       return true;
@@ -1029,11 +1799,22 @@
       ) boardTimelineError = friendlyError(error, 'This board timeline could not be loaded.');
       return false;
     } finally {
-      if (requestId === boardTimelineRequest) {
-        if (older) boardTimelineLoadingOlder = false;
-        else boardTimelineLoading = false;
-      }
+      if (older) boardTimelineLoadingOlder = false;
+      else boardTimelineLoading = false;
     }
+  }
+
+  function loadBoardTimeline(
+    projectId = activeProject?.id,
+    options: { older?: boolean; reset?: boolean; reconciliation?: TimelineCommentReconciliation } = {}
+  ): Promise<boolean> {
+    const requestedFilter = boardTimelineFilter;
+    const queued = queueBoardTimelineLoad(
+      boardTimelineLoadQueue,
+      () => loadBoardTimelinePage(projectId, { ...options, filter: requestedFilter })
+    );
+    boardTimelineLoadQueue = queued.queue;
+    return queued.promise;
   }
 
   function setBoardTimelineFilter(next: TaskTimelineFilter) {
@@ -1078,6 +1859,47 @@
       return false;
     } finally {
       if (requestId === issueRequest && sessionGeneration === requestedSession) issuesLoading = false;
+    }
+  }
+
+  async function loadIssueMetrics(): Promise<boolean> {
+    const requestId = ++issueMetricsRequest;
+    const requestedSession = sessionGeneration;
+    issueMetricsStatus = 'loading';
+    try {
+      const result = await api.issueMetrics();
+      if (requestId !== issueMetricsRequest || sessionGeneration !== requestedSession || !user) return false;
+      issueMetricsData = result;
+      issueMetricsStatus = 'known';
+      return true;
+    } catch {
+      if (requestId === issueMetricsRequest && sessionGeneration === requestedSession && user) {
+        issueMetricsStatus = 'error';
+      }
+      return false;
+    }
+  }
+
+  async function loadSidebarCounts(requestedView: MyWorkView = myWorkView): Promise<boolean> {
+    const requestId = ++sidebarCountsRequest;
+    const requestedSession = sessionGeneration;
+    sidebarCountsStatus = 'loading';
+    try {
+      const result = await api.sidebarCounts({ view: requestedView });
+      if (
+        requestId !== sidebarCountsRequest
+        || sessionGeneration !== requestedSession
+        || !user
+        || myWorkView !== requestedView
+      ) return false;
+      sidebarCounts = result;
+      sidebarCountsStatus = 'known';
+      return true;
+    } catch {
+      if (requestId === sidebarCountsRequest && sessionGeneration === requestedSession && user && myWorkView === requestedView) {
+        sidebarCountsStatus = 'error';
+      }
+      return false;
     }
   }
 
@@ -1131,6 +1953,161 @@
     myWorkView = next;
     myWorkFilter = 'all';
     void loadMyWork();
+    void loadSidebarCounts(next);
+  }
+
+  function searchSortValue(): string {
+    return `${searchSortField}:${searchSortDirection}`;
+  }
+
+  function runSearch() {
+    searchViewId = '';
+    const params = new URLSearchParams();
+    if (searchQuery.trim()) params.set('q', searchQuery.trim());
+    if (searchPriority !== 'all') params.set('priority', searchPriority);
+    if (searchState !== 'all') params.set('state', searchState);
+    params.set('sort', searchSortValue());
+    navigate(`/search${params.toString() ? `?${params.toString()}` : ''}`);
+    void loadSearch();
+  }
+
+  async function loadSearch(append = false): Promise<boolean> {
+    if (append && !searchNextCursor) return true;
+    const requestId = ++searchRequest;
+    const requestedSession = sessionGeneration;
+    const cursor = append ? searchNextCursor : undefined;
+    if (!append) searchNextCursor = '';
+    searchLoading = true;
+    searchError = '';
+    try {
+      const params = searchViewId
+        ? { view: searchViewId, cursor, limit: 200 }
+        : {
+            q: searchQuery.trim() || undefined,
+            priority: searchPriority === 'all' ? undefined : searchPriority,
+            state: searchState === 'all' ? undefined : searchState,
+            sort: searchSortValue(),
+            cursor,
+            limit: 200
+          };
+      const result = await api.search(params);
+      if (requestId !== searchRequest || sessionGeneration !== requestedSession || !user || view !== 'search') return false;
+      searchTasks = append ? [...searchTasks, ...(result.data || [])] : (result.data || []);
+      searchNextCursor = result.next_cursor || '';
+      const projectIds = Array.from(new Set(searchTasks.map((task) => task.project_id)));
+      const columnResults = await Promise.all(projectIds.map(async (projectId) => ({
+        projectId,
+        columns: (await api.listAllColumns(projectId)).data
+      })));
+      if (requestId !== searchRequest || sessionGeneration !== requestedSession || !user || view !== 'search') return false;
+      searchColumnsByProject = Object.fromEntries(columnResults.map((result) => [result.projectId, result.columns]));
+      if (!searchViewId || !searchSavedViews.some((item) => item.id === searchViewId)) {
+        const savedViews = (await api.listAllSavedViews()).data;
+        if (requestId !== searchRequest || sessionGeneration !== requestedSession || !user || view !== 'search') return false;
+        searchSavedViews = savedViews;
+        const selected = savedViews.find((item) => item.id === searchViewId);
+        if (selected) {
+          searchQuery = typeof selected.filters?.q === 'string' ? selected.filters.q : '';
+          searchPriority = typeof selected.filters?.priority === 'string' ? selected.filters.priority : 'all';
+          searchState = typeof selected.filters?.state === 'string' ? selected.filters.state : 'all';
+          const firstSort = selected.sort?.[0];
+          searchSortField = firstSort?.field || 'updated_at';
+          searchSortDirection = firstSort?.direction || 'desc';
+          savedViewShared = selected.shared;
+        }
+      }
+      return true;
+    } catch (error) {
+      if (requestId === searchRequest && sessionGeneration === requestedSession && user) {
+        searchError = friendlyError(error, 'Search could not be loaded.');
+      }
+      return false;
+    } finally {
+      if (requestId === searchRequest && sessionGeneration === requestedSession) searchLoading = false;
+    }
+  }
+
+  async function saveCurrentSearchView() {
+    const name = savedViewName.trim();
+    if (!name) {
+      searchError = 'Name the saved view before saving it.';
+      return;
+    }
+    savedViewSaving = true;
+    searchError = '';
+    const filters: Record<string, unknown> = {};
+    if (searchQuery.trim()) filters.q = searchQuery.trim();
+    if (searchPriority !== 'all') filters.priority = searchPriority;
+    if (searchState !== 'all') filters.state = searchState;
+    try {
+      const created = await api.createSavedView({
+        name,
+        filters,
+        sort: [{ field: searchSortField, direction: searchSortDirection }],
+        shared: savedViewShared
+      });
+      searchSavedViews = [created, ...searchSavedViews.filter((item) => item.id !== created.id)];
+      savedViewName = '';
+      searchViewId = created.id;
+      navigate(`/search?view=${encodeURIComponent(created.id)}`);
+      await loadSearch();
+      toast('success', `${created.name} saved.`);
+    } catch (error) {
+      searchError = friendlyError(error, 'The saved view could not be created.');
+    } finally {
+      savedViewSaving = false;
+    }
+  }
+
+  async function updateCurrentSearchView() {
+    const current = searchSavedViews.find((item) => item.id === searchViewId);
+    if (!current) return saveCurrentSearchView();
+    savedViewSaving = true;
+    searchError = '';
+    try {
+      const updated = await api.patchSavedView(current.id, {
+        filters: {
+          ...(searchQuery.trim() ? { q: searchQuery.trim() } : {}),
+          ...(searchPriority !== 'all' ? { priority: searchPriority } : {}),
+          ...(searchState !== 'all' ? { state: searchState } : {})
+        },
+        sort: [{ field: searchSortField, direction: searchSortDirection }],
+        shared: savedViewShared
+      });
+      searchSavedViews = searchSavedViews.map((item) => item.id === updated.id ? updated : item);
+      toast('success', `${updated.name} updated.`);
+      await loadSearch();
+    } catch (error) {
+      searchError = friendlyError(error, 'The saved view could not be updated.');
+    } finally {
+      savedViewSaving = false;
+    }
+  }
+
+  async function removeCurrentSearchView(savedView: SavedView) {
+    const confirmed = await requestConfirm({
+      title: `Delete ${savedView.name}?`,
+      message: 'This removes the saved search for you. Shared views will also disappear for everyone who can use them.',
+      confirmLabel: 'Delete saved view',
+      fallbackSelector: '[aria-label="Saved view name"]'
+    });
+    if (!confirmed) return;
+    savedViewSaving = true;
+    try {
+      await api.deleteSavedView(savedView.id);
+      searchSavedViews = searchSavedViews.filter((item) => item.id !== savedView.id);
+      if (searchViewId === savedView.id) {
+        searchViewId = '';
+        navigate('/search');
+        await loadSearch();
+      }
+      toast('success', `${savedView.name} deleted.`);
+    } catch (error) {
+      searchError = friendlyError(error, 'The saved view could not be deleted.');
+    } finally {
+      savedViewSaving = false;
+      restoreDialogFocus();
+    }
   }
 
   async function loadRoadmap(projectId = roadmapProjectId): Promise<boolean> {
@@ -1334,6 +2311,277 @@
     }
   }
 
+  function setAdminProjectDraft(project: Project) {
+    adminProjectId = project.id;
+    adminProjectName = project.name;
+    adminProjectDescription = project.description || '';
+    adminProjectColor = project.color || '#64748b';
+    adminChecklistPolicy = project.checklist_completion_policy || 'warn';
+  }
+
+  async function loadAdminColumns(projectId = adminProjectId) {
+    if (!projectId || !user?.admin) return;
+    adminColumnsLoading = true;
+    try {
+      adminColumns = (await api.listAllColumns(projectId, { includeArchived: true })).data;
+    } catch (error) {
+      adminError = friendlyError(error, 'Project columns could not be loaded.');
+    } finally {
+      adminColumnsLoading = false;
+    }
+  }
+
+  async function loadProjectAdmin() {
+    if (!user?.admin) return;
+    adminLoading = true;
+    adminError = '';
+    try {
+      const result = await api.listAllProjects({ includeArchived: true });
+      adminProjects = result.data;
+      const selected = adminProjects.find((project) => project.id === adminProjectId)
+        || adminProjects.find((project) => project.id === activeProject?.id)
+        || adminProjects[0];
+      if (!selected) {
+        adminProjectId = '';
+        adminColumns = [];
+        return;
+      }
+      setAdminProjectDraft(selected);
+      await loadAdminColumns(selected.id);
+    } catch (error) {
+      adminError = friendlyError(error, 'Project administration could not be loaded.');
+    } finally {
+      adminLoading = false;
+    }
+  }
+
+  function replaceAdminProject(updated: Project) {
+    adminProjects = adminProjects.map((project) => project.id === updated.id ? updated : project);
+    if (updated.archived_at) {
+      projects = projects.filter((project) => project.id !== updated.id);
+      if (activeProjectSlug === updated.slug) {
+        activeProjectSlug = '';
+        columns = [];
+        tasks = [];
+        labels = [];
+      }
+    } else if (!projects.some((project) => project.id === updated.id)) {
+      projects = [...projects, updated];
+    } else {
+      projects = projects.map((project) => project.id === updated.id ? updated : project);
+    }
+    setAdminProjectDraft(updated);
+  }
+
+  async function saveAdminProject() {
+    const current = adminProjects.find((project) => project.id === adminProjectId);
+    if (!current || !adminProjectName.trim()) return;
+    adminSaving = true;
+    adminError = '';
+    try {
+      const updated = await api.patchProject(current.id, {
+        name: adminProjectName.trim(),
+        description: adminProjectDescription.trim(),
+        color: adminProjectColor,
+        checklist_completion_policy: adminChecklistPolicy
+      }, current.version);
+      replaceAdminProject(updated);
+      toast('success', `${updated.name} settings saved.`);
+    } catch (error) {
+      adminError = friendlyError(error, 'The project settings could not be saved. Refresh and try again.');
+      await loadProjectAdmin();
+      throw error;
+    } finally {
+      adminSaving = false;
+    }
+  }
+
+  function confirmAdminProjectSave() {
+    if (!adminProject || !adminProjectName.trim()) return;
+    showAdminConfirmation({
+      title: `Save ${adminProjectName.trim()} settings?`,
+      message: 'This updates the project name, description, accent color, and checklist completion policy. The stable project key and URL stay unchanged unless you edit them through the API.',
+      confirmLabel: 'Save project',
+      action: saveAdminProject
+    });
+  }
+
+  async function mutateAdminProjectArchive(project: Project) {
+    const updated = await api.patchProject(project.id, { archived: !project.archived_at }, project.version);
+    replaceAdminProject(updated);
+    await loadAdminColumns(updated.id);
+    toast('success', `${updated.name} was ${updated.archived_at ? 'archived' : 'restored'}.`);
+  }
+
+  function confirmAdminProjectArchive(project: Project) {
+    const archived = Boolean(project.archived_at);
+    showAdminConfirmation({
+      title: archived ? `Restore ${project.name}?` : `Archive ${project.name}?`,
+      message: archived
+        ? 'The project and its stable URL will be available in the workspace again.'
+        : `${project.task_count ?? 0} task${project.task_count === 1 ? '' : 's'} will stay intact, but the project will leave the active workspace until restored.`,
+      confirmLabel: archived ? 'Restore project' : 'Archive project',
+      action: async () => {
+        try {
+          await mutateAdminProjectArchive(project);
+        } catch (error) {
+          await loadProjectAdmin();
+          throw error;
+        }
+      }
+    });
+  }
+
+  function replaceAdminColumn(updated: Column) {
+    adminColumns = adminColumns.map((column) => column.id === updated.id ? updated : column);
+    if (updated.project_id === activeProject?.id) {
+      columns = columns.map((column) => column.id === updated.id ? updated : column).filter((column) => !column.archived_at);
+    }
+  }
+
+  async function mutateAdminColumn(column: Column) {
+    adminColumnSaving = column.id;
+    try {
+      const updated = await api.patchColumn(column.id, {
+        name: column.name.trim(),
+        semantic_state: column.semantic_state
+      }, column.version);
+      replaceAdminColumn(updated);
+      toast('success', `${updated.name} was saved.`);
+    } finally {
+      if (adminColumnSaving === column.id) adminColumnSaving = '';
+    }
+  }
+
+  function confirmAdminColumnSave(column: Column) {
+    showAdminConfirmation({
+      title: `Save ${column.name || 'column'}?`,
+      message: 'Changing a semantic mapping may update task completion state and dependency readiness. The operation is transactional and can be retried if another admin edits it first.',
+      confirmLabel: 'Save column',
+      action: async () => {
+        try {
+          await mutateAdminColumn(column);
+        } catch (error) {
+          await loadAdminColumns();
+          throw error;
+        }
+      }
+    });
+  }
+
+  async function mutateAdminColumnArchive(column: Column) {
+    adminColumnSaving = column.id;
+    try {
+      const updated = await api.patchColumn(column.id, { archived: !column.archived_at }, column.version);
+      replaceAdminColumn(updated);
+      await loadAdminColumns();
+      toast('success', `${updated.name} was ${updated.archived_at ? 'archived' : 'restored'}.`);
+    } finally {
+      if (adminColumnSaving === column.id) adminColumnSaving = '';
+    }
+  }
+
+  function confirmAdminColumnArchive(column: Column) {
+    const archived = Boolean(column.archived_at);
+    showAdminConfirmation({
+      title: archived ? `Restore ${column.name}?` : `Archive ${column.name}?`,
+      message: archived
+        ? 'Tasks can use this column again after it is restored.'
+        : 'Tasks in this column will move to another live column with the same semantic state. The five required mappings remain available.',
+      confirmLabel: archived ? 'Restore column' : 'Archive column',
+      action: async () => {
+        try {
+          await mutateAdminColumnArchive(column);
+        } catch (error) {
+          await loadAdminColumns();
+          throw error;
+        }
+      }
+    });
+  }
+
+  async function mutateAdminColumnMove(column: Column, position: number) {
+    adminColumnSaving = column.id;
+    try {
+      const updated = await api.patchColumn(column.id, { position }, column.version);
+      replaceAdminColumn(updated);
+      await loadAdminColumns();
+      toast('success', `${updated.name} moved.`);
+    } finally {
+      if (adminColumnSaving === column.id) adminColumnSaving = '';
+    }
+  }
+
+  function confirmAdminColumnMove(column: Column, position: number) {
+    showAdminConfirmation({
+      title: `Move ${column.name}?`,
+      message: 'Reordering changes the board for everyone. Existing tasks remain in their current column and keep their order.',
+      confirmLabel: 'Move column',
+      action: async () => {
+        try {
+          await mutateAdminColumnMove(column, position);
+        } catch (error) {
+          await loadAdminColumns();
+          throw error;
+        }
+      }
+    });
+  }
+
+  async function mutateAdminColumnCreate() {
+    const name = adminColumnName.trim();
+    if (!name) return;
+    adminColumnCreating = true;
+    try {
+      const created = await api.createColumn(adminProjectId, { name, semantic_state: adminColumnState });
+      const firstArchived = adminColumns.findIndex((column) => Boolean(column.archived_at));
+      const insertAt = firstArchived === -1 ? adminColumns.length : firstArchived;
+      adminColumns = [...adminColumns.slice(0, insertAt), created, ...adminColumns.slice(insertAt)];
+      adminColumnName = '';
+      adminColumnState = 'backlog';
+      toast('success', `${created.name} was added.`);
+    } finally {
+      adminColumnCreating = false;
+    }
+  }
+
+  function confirmAdminColumnCreate() {
+    if (!adminColumnName.trim() || !adminProjectId) return;
+    showAdminConfirmation({
+      title: `Add ${adminColumnName.trim()}?`,
+      message: 'The new column will appear at the end of the board and use the selected semantic mapping.',
+      confirmLabel: 'Add column',
+      action: mutateAdminColumnCreate
+    });
+  }
+
+  function showAdminConfirmation(confirmation: AdminConfirmation) {
+    rememberDialogFocus('[aria-labelledby="project-admin-heading"] button');
+    adminConfirmation = confirmation;
+  }
+
+  async function runAdminConfirmation() {
+    const pending = adminConfirmation;
+    if (!pending || adminConfirmationBusy) return;
+    adminConfirmationBusy = true;
+    adminError = '';
+    try {
+      await pending.action();
+      adminConfirmation = null;
+      restoreDialogFocus();
+    } catch (error) {
+      adminError = friendlyError(error, 'The administration change could not be applied. Refresh and try again.');
+    } finally {
+      adminConfirmationBusy = false;
+    }
+  }
+
+  function cancelAdminConfirmation() {
+    adminConfirmation = null;
+    restoreDialogFocus();
+    void loadAdminColumns();
+  }
+
   async function loadCodexAccount(refresh = false) {
     codexStatusLoading = true;
     codexError = '';
@@ -1451,43 +2699,7 @@
   async function refreshBoardTasks(): Promise<boolean> {
     if (!user || (view !== 'board' && view !== 'timeline') || !activeProject || boardLoading) return true;
     if (boardLivenessInFlight) return boardLivenessInFlight;
-
-    const requestId = ++boardLivenessRequest;
-    const requestedSession = sessionGeneration;
-    const mutationSnapshot = taskMutationRevision;
-    const requestedSlug = activeProjectSlug;
-    const requestedProjectId = activeProject.id;
-    const normalRequestId = boardRequest;
-    const refresh = (async () => {
-      try {
-        const result = await listAllTasks(requestedProjectId, { limit: 200 });
-        if (
-          !user
-          || sessionGeneration !== requestedSession
-          || (view !== 'board' && view !== 'timeline')
-          || activeProjectSlug !== requestedSlug
-          || boardRequest !== normalRequestId
-          || boardLivenessRequest !== requestId
-        ) return false;
-        tasks = mergeAuthoritativeTaskList(
-          tasks,
-          result.data,
-          mutationsForRequest('board', mutationSnapshot)
-        );
-        const updatedDrawer = drawerTask?.id === undefined
-          ? undefined
-          : result.data.find((task) => task.id === drawerTask?.id);
-        if (updatedDrawer && drawerTask?.id === updatedDrawer.id) {
-          drawerTask = mergeAuthoritativeTask(drawerTask, updatedDrawer);
-        }
-        observeWorkTransitions(tasks);
-        return true;
-      } catch {
-        // Liveness refreshes are best effort and must not surface a transient
-        // failure as a board error or loading state.
-        return false;
-      }
-    })();
+    const refresh = loadBoard();
     boardLivenessInFlight = refresh;
     try {
       return await refresh;
@@ -1526,6 +2738,7 @@
           : result.data.find((task) => task.id === drawerTask?.id);
         if (updatedDrawer && drawerTask?.id === updatedDrawer.id) {
           drawerTask = mergeAuthoritativeTask(drawerTask, updatedDrawer);
+          syncCleanDrawerDrafts(drawerTask);
         }
         observeWorkTransitions(myWorkTasks);
         return true;
@@ -1541,6 +2754,36 @@
     } finally {
       if (myWorkLivenessInFlight === refresh) myWorkLivenessInFlight = null;
     }
+  }
+
+  async function reconcileDrawerComments(taskId: string, events: ActivityEvent[]): Promise<TimelineCommentReconciliationResult> {
+    const loadedCommentTasks = new Map(
+      drawerTimelineItems
+        .filter((item) => item.kind === 'comment' && item.comment?.id)
+        .map((item) => [item.comment?.id as string, taskId])
+    );
+    return reconcileTimelineComments(
+      events,
+      loadedCommentTasks,
+      (commentTaskID, commentID) => api.getComment(commentTaskID, commentID),
+      (error) => error instanceof ApiError && error.status === 404,
+      taskId
+    );
+  }
+
+  async function reconcileBoardComments(projectId: string, events: ActivityEvent[]): Promise<TimelineCommentReconciliationResult> {
+    if (boardTimelineProjectId && boardTimelineProjectId !== projectId) return { ok: true, reconciliation: {} };
+    const loadedCommentTasks = new Map(
+      boardTimelineItems
+        .filter((item) => item.kind === 'comment' && item.comment?.id && item.task_id)
+        .map((item) => [item.comment?.id as string, item.task_id])
+    );
+    return reconcileTimelineComments(
+      events,
+      loadedCommentTasks,
+      (commentTaskID, commentID) => api.getComment(commentTaskID, commentID),
+      (error) => error instanceof ApiError && error.status === 404
+    );
   }
 
   async function pollEvents() {
@@ -1561,9 +2804,26 @@
         // first page on every poll so a quiet or globally backlogged event
         // feed cannot delay visible work from the current board.
         if (view === 'timeline' && activeProject?.id) {
-          if (!(await loadBoardTimeline(activeProject.id)) || !isCurrentPoll()) return;
+          let boardTimelineReconciliation: TimelineCommentReconciliation | undefined;
+          let boardTimelineReconciliationSucceeded = true;
+          if (result.data.length) {
+            const reconciliation = await reconcileBoardComments(activeProject.id, result.data);
+            if (!isCurrentPoll()) return;
+            boardTimelineReconciliation = reconciliation.reconciliation;
+            boardTimelineReconciliationSucceeded = reconciliation.ok;
+          }
+          if (
+            !(await loadBoardTimeline(activeProject.id, { reconciliation: boardTimelineReconciliation }))
+            || !boardTimelineReconciliationSucceeded
+            || !isCurrentPoll()
+          ) return;
         }
         if (!result.data.length) return;
+        const [issueMetricsReady, sidebarCountsReady] = await Promise.all([
+          loadIssueMetrics(),
+          loadSidebarCounts()
+        ]);
+        if (!isCurrentPoll()) return;
         const mergedEvents = new Map<string, ActivityEvent>();
         [...events, ...result.data].forEach((event) => mergedEvents.set(event.id || String(event.cursor), event));
         events = [...mergedEvents.values()].sort((a, b) => b.cursor - a.cursor).slice(0, 100);
@@ -1571,12 +2831,24 @@
         const currentProjectId = activeProject?.id;
         const currentView = view;
         const boardChanged = result.data.some((event) => !event.project_id || event.project_id === currentProjectId);
+        const boardRefreshRequired = boardEventPageRequiresRefresh(boardChanged, result.next_cursor);
+        const boardTaskIdsBeforePoll = new Set(tasks.map((task) => task.id));
         const affectedTaskIds = new Set(result.data.map((event) => event.task_id).filter((id): id is string => Boolean(id)));
         const dependencyAffectedTaskIds = new Set(result.data.flatMap(dependencyEventTaskIds));
         dependencyAffectedTaskIds.forEach((taskId) => affectedTaskIds.add(taskId));
-        let reloadSucceeded = true;
+        const hierarchyAffectedTaskIds = new Set(result.data.flatMap(hierarchyEventTaskIds));
+        hierarchyAffectedTaskIds.forEach((taskId) => affectedTaskIds.add(taskId));
+        let reloadSucceeded = issueMetricsReady && sidebarCountsReady;
+        let drawerReconciliation: TimelineCommentReconciliation | undefined;
 
-        if (boardChanged && (currentView === 'board' || currentView === 'timeline')) reloadSucceeded = (await loadBoard()) && reloadSucceeded;
+        if (boardRefreshRequired && (currentView === 'board' || currentView === 'timeline')) {
+          reloadSucceeded = (await loadBoard()) && reloadSucceeded;
+          const missingAffectedTask = [...affectedTaskIds].some((taskId) => boardTaskIdsBeforePoll.has(taskId) && !tasks.some((task) => task.id === taskId));
+          if (missingAffectedTask) {
+            boardReconciliationNotice = 'A changed task is outside the loaded board page or current filters. Refresh or load more to find it.';
+            announce(boardReconciliationNotice);
+          }
+        }
         if (!isCurrentPoll()) return;
         if (boardChanged && currentView === 'issues') reloadSucceeded = (await loadIssues()) && reloadSucceeded;
         if (!isCurrentPoll()) return;
@@ -1588,6 +2860,7 @@
         if (drawerTask && affectedTaskIds.has(drawerTask.id)) {
           const drawerTaskId = drawerTask.id;
           const dependencyChanged = dependencyAffectedTaskIds.has(drawerTaskId);
+          const hierarchyChanged = hierarchyAffectedTaskIds.has(drawerTaskId);
           reloadSucceeded = (await refreshDrawerTask(drawerTaskId)) && reloadSucceeded;
           if (dependencyChanged && drawerTask?.id === drawerTaskId) {
             if (drawerView === 'details' && drawerDependencyPanel) {
@@ -1596,8 +2869,19 @@
               drawerDependencyRefresh += 1;
             }
           }
+          if (hierarchyChanged && drawerTask?.id === drawerTaskId) {
+            if (drawerView === 'details' && drawerHierarchyPanel) {
+              reloadSucceeded = (await drawerHierarchyPanel.refreshRelationships()) && reloadSucceeded;
+            } else {
+              drawerHierarchyRefresh += 1;
+            }
+          }
           if (drawerView === 'activity') {
-            reloadSucceeded = (await loadDrawerTimeline(drawerTaskId)) && reloadSucceeded;
+            const reconciliation = await reconcileDrawerComments(drawerTaskId, result.data);
+            if (!isCurrentPoll()) return;
+            drawerReconciliation = reconciliation.reconciliation;
+            reloadSucceeded = reconciliation.ok && reloadSucceeded;
+            reloadSucceeded = (await loadDrawerTimeline(drawerTaskId, { reconciliation: drawerReconciliation })) && reloadSucceeded;
           }
         }
         // Leave the cursor where it was when any dependent read failed. The
@@ -1672,7 +2956,7 @@
   }
 
   function navigate(path: string, replace = false) {
-    if (window.location.pathname !== path) {
+    if (`${window.location.pathname}${window.location.search}` !== path) {
       window.history[replace ? 'replaceState' : 'pushState']({}, '', path);
     }
   }
@@ -1680,13 +2964,20 @@
   async function selectProject(project: Project, push = true) {
     projectSwitchVersion += 1;
     boardTimelineRequest += 1;
-    if (drawerTask) closeDrawer();
+    if (drawerTask && !closeDrawer()) return;
+    clearAnnouncement();
+    boardMutationRequest += 1;
+    taskActionLoading = '';
     activeProjectSlug = project.slug;
     auditIdFromRoute = '';
     roadmapProjectId = undefined;
     columns = [];
     tasks = [];
     labels = [];
+    invalidateBoardColumnRequests(Object.keys(boardPages));
+    boardPages = {};
+    boardPartial = false;
+    boardReconciliationNotice = '';
     boardError = '';
     boardTimelineItems = [];
     boardTimelineNextCursor = '';
@@ -1716,6 +3007,9 @@
       roadmapProjectId = undefined;
       if (push) navigate('/roadmap');
       await loadRoadmap();
+    } else if (next === 'search') {
+      if (push) navigate(searchViewId ? `/search?view=${encodeURIComponent(searchViewId)}` : '/search');
+      await loadSearch();
     } else if (next === 'timeline' && activeProject) {
       roadmapProjectId = undefined;
       if (push) navigate(`/p/${encodeURIComponent(activeProject.slug)}/timeline`);
@@ -1731,7 +3025,7 @@
       if (!columns.length || !tasks.length) await loadBoard();
     } else if (next === 'settings') {
       if (push) navigate('/settings');
-      await Promise.all([loadAgents(), loadCodexAccount()]);
+      await Promise.all([loadAgents(), loadCodexAccount(), loadProjectAdmin()]);
     } else if (activeProject) {
       if (push) navigate(`/p/${encodeURIComponent(activeProject.slug)}`);
       await loadBoard();
@@ -1794,6 +3088,10 @@
       return;
     }
     if (/^\/my-work\/?$/.test(window.location.pathname)) void setView('my-work', false);
+    else if (/^\/search\/?$/.test(window.location.pathname)) {
+      applySearchRouteFilters(new URL(window.location.href).searchParams);
+      void setView('search', false);
+    }
     else if (/^\/issues\/?$/.test(window.location.pathname)) {
       applyIssueRouteFilters(new URL(window.location.href).searchParams);
       void setView('issues', false);
@@ -1828,6 +3126,23 @@
     });
   }
 
+  function requestConfirm(input: Omit<ConfirmRequest, 'resolve'>): Promise<boolean> {
+    rememberDialogFocus(input.fallbackSelector || '');
+    return new Promise((resolve) => {
+      confirmRequest = { ...input, resolve };
+    });
+  }
+
+  function settleConfirm(confirmed: boolean) {
+    const request = confirmRequest;
+    confirmRequest = null;
+    request?.resolve(confirmed);
+    // Cancellation can return to the original trigger immediately. A
+    // destructive confirmation must keep the focus record until its async
+    // mutation removes the trigger, so the caller can resolve the fallback.
+    if (!confirmed) restoreDialogFocus();
+  }
+
   function closeProjectModal() {
     showProjectModal = false;
     restoreDialogFocus();
@@ -1839,18 +3154,87 @@
     projectSwitcherOpen = false;
     commandQuery = '';
     commandIndex = 0;
+    commandIssuesError = '';
     if (!issueTasks.length) {
-      void listAllIssues({ limit: 200 }).then((result) => {
-        issueTasks = result.data;
-      }).catch(() => undefined);
+      void loadCommandIssues();
     }
+    commandSearchTasks = [];
+    commandSearchProjects = [];
+    commandSearchViews = [];
+    void searchCommand('');
     void tick().then(() => commandInput?.focus());
   }
 
+  function openTaskModalFromCommand(returnFocus: DialogReturnFocus | null) {
+    const opening = openTaskModal();
+    if (returnFocus) dialogReturnFocus = returnFocus;
+    return opening;
+  }
+
+  function openBugModalFromCommand(returnFocus: DialogReturnFocus | null) {
+    const opening = openBugModal();
+    if (returnFocus) dialogReturnFocus = returnFocus;
+    return opening;
+  }
+
+  async function loadCommandIssues() {
+    if (commandIssuesLoading) return;
+    const requestId = ++commandIssuesRequest;
+    commandIssuesLoading = true;
+    commandIssuesError = '';
+    try {
+      const result = await listAllIssues({ limit: 200 });
+      if (requestId !== commandIssuesRequest) return;
+      issueTasks = result.data;
+    } catch (error) {
+      if (requestId === commandIssuesRequest) {
+        commandIssuesError = friendlyError(error, 'Issue results could not be loaded.');
+      }
+    } finally {
+      if (requestId === commandIssuesRequest) commandIssuesLoading = false;
+    }
+  }
+
+  async function searchCommand(query: string) {
+    const requestId = ++commandSearchRequest;
+    commandSearchLoading = true;
+    try {
+      const result = await api.search({ q: query.trim() || undefined, limit: 50 });
+      if (requestId !== commandSearchRequest || !commandOpen) return;
+      commandSearchTasks = result.data || [];
+      commandSearchProjects = result.projects || [];
+      commandSearchViews = result.views || [];
+    } catch {
+      // The local project/view choices remain useful during a transient search
+      // failure; command search retries on the next query change.
+    } finally {
+      if (requestId === commandSearchRequest) commandSearchLoading = false;
+    }
+  }
+
+  function commandInputChanged() {
+    void searchCommand(commandQuery);
+  }
   function closeCommandPalette() {
+    closeCommandPaletteWithFocus(true);
+  }
+
+  function closeCommandPaletteWithoutFocus() {
+    closeCommandPaletteWithFocus(false);
+  }
+
+  function closeCommandPaletteWithFocus(restoreFocus: boolean) {
     if (!commandOpen) return;
     commandOpen = false;
-    restoreDialogFocus();
+    if (restoreFocus) restoreDialogFocus();
+  }
+
+  function handleProjectSwitcherPointerDown(event: PointerEvent) {
+    if (!projectSwitcherOpen) return;
+    const target = event.target;
+    if (!(target instanceof Node)) return;
+    if (projectSwitcherPopover?.contains(target) || projectPickerTrigger?.contains(target)) return;
+    projectSwitcherOpen = false;
   }
 
   function closeTaskModal() {
@@ -1874,12 +3258,42 @@
   }
 
   function handleKeydown(event: KeyboardEvent) {
+    // A confirmation is the top-most modal. Do not let global shortcuts or a
+    // second Escape handler act on the dialog's underlying drawer/view.
+    if (confirmRequest) {
+      if (event.key === 'Escape') {
+        event.preventDefault();
+        settleConfirm(false);
+      }
+      return;
+    }
     if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === 'k') {
       event.preventDefault();
       openCommandPalette();
+    } else if (
+      event.key === '/'
+      && !event.metaKey
+      && !event.ctrlKey
+      && !event.altKey
+      && !isEditableTarget(event.target)
+      && !commandOpen
+      && !projectSwitcherOpen
+      && !showProjectModal
+      && !showTaskModal
+      && !showBugModal
+      && !revealedToken
+      && !drawerTask
+    ) {
+      const searchInput = view === 'issues' ? issueSearchInput : view === 'board' ? boardSearchInput : null;
+      if (searchInput) {
+        event.preventDefault();
+        searchInput.focus();
+      }
     } else if (event.key === 'Escape') {
-      if (commandOpen) closeCommandPalette();
+      if (confirmRequest) settleConfirm(false);
+      else if (commandOpen) closeCommandPalette();
       else if (projectSwitcherOpen) projectSwitcherOpen = false;
+      else if (adminConfirmation) cancelAdminConfirmation();
       else if (showProjectModal) closeProjectModal();
       else if (showTaskModal) closeTaskModal();
       else if (showBugModal) closeBugModal();
@@ -1888,28 +3302,34 @@
     }
   }
 
-  function buildCommandChoices(query: string): CommandChoice[] {
-    const normalized = query.trim().toLowerCase();
-    const choices: CommandChoice[] = [
-      { kind: 'view', id: 'issues', view: 'issues', label: 'Issues', hint: 'Track and triage reported bugs' },
-      { kind: 'view', id: 'my-work', view: 'my-work', label: 'My work', hint: 'Assigned and claimed tasks' },
-      { kind: 'view', id: 'roadmap', view: 'roadmap', label: 'Roadmap overview', hint: 'Progress across every project' },
-      { kind: 'view', id: 'settings', view: 'settings', label: 'Settings', hint: 'Agents, tokens, and appearance' },
-      ...projects.map((project) => ({ kind: 'project' as const, id: project.id, project, label: project.name, hint: project.key })),
-      ...issueTasks.map((task) => ({ kind: 'issue' as const, id: task.id, task, label: task.title, hint: `${task.key} · ${task.bug?.severity?.toUpperCase() || 'Untriaged'}` }))
-    ];
-    return normalized
-      ? choices.filter((choice) => `${choice.label} ${choice.hint}`.toLowerCase().includes(normalized))
-      : choices;
-  }
-
   function commandKeydown(event: KeyboardEvent) {
-    if (event.key === 'ArrowDown') {
+    if (event.key === 'Tab') {
+      const source = event.currentTarget instanceof HTMLElement ? event.currentTarget : null;
+      const menu = source?.closest<HTMLElement>('.command-menu') || document.querySelector<HTMLElement>('.command-menu');
+      const focusable = menu ? focusableElements(menu) : [];
+      if (!focusable.length) return;
+      const active = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+      const index = active ? focusable.indexOf(active) : -1;
+      const nextIndex = event.shiftKey
+        ? index <= 0 ? focusable.length - 1 : index - 1
+        : index < 0 || index === focusable.length - 1 ? 0 : index + 1;
+      // Result buttons remain tabindex=-1 for the aria-activedescendant
+      // combobox pattern, so the command menu owns both Tab directions.
       event.preventDefault();
-      commandIndex = Math.min(commandIndex + 1, Math.max(0, commandChoices.length - 1));
+      event.stopPropagation();
+      focusable[nextIndex].focus();
+    } else if (event.key === 'ArrowDown') {
+      event.preventDefault();
+      commandIndex = nextCommandIndex(commandIndex, commandChoices.length, 1);
     } else if (event.key === 'ArrowUp') {
       event.preventDefault();
-      commandIndex = Math.max(commandIndex - 1, 0);
+      commandIndex = nextCommandIndex(commandIndex, commandChoices.length, -1);
+    } else if (event.key === 'Home') {
+      event.preventDefault();
+      commandIndex = commandChoices.length ? 0 : 0;
+    } else if (event.key === 'End') {
+      event.preventDefault();
+      commandIndex = Math.max(0, commandChoices.length - 1);
     } else if (event.key === 'Enter') {
       event.preventDefault();
       const choice = commandChoices[commandIndex];
@@ -1917,14 +3337,86 @@
     }
   }
 
-  async function selectCommand(choice: CommandChoice) {
-    if (choice.kind === 'project' && choice.project) await selectProject(choice.project);
-    else if (choice.kind === 'issue' && choice.task) {
-      commandOpen = false;
-      await setView('issues');
-      await openWorkTask(issueTasks.find((task) => task.id === choice.task?.id) || choice.task);
+  function commandOptionKeydown(event: KeyboardEvent, choice: CommandChoice) {
+    if (['Tab', 'ArrowDown', 'ArrowUp', 'Home', 'End'].includes(event.key)) {
+      commandKeydown(event);
+      return;
     }
-    else if (choice.view) await setView(choice.view);
+    if (event.key === 'Enter' || event.key === ' ') {
+      event.preventDefault();
+      void selectCommand(choice);
+    }
+  }
+
+  function commandChoiceIcon(choice: CommandChoice): string {
+    if (choice.kind === 'project') return projectInitials(choice.project);
+    if (choice.kind === 'saved-view') return '☆';
+    if (choice.kind === 'issue') return '⚠';
+    if (choice.kind === 'task') return '□';
+    if (choice.kind === 'action') {
+      return choice.action === 'new-task' ? '+' : choice.action === 'report-bug' ? '⚠' : '◐';
+    }
+    return choice.view === 'search' ? '⌕' : choice.view === 'issues' ? '⚠' : choice.view === 'my-work' ? '◌' : choice.view === 'roadmap' ? '◒' : '⚙';
+  }
+
+  async function selectCommand(choice: CommandChoice) {
+    if (choice.kind === 'action') {
+      const returnFocus = dialogReturnFocus;
+      if (choice.action === 'toggle-theme') {
+        closeCommandPalette();
+        toggleTheme();
+        return;
+      }
+      closeCommandPaletteWithoutFocus();
+      await tick();
+      if (choice.action === 'new-task') await openTaskModalFromCommand(returnFocus);
+      else await openBugModalFromCommand(returnFocus);
+    } else if (choice.kind === 'project') {
+      await selectProject(choice.project);
+    } else if (choice.kind === 'task') {
+      const returnFocus = dialogReturnFocus;
+      closeCommandPaletteWithoutFocus();
+      await tick();
+      await openWorkTask(choice.task, returnFocus);
+    } else if (choice.kind === 'issue') {
+      const returnFocus = dialogReturnFocus;
+      closeCommandPaletteWithoutFocus();
+      await tick();
+      await setView('issues');
+      await openWorkTask(issueTasks.find((task) => task.id === choice.task.id) || choice.task, returnFocus);
+    } else if (choice.kind === 'saved-view') {
+      closeCommandPaletteWithoutFocus();
+      await openSavedView(choice.savedView);
+    } else if (choice.kind === 'view') await setView(choice.view);
+  }
+
+  function applySearchRouteFilters(params: URLSearchParams) {
+    searchViewId = params.get('view') || '';
+    searchQuery = params.get('q') || '';
+    searchPriority = params.get('priority') || 'all';
+    searchState = params.get('state') || 'all';
+    const sort = params.get('sort') || '';
+    const [field, direction] = sort.split(':', 2);
+    const validFields = ['updated_at', 'created_at', 'due_at', 'title', 'key', 'priority', 'state', 'position'];
+    if (validFields.includes(field) && (direction === 'asc' || direction === 'desc')) {
+      searchSortField = field;
+      searchSortDirection = direction;
+    } else {
+      searchSortField = 'updated_at';
+      searchSortDirection = 'desc';
+    }
+  }
+
+  async function openSavedView(savedView: SavedView) {
+    commandOpen = false;
+    searchViewId = savedView.id;
+    searchQuery = typeof savedView.filters?.q === 'string' ? savedView.filters.q : '';
+    searchPriority = typeof savedView.filters?.priority === 'string' ? savedView.filters.priority : 'all';
+    searchState = typeof savedView.filters?.state === 'string' ? savedView.filters.state : 'all';
+    const firstSort = savedView.sort?.[0];
+    searchSortField = firstSort?.field || 'updated_at';
+    searchSortDirection = firstSort?.direction || 'desc';
+    await setView('search');
   }
 
   async function openProjectRoadmap() {
@@ -1998,7 +3490,7 @@
     }
   }
 
-  async function openTaskModal() {
+  async function openTaskModal(parentTaskId: string | null = null) {
     if (!projects.length) {
       openProjectModal();
       return;
@@ -2011,6 +3503,7 @@
     taskModalPriority = 'normal';
     taskModalDueDate = '';
     taskModalAssignee = '';
+    taskModalParentId = parentTaskId;
     taskModalIdea = '';
     taskModalSuggestion = null;
     taskModalAssisting = false;
@@ -2045,12 +3538,16 @@
     }
   }
 
-  function changeTaskModalProject() {
-    taskModalSuggestion = null;
-    taskModalNeedsCodex = false;
-    resetTaskModalSuggestionState();
-    void loadTaskModalColumns(taskModalProjectId);
-  }
+	function changeTaskModalProject() {
+		taskModalSuggestion = null;
+		taskModalNeedsCodex = false;
+		resetTaskModalSuggestionState();
+		// A parent is project-local. If the user changes the destination project,
+		// clear the inherited relationship instead of submitting a guaranteed
+		// cross-project mutation.
+		taskModalParentId = null;
+		void loadTaskModalColumns(taskModalProjectId);
+	}
 
   function resetTaskModalSuggestionState() {
     taskModalAppliedFields = { title: false, description: false, priority: false };
@@ -2147,18 +3644,20 @@
     taskModalCreating = true;
     taskModalError = '';
     try {
-      const projectTasks = taskModalProjectId === activeProject?.id ? tasks : [];
       const created = await api.createTask(taskModalProjectId, {
         title: taskModalTitle.trim(),
         description: taskModalDescription.trim(),
         priority: taskModalPriority,
         column_id: taskModalColumnId || undefined,
-        position: taskModalColumnId ? nextPosition(projectTasks, taskModalColumnId) : undefined,
         due_at: dateToIso(taskModalDueDate),
-        assignee: taskModalAssignee.trim() || null
+        assignee: taskModalAssignee.trim() || null,
+        parent_task_id: taskModalParentId
       });
       recordTaskMutation(created.id, 'upsert', ['board']);
-      if (taskModalProjectId === activeProject?.id) tasks = [...tasks, created];
+      if (taskModalProjectId === activeProject?.id) {
+        tasks = [...tasks, created];
+        syncBoardTaskPages(created);
+      }
       closeTaskModal();
       toast('success', `${created.key} created in ${taskModalProject?.name || 'your project'}.`);
     } catch (error) {
@@ -2217,14 +3716,12 @@
     try {
       const labelNames = bugModalLabels.split(',').map((value) => value.trim()).filter(Boolean);
       const labelIds = await resolveTaskLabels(bugModalProjectId, labelNames);
-      const projectTasks = bugModalProjectId === activeProject?.id ? tasks : [];
       const created = await api.createTask(bugModalProjectId, {
         title: bugModalTitle.trim(),
         description: bugModalDescription.trim(),
         kind: 'bug',
         priority: bugModalPriority,
         column_id: bugModalColumnId || undefined,
-        position: bugModalColumnId ? nextPosition(projectTasks, bugModalColumnId) : undefined,
         labels: labelIds,
         bug: {
           actual_behavior: bugModalActual.trim(),
@@ -2239,7 +3736,10 @@
       if (bugModalProjectId === activeProject?.id) createdScopes.push('board');
       recordTaskMutation(created.id, 'upsert', createdScopes);
       issueTasks = [...issueTasks.filter((task) => task.id !== created.id), created];
-      if (bugModalProjectId === activeProject?.id) tasks = [...tasks, created];
+      if (bugModalProjectId === activeProject?.id) {
+        tasks = [...tasks, created];
+        syncBoardTaskPages(created);
+      }
       closeBugModal();
       toast('success', `${created.key} reported.`);
     } catch (error) {
@@ -2284,6 +3784,7 @@
   function clearFilters() {
     filters = { query: '', priority: 'all', label: 'all', assignee: 'all', state: 'all', dependency: 'all' };
     boardWorkFilter = 'all';
+    scheduleBoardReload();
   }
 
   function clearIssueFilters() {
@@ -2342,43 +3843,373 @@
 
   function dragStart(event: DragEvent, task: Task) {
     draggingTaskId = task.id;
+    dragOverColumnId = '';
     event.dataTransfer?.setData('text/plain', task.id);
     if (event.dataTransfer) event.dataTransfer.effectAllowed = 'move';
   }
 
-  async function dropTask(event: DragEvent, destinationColumnId: string) {
+  function dragOverColumn(event: DragEvent, columnId: string) {
     event.preventDefault();
+    if (event.dataTransfer) event.dataTransfer.dropEffect = 'move';
+    if (draggingTaskId) dragOverColumnId = columnId;
+  }
+
+  function dragLeaveColumn(event: DragEvent, columnId: string) {
+    const target = event.currentTarget as HTMLElement;
+    const related = event.relatedTarget as Node | null;
+    if (!related || !target.contains(related)) {
+      if (dragOverColumnId === columnId) dragOverColumnId = '';
+    }
+  }
+
+  async function dropTask(event: DragEvent, destinationColumnId: string, boundaryTaskId = '') {
+    event.preventDefault();
+    event.stopPropagation();
     const taskId = event.dataTransfer?.getData('text/plain') || draggingTaskId;
     draggingTaskId = '';
+    dragOverColumnId = '';
     const task = tasks.find((item) => item.id === taskId);
-    if (!task || task.column_id === destinationColumnId || taskActionLoading) return;
-    await moveTask(task, destinationColumnId);
+    if (!task || taskActionLoading) return;
+    // A drop on the column body is an append-only column move. A drop on a
+    // rendered card is a precise reorder and therefore requires the physical
+    // position/ascending view; visual sorts cannot be translated safely to
+    // physical anchors without loading and sorting the complete column.
+    if (!boundaryTaskId) {
+      await moveTask(task, destinationColumnId);
+      return;
+    }
+    if (!physicalOrderingEnabled(currentBoardOrderingGate(destinationColumnId))) {
+      toast('info', visualOrderingUnavailableMessage());
+      return;
+    }
+    const destinationTasks = tasksByColumn[destinationColumnId] || [];
+    let targetIndex = destinationTasks.length;
+    if (boundaryTaskId) {
+      const boundaryIndex = destinationTasks.findIndex((item) => item.id === boundaryTaskId);
+      if (boundaryIndex >= 0) {
+        const target = event.currentTarget as HTMLElement | null;
+        const bounds = target?.getBoundingClientRect();
+        targetIndex = boundaryIndex + (bounds && event.clientY >= bounds.top + bounds.height / 2 ? 1 : 0);
+      }
+    }
+    await reorderTaskAt(task, destinationColumnId, targetIndex);
+  }
+
+  function endDrag() {
+    draggingTaskId = '';
+    dragOverColumnId = '';
+  }
+
+  function currentBoardOrderingGate(columnId: string): BoardOrderingGate {
+    return makeBoardOrderingGate({
+      criteriaTransition: boardCriteriaTransition,
+      filterTimerPending: boardFilterTimer !== undefined,
+      boardLoading,
+      metadataError: Boolean(boardError),
+      pageRefreshActive: Boolean(boardColumnRefreshes[columnId]),
+      page: boardPages[columnId],
+      filters,
+      workFilter: boardWorkFilter,
+      sort: boardSort,
+      order: boardOrder
+    });
+  }
+
+  function physicalOrderingEnabled(gate: BoardOrderingGate): boolean {
+    return boardOrderingUsesPhysicalOrder(gate);
+  }
+
+  function boardColumnPageComplete(gate: BoardOrderingGate): boolean {
+    return boardColumnHasKnownGlobalBounds(boardOrderingFiltersActive(gate), gate.page, {
+      metadataLoading: gate.boardLoading || gate.metadataError,
+      pageRefreshActive: gate.pageRefreshActive,
+      criteriaTransition: gate.criteriaTransition || gate.filterTimerPending
+    });
+  }
+
+  function globalOrderingUnavailableMessage(gate: BoardOrderingGate): string {
+    if (boardOrderingFiltersActive(gate)) {
+      return 'Home and End cannot move to a global first or last position while board filters are active. Clear filters; previous and next remain available for visible cards.';
+    }
+    if (gate.criteriaTransition || gate.filterTimerPending) {
+      return 'Home and End cannot move to a global first or last position while the board criteria are changing. Wait for the refreshed column; previous and next remain available for visible cards.';
+    }
+    if (gate.metadataError) {
+      return 'Home and End cannot move to a global first or last position because the board metadata refresh failed. Retry the board; previous and next remain available for loaded cards.';
+    }
+    if (gate.boardLoading || gate.pageRefreshActive || gate.page?.loading) {
+      return 'Home and End cannot move to a global first or last position while this board column is refreshing. Wait for the refreshed page; previous and next remain available for visible cards.';
+    }
+    if (gate.page?.error) {
+      return 'Home and End cannot move to a global first or last position because this column did not finish loading. Retry the column; previous and next remain available for loaded cards.';
+    }
+    if (gate.page?.nextCursor) {
+      return 'Home and End cannot move to a global first or last position until this column is fully loaded. Load more tasks; previous and next remain available for loaded cards.';
+    }
+    return 'Home and End cannot move to a global first or last position until this column is fully loaded.';
+  }
+
+  function announceGlobalOrderingUnavailable(gate: BoardOrderingGate) {
+    const message = globalOrderingUnavailableMessage(gate);
+    announce(message);
+    toast('info', message);
+  }
+
+  function visualOrderingUnavailableMessage(): string {
+    return 'Precise ordering is unavailable unless Sort tasks is Board order and Sort direction is Ascending.';
+  }
+
+  function orderingMoveUnavailableReason(
+    placement: 'first' | 'previous' | 'next' | 'last',
+    gate: BoardOrderingGate
+  ): string {
+    if (!physicalOrderingEnabled(gate)) return visualOrderingUnavailableMessage();
+    const refreshReason = boardOrderingRefreshReason(gate);
+    if (refreshReason) return refreshReason;
+    if ((placement === 'first' || placement === 'last') && !boardColumnPageComplete(gate)) {
+      return globalOrderingUnavailableMessage(gate);
+    }
+    return '';
+  }
+
+  function orderingMoveDisabled(
+    task: Task,
+    placement: 'first' | 'previous' | 'next' | 'last',
+    ordered: Task[],
+    gate: BoardOrderingGate,
+    taskBusy: boolean
+  ): boolean {
+    if (!physicalOrderingEnabled(gate) || taskBusy) return true;
+    const index = ordered.findIndex((item) => item.id === task.id);
+    if (index < 0) return true;
+    if (orderingMoveUnavailableReason(placement, gate)) return true;
+    return placement === 'first' || placement === 'previous'
+      ? index === 0
+      : index === ordered.length - 1;
+  }
+
+  function orderingMoveTitle(
+    placement: 'first' | 'previous' | 'next' | 'last',
+    gate: BoardOrderingGate
+  ): string {
+    return orderingMoveUnavailableReason(placement, gate) || `Move to ${placement} position`;
   }
 
   async function moveTask(task: Task, destinationColumnId: string) {
+    if (taskActionLoading) return;
+    if (task.column_id === destinationColumnId) return;
     const destination = columns.find((column) => column.id === destinationColumnId);
     const blockedReason = dependencyMoveExplanation(task, destination);
     if (blockedReason) {
       toast('info', blockedReason);
       return;
     }
+    const mutationContext = beginBoardMutation();
+    if (!mutationContext) return;
     taskActionLoading = task.id;
     try {
-      const updated = await api.patchTask(task.id, { column_id: destinationColumnId, position: nextPosition(tasks, destinationColumnId) }, task.version);
-      replaceTask(updated, true);
-      toast('success', `${task.key} moved to ${columns.find((column) => column.id === destinationColumnId)?.name || 'another column'}.`);
+      // Column moves remain append-only and are safe with cursor pagination:
+      // the guarded endpoint computes the destination tail under its writer
+      // lock, rather than treating the loaded page as the whole column. The
+      // legacy move route owns backlog/ready moves; precise last-placement
+      // handles active/blocked columns, while completed transitions retain
+      // the existing checklist/lifecycle patch path.
+      const updated = destination && ['backlog', 'ready'].includes(destination.semantic_state)
+        ? await api.moveTask(task.id, {
+            destination_column_id: destinationColumnId,
+            expected_source_column_id: task.column_id,
+            source: 'board'
+          }, task.version)
+        : destination?.semantic_state === 'completed'
+          ? await api.patchTask(task.id, { column_id: destinationColumnId }, task.version)
+          : await api.reorderTask(task.id, {
+              destination_column_id: destinationColumnId,
+              expected_source_column_id: task.column_id,
+              source: 'board',
+              reason: 'board column move',
+              placement: 'last',
+              ...(columns.find((column) => column.id === task.column_id)?.ordering_version ? { expected_source_ordering_version: columns.find((column) => column.id === task.column_id)?.ordering_version } : {}),
+              ...(destination?.ordering_version ? { expected_destination_ordering_version: destination.ordering_version } : {})
+            }, task.version);
+      if (!boardMutationIsCurrent(mutationContext)) return;
+      replaceTask(updated, true, false);
+      mutationContext.mutationRevision = taskMutationRevision;
+      const reloadSucceeded = await reloadBoardColumns([task.column_id, destinationColumnId]);
+      if (!boardMutationReloadCanAnnounce(boardMutationIsCurrent(mutationContext), reloadSucceeded)) return;
+      const destinationName = destination?.name || 'another column';
+      toast('success', `${task.key} moved to ${destinationName}.`, {
+        label: 'Undo',
+        run: () => undoTaskMove(task, updated)
+      });
+      announce(`${task.key} moved to ${destinationName}.`);
     } catch (error) {
-      toast('error', friendlyError(error, 'The task could not be moved. Refresh and try again.'));
+      if (!boardMutationIsCurrent(mutationContext)) return;
+      if (error instanceof ApiError && error.status === 409) {
+        if (error.details?.current) replaceTask(error.details.current as Task, false, false);
+        mutationContext.mutationRevision = taskMutationRevision;
+        const reloadSucceeded = await reloadBoardColumns([task.column_id, destinationColumnId]);
+        if (!boardMutationReloadCanAnnounce(boardMutationIsCurrent(mutationContext), reloadSucceeded)) return;
+        announce(`${task.key} changed elsewhere; the board was refreshed.`);
+        toast('info', `${task.key} changed elsewhere. The board was refreshed; review the new order.`);
+      } else {
+        toast('error', friendlyError(error, 'The task could not be moved. Refresh and try again.'));
+      }
     } finally {
-      taskActionLoading = '';
+      if (mutationContext.requestId === boardMutationRequest && taskActionLoading === task.id) taskActionLoading = '';
+    }
+  }
+
+  function normalizedOrderingIndex(task: Task, destinationColumnId: string, targetIndex: number): number {
+    const destinationTasks = tasksByColumn[destinationColumnId] || [];
+    const index = Math.max(0, Math.min(destinationTasks.length, Math.trunc(targetIndex)));
+    const currentIndex = destinationTasks.findIndex((item) => item.id === task.id);
+    return task.column_id === destinationColumnId && currentIndex >= 0 && currentIndex < index ? index - 1 : index;
+  }
+
+  async function reorderTaskAt(task: Task, destinationColumnId: string, targetIndex: number, spokenPlacement = '') {
+    if (taskActionLoading) return;
+    const destinationOrderingGate = currentBoardOrderingGate(destinationColumnId);
+    const sourceOrderingGate = task.column_id === destinationColumnId
+      ? destinationOrderingGate
+      : currentBoardOrderingGate(task.column_id);
+    if (!physicalOrderingEnabled(destinationOrderingGate)) {
+      toast('info', visualOrderingUnavailableMessage());
+      return;
+    }
+    const refreshReason = boardOrderingRefreshReason(destinationOrderingGate)
+      || boardOrderingRefreshReason(sourceOrderingGate);
+    if (refreshReason) {
+      toast('info', refreshReason);
+      return;
+    }
+    const destination = columns.find((column) => column.id === destinationColumnId);
+    const blockedReason = dependencyMoveExplanation(task, destination);
+    if (blockedReason) {
+      toast('info', blockedReason);
+      return;
+    }
+    const destinationTasks = tasksByColumn[destinationColumnId] || [];
+    const currentIndex = destinationTasks.findIndex((item) => item.id === task.id);
+    const index = normalizedOrderingIndex(task, destinationColumnId, targetIndex);
+    if (task.column_id === destinationColumnId && currentIndex >= 0 && currentIndex === index) return;
+    let anchors = taskOrderingAnchors(visibleTasks, destinationColumnId, index, task.id);
+    const visibleDestination = visibleTasks.filter((item) => item.column_id === destinationColumnId && item.id !== task.id);
+    const completeDestination = tasks.filter((item) => item.column_id === destinationColumnId && item.id !== task.id);
+    const globalBoundsUnknown = !boardColumnPageComplete(destinationOrderingGate);
+    // When a filter hides leading/trailing cards, anchor at the visible edge
+    // instead of claiming the global first/last position. If every
+    // destination card is hidden, wait for a visible anchor rather than
+    // disturbing an unknown part of the column.
+    if (globalBoundsUnknown && visibleDestination.length === 0) {
+      toast('info', 'Load or reveal a destination card before choosing its exact position.');
+      return;
+    } else if ((completeDestination.length > visibleDestination.length || globalBoundsUnknown) && anchors.placement === 'first' && visibleDestination[0]) {
+      anchors = { before_task_id: visibleDestination[0].id, placement: 'before' };
+    } else if ((completeDestination.length > visibleDestination.length || globalBoundsUnknown) && anchors.placement === 'last' && visibleDestination.length) {
+      anchors = { after_task_id: visibleDestination[visibleDestination.length - 1].id, placement: 'after' };
+    } else if (completeDestination.length > visibleDestination.length && visibleDestination.length === 0) {
+      anchors = { placement: 'last' };
+    }
+    const sourceColumn = columns.find((column) => column.id === task.column_id);
+    const sourceOrderingVersion = sourceColumn?.ordering_version;
+    const destinationOrderingVersion = destination?.ordering_version;
+    const mutationContext = beginBoardMutation();
+    if (!mutationContext) return;
+    taskActionLoading = task.id;
+    try {
+      const updated = await api.reorderTask(task.id, {
+        destination_column_id: destinationColumnId,
+        expected_source_column_id: task.column_id,
+        source: 'board',
+        reason: 'precise board reorder',
+        ...anchors,
+        ...(sourceOrderingVersion ? { expected_source_ordering_version: sourceOrderingVersion } : {}),
+        ...(destinationOrderingVersion ? { expected_destination_ordering_version: destinationOrderingVersion } : {})
+      }, task.version);
+      if (!boardMutationIsCurrent(mutationContext)) return;
+      replaceTask(updated, true, false);
+      mutationContext.mutationRevision = taskMutationRevision;
+      // Rebalancing updates neighbors without changing their task versions;
+      // refresh keeps the filtered board aligned with those authoritative keys.
+      const reloadSucceeded = await reloadBoardColumns([task.column_id, destinationColumnId]);
+      if (!boardMutationReloadCanAnnounce(boardMutationIsCurrent(mutationContext), reloadSucceeded)) return;
+      toast('success', `${task.key} moved to ${columns.find((column) => column.id === destinationColumnId)?.name || 'another column'}.`);
+      announce(`${task.key} moved to ${spokenPlacement || orderingPlacementLabel(anchors.placement)} position.`);
+    } catch (error) {
+      if (!boardMutationIsCurrent(mutationContext)) return;
+      if (error instanceof ApiError && error.status === 409) {
+        if (error.details?.current) replaceTask(error.details.current as Task, false, false);
+        mutationContext.mutationRevision = taskMutationRevision;
+        const reloadSucceeded = await reloadBoardColumns([task.column_id, destinationColumnId]);
+        if (!boardMutationReloadCanAnnounce(boardMutationIsCurrent(mutationContext), reloadSucceeded)) return;
+        announce(`${task.key} order changed elsewhere; the board was refreshed.`);
+        toast('info', `${task.key} changed elsewhere. The board was refreshed; review the new order.`);
+      } else {
+        toast('error', friendlyError(error, 'The task could not be moved. Refresh and try again.'));
+      }
+    } finally {
+      if (mutationContext.requestId === boardMutationRequest && taskActionLoading === task.id) taskActionLoading = '';
+    }
+  }
+
+  async function undoTaskMove(previous: Task, moved: Task) {
+    if (moved.project_id !== activeProject?.id || previous.project_id !== activeProject?.id) return;
+    const mutationContext = beginBoardMutation();
+    if (!mutationContext) return;
+    try {
+      const restored = await api.patchTask(
+        moved.id,
+        { column_id: previous.column_id, position: previous.position },
+        moved.version
+      );
+      if (!boardMutationIsCurrent(mutationContext)) return;
+      replaceTask(restored, true, false);
+      mutationContext.mutationRevision = taskMutationRevision;
+      const reloadSucceeded = await reloadBoardColumns([previous.column_id, restored.column_id]);
+      if (!boardMutationReloadCanAnnounce(boardMutationIsCurrent(mutationContext), reloadSucceeded)) return;
+      announce(`${restored.key} moved back to ${columns.find((column) => column.id === previous.column_id)?.name || 'its previous column'}.`);
+    } catch (error) {
+      if (!boardMutationIsCurrent(mutationContext)) return;
+      toast('error', friendlyError(error, 'Undo could not be applied because the task changed elsewhere.'));
     }
   }
 
   function keyboardMove(event: KeyboardEvent, task: Task) {
-    if (!(event.altKey && (event.key === 'ArrowLeft' || event.key === 'ArrowRight'))) return;
+    if (event.altKey && (event.key === 'ArrowLeft' || event.key === 'ArrowRight')) {
+      event.preventDefault();
+      const destination = adjacentTaskColumn(task, event.key === 'ArrowLeft' ? -1 : 1);
+      if (destination) void moveTask(task, destination.id);
+      return;
+    }
+    if (!event.altKey || !['ArrowUp', 'ArrowDown', 'Home', 'End'].includes(event.key)) return;
+    const ordered = tasksByColumn[task.column_id] || [];
+    const currentIndex = ordered.findIndex((item) => item.id === task.id);
+    if (currentIndex < 0) return;
+    const orderingGate = currentBoardOrderingGate(task.column_id);
+    if (!physicalOrderingEnabled(orderingGate)) {
+      event.preventDefault();
+      const message = visualOrderingUnavailableMessage();
+      announce(message);
+      toast('info', message);
+      return;
+    }
+    const refreshReason = boardOrderingRefreshReason(orderingGate);
+    if (refreshReason) {
+      event.preventDefault();
+      announce(refreshReason);
+      toast('info', refreshReason);
+      return;
+    }
+    if ((event.key === 'Home' || event.key === 'End') && !boardColumnPageComplete(orderingGate)) {
+      event.preventDefault();
+      announceGlobalOrderingUnavailable(orderingGate);
+      return;
+    }
+    const targetIndex = event.key === 'Home' ? 0 : event.key === 'End' ? ordered.length : event.key === 'ArrowUp' ? currentIndex - 1 : currentIndex + 2;
+    if (targetIndex < 0 || targetIndex > ordered.length || (event.key === 'ArrowUp' && currentIndex === 0) || (event.key === 'ArrowDown' && currentIndex === ordered.length - 1)) return;
     event.preventDefault();
-    const destination = adjacentTaskColumn(task, event.key === 'ArrowLeft' ? -1 : 1);
-    if (destination) void moveTask(task, destination.id);
+    const spokenPlacement = event.key === 'Home' ? 'first' : event.key === 'End' ? 'last' : event.key === 'ArrowUp' ? 'previous' : 'next';
+    void reorderTaskAt(task, task.column_id, targetIndex, spokenPlacement);
   }
 
   function adjacentTaskColumn(task: Task, offset: -1 | 1): Column | undefined {
@@ -2401,27 +4232,66 @@
     if (destination) void moveTask(task, destination.id);
   }
 
-  function replaceTask(updated: Task, localMutation = false) {
+  function orderingPlacementLabel(placement: string): string {
+    if (placement === 'first') return 'first';
+    if (placement === 'last') return 'last';
+    return 'the selected';
+  }
+
+  function orderingMoveLabel(
+    task: Task,
+    placement: 'first' | 'previous' | 'next' | 'last',
+    gate: BoardOrderingGate
+  ): string {
+    const reason = orderingMoveUnavailableReason(placement, gate);
+    return `Move ${task.key} to ${placement} position${reason ? `. Unavailable: ${reason}` : ''}`;
+  }
+
+  function moveTaskToPosition(task: Task, placement: 'first' | 'previous' | 'next' | 'last'): void {
+    const ordered = tasksByColumn[task.column_id] || [];
+    const index = ordered.findIndex((item) => item.id === task.id);
+    if (index < 0) return;
+    const targetIndex = placement === 'first' ? 0 : placement === 'last' ? ordered.length : placement === 'previous' ? index - 1 : index + 2;
+    void reorderTaskAt(task, task.column_id, targetIndex, placement);
+  }
+
+  function replaceTask(updated: Task, localMutation = false, announceChanges = true) {
     const issueHasTask = issueTasks.some((task) => task.id === updated.id);
     const existing = [
       drawerTask?.id === updated.id ? drawerTask : undefined,
       tasks.find((task) => task.id === updated.id),
       issueTasks.find((task) => task.id === updated.id),
-      myWorkTasks.find((task) => task.id === updated.id)
+      myWorkTasks.find((task) => task.id === updated.id),
+      searchTasks.find((task) => task.id === updated.id),
+      commandSearchTasks.find((task) => task.id === updated.id)
     ].filter((task): task is Task => Boolean(task));
     const previous = existing.reduce<Task | undefined>(
       (current, task) => !current || task.version > current.version ? task : current,
       undefined
     );
     const nextTask = mergeAuthoritativeTask(previous, updated);
-    tasks = tasks.some((task) => task.id === updated.id)
-      ? tasks.map((task) => (task.id === updated.id ? mergeAuthoritativeTask(task, nextTask) : task))
-      : [nextTask, ...tasks];
+    const belongsToActiveBoard = activeProject?.id === nextTask.project_id;
+    if (belongsToActiveBoard) {
+      tasks = tasks.some((task) => task.id === updated.id)
+        ? tasks.map((task) => (task.id === updated.id ? mergeAuthoritativeTask(task, nextTask) : task))
+        : [nextTask, ...tasks];
+    }
     if (issueTasks.some((task) => task.id === updated.id)) {
       issueTasks = issueTasks.map((task) => (task.id === updated.id ? mergeAuthoritativeTask(task, nextTask) : task));
+    } else if (nextTask.kind === 'bug') {
+      // A delete removes the task from the Issues cache. Restore must put a
+      // bug back into the currently rendered Issues view without waiting for
+      // the next 15-second event poll or a manual refresh.
+      issueTasks = [nextTask, ...issueTasks];
     }
     if (drawerTask?.id === updated.id) {
       drawerTask = mergeAuthoritativeTask(drawerTask, nextTask);
+    }
+    if (searchTasks.some((task) => task.id === updated.id)) {
+      searchTasks = searchTasks.map((task) => (task.id === updated.id ? mergeAuthoritativeTask(task, nextTask) : task));
+    }
+    if (commandSearchTasks.some((task) => task.id === updated.id)) {
+      commandSearchTasks = commandSearchTasks.map((task) => (task.id === updated.id ? mergeAuthoritativeTask(task, nextTask) : task));
     }
     const myWorkIndex = myWorkTasks.findIndex((task) => task.id === updated.id);
     const belongsToUser = actorId(nextTask.assignee) === user?.id
@@ -2430,8 +4300,9 @@
       ? !nextTask.completed_at && Boolean(nextTask.agent_work)
       : belongsToUser;
     if (localMutation) {
-      const mutations: Partial<Record<TaskMutationScope, TaskMutationKind>> = { board: 'upsert' };
-      if (issueHasTask) mutations.issues = 'upsert';
+      const mutations: Partial<Record<TaskMutationScope, TaskMutationKind>> = {};
+      if (belongsToActiveBoard) mutations.board = 'upsert';
+      if (issueHasTask || nextTask.kind === 'bug') mutations.issues = 'upsert';
       if (myWorkIndex >= 0 || keepInMyWork) {
         mutations[myWorkMutationScope()] = myWorkIndex >= 0 && !keepInMyWork ? 'remove' : 'upsert';
       }
@@ -2444,12 +4315,34 @@
     } else if (keepInMyWork) {
       myWorkTasks = [...myWorkTasks, nextTask];
     }
+    syncBoardTaskPages(nextTask, announceChanges);
     const previousTransition = previous ? workTransitionKey(previous) : '';
     const nextTransition = workTransitionKey(nextTask);
-    if (previousTransition && nextTransition && previousTransition !== nextTransition) {
+    if (announceChanges && previousTransition && nextTransition && previousTransition !== nextTransition) {
       const status = isWorkStale(nextTask) && workState(nextTask) !== 'waiting' ? 'stale' : workState(nextTask) || 'updated';
       announce(`${nextTask.key} is now ${status}${isActionNeeded(nextTask) ? ' · action needed' : ''}.`);
     }
+  }
+
+  function openQuickAdd(columnId: string, trigger: HTMLButtonElement) {
+    quickAddReturnFocus = trigger;
+    quickAddColumn = columnId;
+    void tick().then(() => {
+      if (quickAddColumn === columnId) quickAddInput?.focus();
+    });
+  }
+
+  function cancelQuickAdd() {
+    const columnId = quickAddColumn;
+    const previousTrigger = quickAddReturnFocus;
+    quickAddReturnFocus = null;
+    quickAddColumn = '';
+    void tick().then(() => {
+      const fallbackTrigger = Array.from(document.querySelectorAll<HTMLButtonElement>('[data-quick-add-trigger]'))
+        .find((trigger) => trigger.dataset.quickAddTrigger === columnId && isFocusableVisible(trigger));
+      const target = previousTrigger && isFocusableVisible(previousTrigger) ? previousTrigger : fallbackTrigger;
+      target?.focus();
+    });
   }
 
   async function submitQuickAdd(columnId: string) {
@@ -2460,13 +4353,14 @@
       const created = await api.createTask(activeProject.id, {
         title,
         column_id: columnId,
-        position: nextPosition(tasks, columnId),
         priority: 'normal'
       });
       recordTaskMutation(created.id, 'upsert', ['board']);
       tasks = [...tasks, created];
+      syncBoardTaskPages(created);
       quickAddTitle = { ...quickAddTitle, [columnId]: '' };
       quickAddColumn = '';
+      quickAddReturnFocus = null;
       toast('success', `${created.key} added to ${columns.find((column) => column.id === columnId)?.name || 'the board'}.`);
     } catch (error) {
       toast('error', friendlyError(error, 'The task could not be created.'));
@@ -2479,25 +4373,16 @@
     return filter === 'all' ? undefined : filter;
   }
 
-  function mergeDrawerTimeline(existing: TaskTimelineItem[], incoming: TaskTimelineItem[]): TaskTimelineItem[] {
-    const merged = new Map<string, TaskTimelineItem>();
-    [...existing, ...incoming].forEach((item) => merged.set(item.id, item));
-    return [...merged.values()].sort((a, b) => {
-      const aTime = Date.parse(a.created_at) || 0;
-      const bTime = Date.parse(b.created_at) || 0;
-      // Modern browsers guarantee stable Array#sort, so equal timestamps
-      // retain the API's deterministic cursor order.
-      return bTime - aTime;
-    });
-  }
-
   async function loadDrawerTimeline(
     taskId = drawerTask?.id,
-    options: { older?: boolean } = {}
+    options: { older?: boolean; reconciliation?: TimelineCommentReconciliation } = {}
   ): Promise<boolean> {
     if (!taskId) return false;
     const older = Boolean(options.older);
-    if (drawerTimelineLoading || drawerTimelineLoadingOlder) return true;
+    // A poll and an explicit "load older" action may overlap. Deduplicate the
+    // same lane and report false so the event poller keeps its cursor and will
+    // retry after the in-flight request settles.
+    if (drawerTimelineLoading || drawerTimelineLoadingOlder) return false;
     const requestId = ++drawerTimelineRequest;
     const requestedSession = sessionGeneration;
     const requestedFilter = drawerTimelineFilter;
@@ -2523,7 +4408,11 @@
         || drawerTimelineFilter !== requestedFilter
         || !user
       ) return false;
-      drawerTimelineItems = mergeDrawerTimeline(older ? previousItems : hadItems ? previousItems : [], result.data || []);
+      drawerTimelineItems = mergeTimelineItems(
+        older ? previousItems : hadItems ? previousItems : [],
+        result.data || [],
+        options.reconciliation
+      );
       // A refresh of a list that already includes older pages must retain the
       // existing keyset boundary; the first page's cursor would otherwise
       // replay rows the user has already loaded.
@@ -2543,6 +4432,18 @@
         else drawerTimelineLoading = false;
       }
     }
+  }
+
+  function refreshDrawerTimelineAfterMutation(taskId: string) {
+    if (drawerTask?.id !== taskId) return;
+    // A lifecycle mutation creates a timeline event immediately, while the
+    // normal event poll can take up to 15 seconds. Invalidate any in-flight
+    // read and fetch the newest page so Details → Activity is immediately
+    // truthful after claim/block/bug-lifecycle actions.
+    drawerTimelineRequest += 1;
+    drawerTimelineLoading = false;
+    drawerTimelineLoadingOlder = false;
+    void loadDrawerTimeline(taskId);
   }
 
   function setDrawerView(next: DrawerView) {
@@ -2587,9 +4488,15 @@
     if (drawerTimelineNextCursor) void loadDrawerTimeline(drawerTask?.id, { older: true });
   }
 
-  async function openTask(task: Task, intent: TaskRouteIntent = taskRouteIntent) {
+  async function openTask(
+    task: Task,
+    intent: TaskRouteIntent = taskRouteIntent,
+    options: OpenTaskOptions = {}
+  ) {
+    if (!options.skipDiscardGuard && !confirmDrawerTaskSwitch(task)) return;
     const requestId = ++taskDetailRequest;
     rememberDialogFocus('[data-task-trigger], .work-row');
+    if (options.returnFocus) dialogReturnFocus = options.returnFocus;
     taskRouteIntent = intent;
     drawerView = intent === 'activity' ? 'activity' : 'details';
     drawerTask = task;
@@ -2606,6 +4513,8 @@
     blockReasonDraft = '';
     blockReasonOpen = false;
     syncDraft(task);
+    drawerSavedTaskDraftFingerprint = drawerTaskDraftFingerprint();
+    drawerSavedActionDraftFingerprint = drawerActionDraftFingerprint();
     const openingDraft = drawerDraftFingerprint();
     drawerLoading = true;
     void loadDrawerTimeline(task.id);
@@ -2615,7 +4524,11 @@
       replaceTask(detail);
       // A fast editor can type before the detail request settles. Hydrate
       // only while every draft field still matches the opening snapshot.
-      if (drawerDraftFingerprint() === openingDraft) syncDraft(detail);
+      if (drawerDraftFingerprint() === openingDraft) {
+        syncDraft(detail);
+        drawerSavedTaskDraftFingerprint = drawerTaskDraftFingerprint();
+        drawerSavedActionDraftFingerprint = drawerActionDraftFingerprint();
+      }
     } catch (error) {
       if (requestId === taskDetailRequest && drawerTask?.id === task.id) {
         drawerError = friendlyError(error, 'Some task details could not be loaded.');
@@ -2641,9 +4554,8 @@
           || sessionGeneration !== requestedSession
           || !user
         ) return false;
-        // Authoritative event refreshes update the task model only. Draft fields
-        // remain untouched so a background pulse cannot erase in-progress edits.
         replaceTask(updated);
+        if (drawerTask?.id === taskId) syncCleanDrawerDrafts(drawerTask);
         return true;
       } catch {
         // The next event or the drawer's explicit refresh can retry this read.
@@ -2664,8 +4576,56 @@
     replaceTask(updated, true);
   }
 
+  function handleChecklistTaskUpdated(updated: Task) {
+    // Checklist mutations are task-versioned just like dependencies. Merge
+    // the authoritative task while preserving title/description drafts.
+    replaceTask(updated, true);
+  }
+
   async function refreshDependencyTask(): Promise<void> {
     if (drawerTask) await refreshDrawerTask(drawerTask.id);
+  }
+
+  function handleHierarchyTaskUpdated(updated: Task) {
+    // Parent-edge mutations update the child version and the parent's derived
+    // rollup. Merge the returned child without replacing unsaved drawer text.
+    replaceTask(updated, true);
+  }
+
+  async function refreshHierarchyTask(): Promise<void> {
+    if (drawerTask) await refreshDrawerTask(drawerTask.id);
+  }
+
+  async function openHierarchyTask(reference: TaskHierarchyReference): Promise<void> {
+    const sourceTask = drawerTask;
+    if (!sourceTask) return;
+    const project = projectForTask(sourceTask);
+    if (!project) {
+      drawerError = 'The linked task project could not be found.';
+      return;
+    }
+    try {
+      const related = await api.getTask(reference.id);
+      if (related.project_id !== sourceTask.project_id) {
+        throw new Error('Hierarchy tasks must belong to the same project.');
+      }
+      // Check the drawer's dirty state before changing the URL. Navigation is
+      // itself observable, so a cancelled discard must leave both the drawer
+      // and the current route untouched.
+      if (!confirmDrawerTaskSwitch(related)) return;
+      if (!taskRouteOrigin) taskRouteOrigin = `${window.location.pathname}${window.location.search}`;
+      navigate(taskDeepLink(project.slug, related.key, 'details'));
+      await openTask(related, 'details', { skipDiscardGuard: true });
+    } catch (error) {
+      if (drawerTask?.id === sourceTask.id) {
+        drawerError = friendlyError(error, 'The hierarchy task could not be opened.');
+      }
+    }
+  }
+
+  async function createChildTask(): Promise<void> {
+    if (!drawerTask) return;
+    await openTaskModal(drawerTask.id);
   }
 
   async function openDependencyTask(reference: TaskReference): Promise<void> {
@@ -2681,9 +4641,10 @@
       if (related.project_id !== sourceTask.project_id) {
         throw new Error('Linked tasks must belong to the same project.');
       }
+      if (!confirmDrawerTaskSwitch(related)) return;
       if (!taskRouteOrigin) taskRouteOrigin = `${window.location.pathname}${window.location.search}`;
       navigate(taskDeepLink(project.slug, related.key, 'details'));
-      await openTask(related, 'details');
+      await openTask(related, 'details', { skipDiscardGuard: true });
     } catch (error) {
       if (drawerTask?.id === sourceTask.id) {
         drawerError = friendlyError(error, 'The linked task could not be opened.');
@@ -2691,7 +4652,7 @@
     }
   }
 
-  function syncDraft(task: Task) {
+  function syncTaskDraft(task: Task) {
     draftTitle = task.title;
     draftDescription = task.description || '';
     draftPriority = task.priority;
@@ -2703,6 +4664,9 @@
     draftBugReproduction = task.bug?.reproduction_steps || '';
     draftBugEnvironment = task.bug?.environment || '';
     draftBugVersion = task.bug?.affected_version || '';
+  }
+
+  function syncActionDraft(task: Task) {
     triageSeverityDraft = task.bug?.severity || 's3';
     resolutionDraft = task.bug?.resolution || 'fixed';
     duplicateOfDraft = task.bug?.duplicate_of || '';
@@ -2710,8 +4674,31 @@
     reopenReasonDraft = '';
   }
 
-  function drawerDraftFingerprint(): string {
-    return JSON.stringify([
+  function syncDraft(task: Task, resetActionDrafts = true) {
+    syncTaskDraft(task);
+    if (resetActionDrafts) {
+      syncActionDraft(task);
+    }
+  }
+
+  function syncCleanDrawerDrafts(authoritative: Task) {
+    if (!drawerTask || drawerTask.id !== authoritative.id) return;
+    if (drawerTaskDraftFingerprint() === drawerSavedTaskDraftFingerprint) {
+      syncTaskDraft(authoritative);
+      drawerSavedTaskDraftFingerprint = drawerTaskDraftFingerprint();
+    }
+    if (drawerActionDraftFingerprint() === drawerSavedActionDraftFingerprint) {
+      syncActionDraft(authoritative);
+      drawerSavedActionDraftFingerprint = drawerActionDraftFingerprint();
+    }
+  }
+
+  function drawerTaskDraftFingerprint(): string {
+    return JSON.stringify(drawerTaskDraftValues());
+  }
+
+  function drawerTaskDraftValues(): unknown[] {
+    return [
       draftTitle,
       draftDescription,
       draftPriority,
@@ -2722,13 +4709,65 @@
       draftBugExpected,
       draftBugReproduction,
       draftBugEnvironment,
-      draftBugVersion,
+      draftBugVersion
+    ];
+  }
+
+  function drawerActionDraftFingerprint(): string {
+    return JSON.stringify(drawerActionDraftValues());
+  }
+
+  function drawerActionDraftValues(): unknown[] {
+    return [
       triageSeverityDraft,
       resolutionDraft,
       duplicateOfDraft,
       resolutionNoteDraft,
-      reopenReasonDraft
-    ]);
+      reopenReasonDraft,
+      blockReasonDraft,
+      commentBody
+    ];
+  }
+
+  function drawerDraftFingerprint(): string {
+    return JSON.stringify([...drawerTaskDraftValues(), ...drawerActionDraftValues()]);
+  }
+
+  function restoreTaskRouteOrigin(origin: string) {
+    const path = new URL(origin || '/', window.location.origin).pathname;
+    if (/^\/my-work\/?$/.test(path)) {
+      view = 'my-work';
+      void loadMyWork();
+    } else if (/^\/search\/?$/.test(path)) {
+      applySearchRouteFilters(new URL(origin, window.location.origin).searchParams);
+      view = 'search';
+      void loadSearch();
+    } else if (/^\/issues\/?$/.test(path)) {
+      applyIssueRouteFilters(new URL(origin, window.location.origin).searchParams);
+      view = 'issues';
+      void loadIssues();
+    } else if (/^\/roadmap\/?$/.test(path)) {
+      view = 'roadmap';
+      void loadRoadmap();
+    } else if (/^\/settings\/?$/.test(path)) {
+      view = 'settings';
+    } else if (/^\/p\/[^/]+\/timeline\/?$/.test(path)) {
+      // Board timeline task links use the same drawer as board, My Work, and
+      // search. Restore the timeline view after closing a task instead of
+      // falling through to the default board view.
+      const timelineSlug = path.match(/^\/p\/([^/]+)\/timeline\/?$/)?.[1];
+      const timelineProject = projects.find((project) => project.slug === decodeURIComponent(timelineSlug || ''));
+      if (timelineProject) {
+        activeProjectSlug = timelineProject.slug;
+        roadmapProjectId = undefined;
+        view = 'timeline';
+        if (boardTimelineProjectId !== timelineProject.id) void loadBoardTimeline(timelineProject.id, { reset: true });
+      } else {
+        view = 'timeline';
+      }
+    } else {
+      view = 'board';
+    }
   }
 
   function findProjectLabel(projectId: string, value: string): Label | undefined {
@@ -2796,12 +4835,24 @@
     return resolved.map((label) => label.id);
   }
 
-  function closeDrawer() {
+  function confirmDrawerDiscard(): boolean {
+    if (!drawerDraftDirty) return true;
+    return window.confirm('You have unsaved task details. Discard them and close the drawer?');
+  }
+
+  function confirmDrawerTaskSwitch(task: Task): boolean {
+    if (!drawerTask || drawerTask.id === task.id) return true;
+    return confirmDrawerDiscard();
+  }
+
+  function closeDrawer(force = false): boolean {
+    if (!force && !confirmDrawerDiscard()) return false;
     const routeOrigin = taskRouteOrigin;
     taskDetailRequest += 1;
     drawerLivenessRequest += 1;
     drawerTask = null;
     drawerDependencyPanel = null;
+    drawerHierarchyPanel = null;
     taskRouteOrigin = '';
     taskRouteIntent = 'details';
     drawerView = 'details';
@@ -2815,12 +4866,25 @@
     drawerTimelineLoadingOlder = false;
     blockReasonDraft = '';
     blockReasonOpen = false;
-    if (isTaskLocation()) navigate(routeOrigin || `/p/${encodeURIComponent(activeProjectSlug)}`);
+    drawerSavedTaskDraftFingerprint = '';
+    drawerSavedActionDraftFingerprint = '';
+    if (isTaskLocation()) {
+      const destination = routeOrigin || `/p/${encodeURIComponent(activeProjectSlug)}`;
+      navigate(destination);
+      restoreTaskRouteOrigin(destination);
+    }
     restoreDialogFocus();
+    return true;
   }
 
   async function deleteProjectLabel(label: Label) {
-    if (!window.confirm(`Delete ${label.name}? It will be removed from tasks.`)) return;
+    const confirmed = await requestConfirm({
+      title: `Delete label “${label.name}”?`,
+      message: `The ${label.name} label will be removed from tasks in this project.`,
+      confirmLabel: 'Delete label',
+      fallbackSelector: '#drawer-title'
+    });
+    if (!confirmed) return;
     labelDeleting = label.id;
     try {
       await api.deleteLabel(label.id);
@@ -2837,22 +4901,24 @@
           .filter((value) => value && value.toLowerCase() !== label.name.toLowerCase())
           .join(', ');
       }
+      restoreDialogFocus();
       toast('success', `${label.name} deleted.`);
     } catch (error) {
+      restoreDialogFocus();
       toast('error', friendlyError(error, 'The label could not be deleted.'));
     } finally {
       labelDeleting = '';
     }
   }
 
-  async function saveTask() {
+  async function saveTask(silent = false): Promise<boolean> {
     if (!drawerTask || !draftTitle.trim()) {
       drawerError = 'A task needs a title.';
-      return;
+      return false;
     }
     if (drawerTask.kind === 'bug' && !draftBugActual.trim()) {
       drawerError = 'A bug report needs actual behavior.';
-      return;
+      return false;
     }
     drawerSaving = true;
     drawerError = '';
@@ -2884,8 +4950,13 @@
         drawerTask.version
       );
       replaceTask(updated, true);
-      syncDraft(updated);
-      toast('success', `${updated.key} saved.`);
+      // Keep action-only drafts (triage severity, resolution note, block
+      // reason, and comments) intact. They are not part of the PATCH body and
+      // must remain dirty until their own action commits them.
+      syncDraft(updated, false);
+      drawerSavedTaskDraftFingerprint = drawerTaskDraftFingerprint();
+      if (!silent) toast('success', `${updated.key} saved.`);
+      return true;
     } catch (error) {
       drawerError = friendlyError(error, 'The task changed elsewhere. Refresh and try again.');
       if (error instanceof ApiError && error.details.current) {
@@ -2893,6 +4964,7 @@
         replaceTask(current);
         drawerError = 'This task changed in another session. Your draft was not overwritten.';
       }
+      return false;
     } finally {
       drawerSaving = false;
     }
@@ -2900,18 +4972,30 @@
 
   async function deleteDrawerTask() {
     const task = drawerTask;
-    if (!task || !window.confirm(`Delete ${task.key}? This cannot be undone.`)) return;
+    if (!task) return;
+    const confirmed = await requestConfirm({
+      title: `Delete ${task.key}?`,
+      message: `“${task.title}” will be removed from the board. You can undo this deletion from the next notification.`,
+      confirmLabel: 'Delete task',
+      fallbackSelector: '[data-destructive-focus-target]'
+    });
+    if (!confirmed) return;
     taskActionLoading = task.id;
     drawerError = '';
     try {
       await api.deleteTask(task.id, task.version);
       recordTaskMutation(task.id, 'remove', ['board', 'issues', 'my-work-live', 'my-work-assigned']);
       tasks = tasks.filter((item) => item.id !== task.id);
+      removeTaskFromBoardPages(task.id);
       issueTasks = issueTasks.filter((item) => item.id !== task.id);
       myWorkTasks = myWorkTasks.filter((item) => item.id !== task.id);
-      closeDrawer();
-      toast('success', `${task.key} deleted.`);
+      closeDrawer(true);
+      toast('success', `${task.key} deleted.`, {
+        label: 'Undo',
+        run: () => undoTaskDelete(task)
+      });
     } catch (error) {
+      restoreDialogFocus();
       drawerError = friendlyError(error, 'The task could not be deleted. Refresh and try again.');
       if (error instanceof ApiError && error.details.current) {
         replaceTask(error.details.current as Task);
@@ -2920,6 +5004,32 @@
     } finally {
       taskActionLoading = '';
     }
+  }
+
+  async function undoTaskDelete(deletedTask: Task) {
+    try {
+      // DELETE increments the task version atomically. The restore endpoint
+      // accepts that deleted version, so a concurrent edit or second restore
+      // fails closed with a conflict instead of resurrecting stale data.
+      const restored = await api.restoreTask(deletedTask.id, deletedTask.version + 1);
+      replaceTask(restored, true);
+      announce(`${restored.key} restored to the board.`);
+    } catch (error) {
+      toast('error', friendlyError(error, 'Undo could not be applied because the task changed elsewhere.'));
+    }
+  }
+
+  async function saveDraftBeforeImmediateAction(actionLabel: string): Promise<boolean> {
+    // Triage/resolve/reopen submit their own action-only drafts. Only task
+    // fields need a preceding PATCH; comments, block reasons, and lifecycle
+    // options must remain available to the action that consumes them.
+    if (drawerTaskDraftFingerprint() === drawerSavedTaskDraftFingerprint) return true;
+    const saved = await saveTask(true);
+    if (!saved) {
+      drawerError = drawerError || `Save your changes before ${actionLabel}.`;
+      return false;
+    }
+    return true;
   }
 
   async function runTaskAction(action: 'claim' | 'renew' | 'release' | 'complete' | 'block', reason = '') {
@@ -2937,7 +5047,7 @@
       return;
     }
     if (action === 'claim' && claimConflict(drawerTask, pulseClock)) {
-      drawerError = `Claim conflict: ${claimOwnerLabel(drawerTask)} holds this task until ${claimExpiryExact(drawerTask.claim_expires_at)} (${claimCountdown(drawerTask, pulseClock)}).`;
+      drawerError = `Claim conflict: ${claimOwnerLabel(drawerTask)} holds this task until ${claimExpiryExact(drawerTask.claim_expires_at)} (${claimCountdown(drawerTask, pulseClock)}). Current task version: v${drawerTask.version}.`;
       return;
     }
     taskActionLoading = drawerTask.id;
@@ -2954,6 +5064,7 @@
         blockReasonOpen = false;
         blockReasonDraft = '';
       }
+      refreshDrawerTimelineAfterMutation(updated.id);
       const actionLabel = action === 'renew' ? 'claim renewed' : action === 'release' ? 'released' : action === 'complete' ? 'completed' : `${action}ed`;
       toast('success', `${updated.key} ${actionLabel}.`);
     } catch (error) {
@@ -2981,6 +5092,8 @@
       drawerError = dependencyActionExplanation(drawerTask, 'start triage');
       return;
     }
+    if (!(await saveDraftBeforeImmediateAction('triaging this issue'))) return;
+    if (!drawerTask?.bug) return;
     taskActionLoading = drawerTask.id;
     drawerError = '';
     try {
@@ -2991,6 +5104,9 @@
       });
       replaceTask(updated, true);
       syncDraft(updated);
+      drawerSavedTaskDraftFingerprint = drawerTaskDraftFingerprint();
+      drawerSavedActionDraftFingerprint = drawerActionDraftFingerprint();
+      refreshDrawerTimelineAfterMutation(updated.id);
       toast('success', `${updated.key} triaged as ${triageSeverityDraft.toUpperCase()}.`);
     } catch (error) {
       drawerError = friendlyError(error, 'The issue could not be triaged. Refresh and try again.');
@@ -3010,6 +5126,8 @@
       drawerError = 'Add the task key or ID this issue duplicates.';
       return;
     }
+    if (!(await saveDraftBeforeImmediateAction('resolving this issue'))) return;
+    if (!drawerTask?.bug) return;
     taskActionLoading = drawerTask.id;
     drawerError = '';
     try {
@@ -3020,6 +5138,9 @@
       });
       replaceTask(updated, true);
       syncDraft(updated);
+      drawerSavedTaskDraftFingerprint = drawerTaskDraftFingerprint();
+      drawerSavedActionDraftFingerprint = drawerActionDraftFingerprint();
+      refreshDrawerTimelineAfterMutation(updated.id);
       toast('success', `${updated.key} resolved.`);
     } catch (error) {
       drawerError = friendlyError(error, 'The issue could not be resolved. Refresh and try again.');
@@ -3035,12 +5156,17 @@
       drawerError = 'Explain why this issue is being reopened.';
       return;
     }
+    if (!(await saveDraftBeforeImmediateAction('reopening this issue'))) return;
+    if (!drawerTask?.bug) return;
     taskActionLoading = drawerTask.id;
     drawerError = '';
     try {
       const updated = await api.reopenTask(drawerTask.id, drawerTask.version, { reason: reopenReasonDraft.trim() });
       replaceTask(updated, true);
       syncDraft(updated);
+      drawerSavedTaskDraftFingerprint = drawerTaskDraftFingerprint();
+      drawerSavedActionDraftFingerprint = drawerActionDraftFingerprint();
+      refreshDrawerTimelineAfterMutation(updated.id);
       toast('success', `${updated.key} reopened.`);
     } catch (error) {
       drawerError = friendlyError(error, 'The issue could not be reopened. Refresh and try again.');
@@ -3072,18 +5198,74 @@
     }
   }
 
+  async function editDrawerComment(comment: Comment, body: string): Promise<void> {
+    if (!drawerTask) return;
+    const taskId = drawerTask.id;
+    try {
+      const updatedComment = await api.patchComment(taskId, comment.id, body.trim(), comment.version ?? 1);
+      drawerTimelineRequest += 1;
+      drawerTimelineLoading = false;
+      drawerTimelineLoadingOlder = false;
+      await loadDrawerTimeline(taskId, { reconciliation: { updatedComments: new Map([[comment.id, updatedComment]]) } });
+      toast('success', 'Comment updated.');
+    } catch (error) {
+      const message = friendlyError(error, 'Your comment could not be updated.');
+      drawerError = message;
+      throw new Error(message);
+    }
+  }
+
+  async function deleteDrawerComment(comment: Comment): Promise<void> {
+    if (!drawerTask) return;
+    const taskId = drawerTask.id;
+    try {
+      await api.deleteComment(taskId, comment.id, comment.version ?? 1);
+      drawerTimelineRequest += 1;
+      drawerTimelineLoading = false;
+      drawerTimelineLoadingOlder = false;
+      await loadDrawerTimeline(taskId, { reconciliation: { deletedCommentIds: [comment.id] } });
+      toast('success', 'Comment deleted.');
+    } catch (error) {
+      const message = friendlyError(error, 'Your comment could not be deleted.');
+      drawerError = message;
+      throw new Error(message);
+    } finally {
+      restoreDialogFocus();
+    }
+  }
+
+  function confirmDrawerCommentDelete(comment: Comment): Promise<boolean> {
+    return requestConfirm({
+      title: 'Delete this comment?',
+      message: 'The comment body will be removed, while the deletion remains recorded in activity.',
+      confirmLabel: 'Delete comment',
+      fallbackSelector: '#drawer-activity-tab'
+    });
+  }
+
   function projectForTask(task: Task): Project | undefined {
     return projects.find((project) => project.id === task.project_id);
   }
 
-  async function openWorkTask(task: Task) {
+  async function openWorkTask(task: Task, returnFocus: DialogReturnFocus | null = null) {
+    if (!confirmDrawerTaskSwitch(task)) return;
     const project = projectForTask(task);
+    const origin = window.location.pathname + window.location.search;
+    taskRouteOrigin = isTaskLocation() ? (taskRouteOrigin || origin) : origin;
     if (project) {
       activeProjectSlug = project.slug;
       recentProjectIds = rememberProject(project.id, localStorage);
+      view = 'board';
+      navigate(taskDeepLink(project.slug, task.key, 'details'));
       await loadBoard();
+    } else {
+      // A task from a scoped/global search can outlive the project list cache.
+      // Keep the drawer usable; the detail response still supplies its task
+      // metadata and closeDrawer returns to the originating view.
+      // There is no stable project route to push until the project metadata is
+      // available, so leave the current URL untouched.
     }
-    await openTask(task);
+    await openTask(task, taskRouteIntent, { skipDiscardGuard: true, returnFocus });
   }
 
   async function openRoadmapTask(task: Task): Promise<void> {
@@ -3147,12 +5329,98 @@
     return actorName(task.claimed_by) || actorId(task.claimed_by) || 'another actor';
   }
 
-  function toast(kind: ToastKind, message: string) {
+  function toast(kind: ToastKind, message: string, action?: ToastAction) {
     const id = ++toastSequence;
-    toasts = [...toasts, { id, kind, message }];
+    toasts = [...toasts, { id, kind, message, action, ...toastAccessibility(kind) }];
     window.setTimeout(() => {
       toasts = toasts.filter((item) => item.id !== id);
     }, 4200);
+  }
+
+  async function runToastAction(item: ToastItem) {
+    if (!item.action || item.action.pending) return;
+    item.action.pending = true;
+    toasts = [...toasts];
+    try {
+      await item.action.run();
+    } finally {
+      toasts = toasts.filter((toastItem) => toastItem.id !== item.id);
+    }
+  }
+
+  async function exportActiveProject() {
+    if (!activeProject || portableBusy) return;
+    portableBusy = true;
+    try {
+      const archive = await api.exportProject(activeProject.id);
+      const blob = new Blob([JSON.stringify(archive, null, 2)], { type: 'application/json' });
+      const url = URL.createObjectURL(blob);
+      const anchor = document.createElement('a');
+      anchor.href = url;
+      anchor.download = `helm-${activeProject.slug}-portable-v${archive.version}.json`;
+      anchor.click();
+      URL.revokeObjectURL(url);
+      toast('success', `Exported ${activeProject.name}.`);
+    } catch (error) {
+      toast('error', friendlyError(error, 'The project could not be exported.'));
+    } finally {
+      portableBusy = false;
+    }
+  }
+
+  async function handlePortableFile(event: Event) {
+    const input = event.currentTarget as HTMLInputElement;
+    const file = input.files?.[0];
+    input.value = '';
+    if (!file || !activeProject || portableBusy) return;
+    portableBusy = true;
+    portablePreviewError = '';
+    let archive: PortableArchive | null = null;
+    try {
+      archive = JSON.parse(await file.text()) as PortableArchive;
+      const report = await api.importPortable(archive, { targetProject: activeProject.id, dryRun: true });
+      portablePreview = { archive, fileName: file.name, report };
+    } catch (error) {
+      const report = portableImportReportFromError(error);
+      if (archive && report) {
+        // Validation failures still carry the complete structured report in
+        // ApiError.details. Keep the review dialog open so users can inspect
+        // every issue and remap before choosing another file or cancelling.
+        portablePreview = { archive, fileName: file.name, report };
+      } else {
+        portablePreviewError = friendlyError(error, 'The portable archive could not be previewed.');
+        toast('error', portablePreviewError);
+      }
+    } finally {
+      portableBusy = false;
+    }
+  }
+
+  function closePortablePreview() {
+    portablePreview = null;
+    portablePreviewError = '';
+  }
+
+  async function confirmPortableImport() {
+    if (!portablePreview || !activeProject || portableBusy) return;
+    portableBusy = true;
+    try {
+      const report = await api.importPortable(portablePreview.archive, { targetProject: activeProject.id });
+      closePortablePreview();
+      const created = report.counts.tasks_created || 0;
+      toast('success', `Imported ${created} task${created === 1 ? '' : 's'} into ${activeProject.name}.`);
+      await loadProjects();
+      await loadBoard();
+    } catch (error) {
+      const report = portableImportReportFromError(error);
+      if (report) {
+        portablePreview = { ...portablePreview, report };
+      } else {
+        toast('error', friendlyError(error, 'The portable archive could not be imported.'));
+      }
+    } finally {
+      portableBusy = false;
+    }
   }
 
   function friendlyError(error: unknown, fallback: string): string {
@@ -3207,12 +5475,20 @@
   }
 
   async function deleteToken(token: ApiToken) {
-    if (!window.confirm(`Revoke ${token.name}? This cannot be undone.`)) return;
+    const confirmed = await requestConfirm({
+      title: `Revoke token “${token.name}”?`,
+      message: 'This token will stop working immediately and cannot be restored.',
+      confirmLabel: 'Revoke token',
+      fallbackSelector: '[data-destructive-focus-target]'
+    });
+    if (!confirmed) return;
     try {
       await api.deleteToken(token.id);
       agents = agents.map((agent) => ({ ...agent, tokens: agent.tokens?.filter((item) => item.id !== token.id) }));
+      restoreDialogFocus();
       toast('success', `${token.name} was revoked.`);
     } catch (error) {
+      restoreDialogFocus();
       toast('error', friendlyError(error, 'The token could not be revoked.'));
     }
   }
@@ -3300,8 +5576,8 @@
       </div>
 
       <nav class="nav-links" aria-label="Workspace views">
-        <button class:active={view === 'issues'} type="button" aria-label="Issues" on:click={() => setView('issues')}><span class="nav-icon">⚠</span><span>Issues</span>{#if issueTasks.length}<span class="nav-count">{issueTasks.length}</span>{/if}</button>
-        <button class:active={view === 'my-work'} type="button" aria-label="My work" on:click={() => setView('my-work')}><span class="nav-icon">◌</span><span>My work</span>{#if myWorkTasks.length}<span class="nav-count">{myWorkTasks.length}</span>{/if}</button>
+        <button class:active={view === 'issues'} type="button" aria-label="Issues" on:click={() => setView('issues')}><span class="nav-icon">⚠</span><span>Issues</span>{#if sidebarCountsStatus === 'known' && sidebarCounts}<span class="nav-count">{sidebarCounts.issues}</span>{/if}</button>
+        <button class:active={view === 'my-work'} type="button" aria-label="My work" on:click={() => setView('my-work')}><span class="nav-icon">◌</span><span>My work</span>{#if sidebarCountsStatus === 'known' && sidebarCounts}<span class="nav-count">{sidebarCounts.my_work}</span>{/if}</button>
         <button class:active={view === 'roadmap'} type="button" aria-label="Roadmap" on:click={() => setView('roadmap')}><span class="nav-icon">◒</span><span>Roadmap</span></button>
       </nav>
 
@@ -3353,12 +5629,12 @@
         <div class="mobile-brand"><HelmMark size={30} decorative className="brand-mark" /><strong>Helm</strong></div>
         <div class="topbar-project">
           {#if activeProject}
-            <button class="project-picker" type="button" data-project-picker-trigger aria-label={`Switch project, current ${activeProject.name}`} aria-expanded={projectSwitcherOpen} on:click={() => { projectSwitcherOpen = !projectSwitcherOpen; closeCommandPalette(); }}>
+            <button bind:this={projectPickerTrigger} class="project-picker" type="button" data-project-picker-trigger aria-label={`Switch project, current ${activeProject.name}`} aria-expanded={projectSwitcherOpen} on:click={() => { projectSwitcherOpen = !projectSwitcherOpen; closeCommandPalette(); }}>
               <span class="project-dot large" style={`--project-color: ${activeProject.color || '#6d5efc'}`}>{projectInitials(activeProject)}</span><span>{activeProject.name}</span><span class="picker-chevron">⌄</span>
             </button>
           {:else}<span class="muted">Workspace</span>{/if}
           {#if projectSwitcherOpen}
-            <div class="popover project-popover">
+            <div bind:this={projectSwitcherPopover} class="popover project-popover" data-project-switcher-popover>
               <div class="popover-search"><span aria-hidden="true">⌕</span><input bind:value={projectSwitcherQuery} placeholder="Find a project…" /></div>
               <div class="popover-list">
                 {#if filteredSwitcherProjects.length}
@@ -3372,7 +5648,7 @@
           {/if}
         </div>
         <div class="topbar-actions">
-          <button class="command-trigger" type="button" aria-label="Search anything" data-command-trigger on:click={openCommandPalette}><span>⌕</span><span class="command-trigger-label">Search anything</span><kbd>⌘ K</kbd></button>
+          <button class="command-trigger" type="button" aria-label="Search anything" data-command-trigger on:click={openCommandPalette}><span>⌕</span><span class="command-trigger-label">Search anything</span><kbd data-command-shortcut>{commandShortcut}</kbd></button>
           <button class="icon-button" type="button" aria-label={theme === 'dark' ? 'Use light theme' : 'Use dark theme'} on:click={toggleTheme}>{theme === 'dark' ? '☼' : '◐'}</button>
           <button class="avatar top-avatar" type="button" aria-label="Open settings" on:click={() => setView('settings')}>{projectInitials({ name: user.name, key: user.name })}</button>
         </div>
@@ -3386,12 +5662,12 @@
         <button class:active={view === 'settings'} type="button" aria-label="Settings" aria-current={view === 'settings' ? 'page' : undefined} on:click={() => setView('settings')}><span class="mobile-nav-icon" aria-hidden="true">⚙</span><span>Settings</span></button>
       </nav>
 
-      <main class="content" class:my-work-live={view === 'my-work' && myWorkView === 'live'}>
+      <main class="content" class:my-work-live={view === 'my-work' && myWorkView === 'live'} tabindex="-1" data-destructive-focus-target>
         {#if view === 'board' || view === 'timeline'}
           {#if activeProject}
             <section class="page-heading board-heading">
               <div><div class="breadcrumbs"><span>Workspace</span><span>/</span><span>{activeProject.key}</span></div><div class="heading-title-row"><span class="heading-project-dot" style={`--project-color: ${activeProject.color || '#6d5efc'}`}></span><h1>{activeProject.name}</h1><button class="icon-button favorite-heading" class:starred={activeProject.favorite} type="button" aria-label={activeProject.favorite ? 'Remove from favorites' : 'Add to favorites'} on:click={(event) => toggleFavorite(event, activeProject)}>{activeProject.favorite ? '★' : '☆'}</button></div><p>{view === 'timeline' ? 'Everything recently worked on in this board, in one chronological view.' : activeProject.description || 'A focused space for turning ideas into shipped work.'}</p></div>
-              <div class="heading-actions"><button class="button quiet-button" type="button" on:click={openProjectRoadmap}><span aria-hidden="true">◒</span> Progress</button><button class="button quiet-button" type="button" on:click={openProjectAudits}><span aria-hidden="true">◎</span> Audits</button><button class="button quiet-button" type="button" data-report-bug-trigger on:click={openBugModal}><span aria-hidden="true">⚠</span> Report bug</button><button class="button primary" type="button" data-task-modal-trigger on:click={openTaskModal}><span aria-hidden="true">＋</span> New task</button></div>
+              <div class="heading-actions"><button class="button quiet-button" type="button" disabled={portableBusy} on:click={() => void exportActiveProject()}><span aria-hidden="true">⇩</span> Export</button><button class="button quiet-button" type="button" disabled={portableBusy} on:click={() => portableFileInput?.click()}><span aria-hidden="true">⇧</span> Import</button><button class="button quiet-button" type="button" on:click={openProjectRoadmap}><span aria-hidden="true">◒</span> Progress</button><button class="button quiet-button" type="button" on:click={openProjectAudits}><span aria-hidden="true">◎</span> Audits</button><button class="button quiet-button" type="button" data-report-bug-trigger on:click={openBugModal}><span aria-hidden="true">⚠</span> Report bug</button><button class="button primary" type="button" data-task-modal-trigger on:click={() => openTaskModal()}><span aria-hidden="true">＋</span> New task</button><input class="sr-only" bind:this={portableFileInput} type="file" accept=".json,application/json" aria-label="Import a Helm portable archive" on:change={handlePortableFile} /></div>
             </section>
 
             <div class="board-view-switch" role="tablist" aria-label="Board view">
@@ -3401,46 +5677,80 @@
 
             {#if view === 'board'}
             <section class="board-toolbar" aria-label="Board filters">
-              <div class="filter-search"><span aria-hidden="true">⌕</span><input aria-label="Search tasks" bind:value={filters.query} placeholder="Search tasks…" /><kbd>/</kbd></div>
-              <div class="filter-group"><select aria-label="Filter by state" bind:value={filters.state}><option value="all">All states</option>{#each sortedColumns as column}<option value={column.semantic_state}>{stateLabels[column.semantic_state] || column.name}</option>{/each}</select><select aria-label="Filter by priority" bind:value={filters.priority}><option value="all">All priorities</option><option value="urgent">Urgent</option><option value="high">High</option><option value="normal">Normal</option><option value="low">Low</option></select><select aria-label="Filter by agent work" bind:value={boardWorkFilter}><option value="all">All agent work</option><option value="action-needed">Action needed{boardWorkCounts.actionNeeded ? ` · ${boardWorkCounts.actionNeeded}` : ''}</option><option value="missing">Missing{boardWorkCounts.missing ? ` · ${boardWorkCounts.missing}` : ''}</option><option value="stale">Stale{boardWorkCounts.stale ? ` · ${boardWorkCounts.stale}` : ''}</option><option value="waiting">Waiting{boardWorkCounts.waiting ? ` · ${boardWorkCounts.waiting}` : ''}</option><option value="handoff">Handoff{boardWorkCounts.handoff ? ` · ${boardWorkCounts.handoff}` : ''}</option><option value="working">Working{boardWorkCounts.working ? ` · ${boardWorkCounts.working}` : ''}</option><option value="verifying">Verifying{boardWorkCounts.verifying ? ` · ${boardWorkCounts.verifying}` : ''}</option></select><select aria-label="Filter by dependency readiness" bind:value={filters.dependency}><option value="all">All dependencies</option><option value="blocked">Waiting on prerequisites</option><option value="ready">Prerequisites finished</option></select><select aria-label="Filter by label" bind:value={filters.label}><option value="all">All labels</option>{#each labels as label}<option value={label.id}>{label.name}</option>{/each}</select><select aria-label="Filter by assignee" bind:value={filters.assignee}><option value="all">All assignees</option>{#each Array.from(new Map(tasks.map((task) => [actorId(task.assignee), task.assignee])).entries()).filter(([id]) => id) as pair}<option value={pair[0]}>{actorName(pair[1]) || pair[0]}</option>{/each}</select></div>
-              {#if filters.query || filters.priority !== 'all' || filters.label !== 'all' || filters.assignee !== 'all' || filters.state !== 'all' || filters.dependency !== 'all' || boardWorkFilter !== 'all'}<button class="clear-filters" type="button" on:click={clearFilters}>Clear filters</button>{/if}
-              <span class="toolbar-spacer"></span><span class="task-total">{visibleTasks.length} {visibleTasks.length === 1 ? 'task' : 'tasks'}</span><button class="icon-button" type="button" aria-label="Refresh board" on:click={loadBoard}>↻</button>
+              <div class="filter-search"><span aria-hidden="true">⌕</span><input bind:this={boardSearchInput} aria-label="Search tasks" bind:value={filters.query} on:input={scheduleBoardReload} placeholder="Search tasks…" /><kbd>/</kbd></div>
+              <div class="filter-group"><select aria-label="Filter by state" bind:value={filters.state} on:change={scheduleBoardReload}><option value="all">All states</option>{#each sortedColumns as column}<option value={column.semantic_state}>{stateLabels[column.semantic_state] || column.name}</option>{/each}</select><select aria-label="Filter by priority" bind:value={filters.priority} on:change={scheduleBoardReload}><option value="all">All priorities</option><option value="urgent">Urgent</option><option value="high">High</option><option value="normal">Normal</option><option value="low">Low</option></select><select aria-label="Filter by agent work" bind:value={boardWorkFilter} on:change={scheduleBoardReload}><option value="all">All agent work</option><option value="action-needed">Action needed{boardWorkCounts.actionNeeded ? ` · ${boardWorkCounts.actionNeeded}` : ''}</option><option value="missing">Missing{boardWorkCounts.missing ? ` · ${boardWorkCounts.missing}` : ''}</option><option value="stale">Stale{boardWorkCounts.stale ? ` · ${boardWorkCounts.stale}` : ''}</option><option value="waiting">Waiting{boardWorkCounts.waiting ? ` · ${boardWorkCounts.waiting}` : ''}</option><option value="handoff">Handoff{boardWorkCounts.handoff ? ` · ${boardWorkCounts.handoff}` : ''}</option><option value="working">Working{boardWorkCounts.working ? ` · ${boardWorkCounts.working}` : ''}</option><option value="verifying">Verifying{boardWorkCounts.verifying ? ` · ${boardWorkCounts.verifying}` : ''}</option></select><select aria-label="Filter by dependency readiness" bind:value={filters.dependency} on:change={scheduleBoardReload}><option value="all">All dependencies</option><option value="blocked">Waiting on prerequisites</option><option value="ready">Prerequisites finished</option></select><select aria-label="Filter by label" bind:value={filters.label} on:change={scheduleBoardReload}><option value="all">All labels</option>{#each labels as label}<option value={label.id}>{label.name}</option>{/each}</select><select aria-label="Filter by assignee" bind:value={filters.assignee} on:change={scheduleBoardReload}><option value="all">All assignees</option>{#each Array.from(new Map(tasks.map((task) => [actorId(task.assignee), task.assignee])).entries()).filter(([id]) => id) as pair}<option value={pair[0]}>{actorName(pair[1]) || pair[0]}</option>{/each}</select><select aria-label="Sort tasks" bind:value={boardSort} on:change={scheduleBoardReload}><option value="position">Board order</option><option value="number">Task number</option><option value="priority">Priority</option><option value="title">Title</option><option value="created_at">Created</option><option value="updated_at">Updated</option></select><select aria-label="Sort direction" bind:value={boardOrder} on:change={scheduleBoardReload}><option value="asc">Ascending</option><option value="desc">Descending</option></select></div>
+              {#if boardFiltersActive()}<button class="clear-filters" type="button" on:click={clearFilters}>Clear filters</button>{/if}
+              <span class="toolbar-spacer"></span><span class="task-total">{visibleTasks.length}{boardPartial ? '+' : ''} {visibleTasks.length === 1 ? 'task' : 'tasks'}</span><button class="icon-button" type="button" aria-label="Refresh board" on:click={() => loadBoard()}>↻</button>
             </section>
 
-            {#if boardError}<div class="inline-alert error content-alert" role="alert"><span>!</span><span>{boardError}</span><button class="text-button" type="button" on:click={loadBoard}>Retry</button></div>{/if}
+            {#if boardError}<div class="inline-alert error content-alert" role="alert"><span>!</span><span>{boardError}</span><button class="text-button" type="button" on:click={() => loadBoard()}>Retry</button></div>{/if}
+            {#if boardOffline}<div class="inline-alert warning content-alert" role="status"><span aria-hidden="true">⌁</span><span>You are offline. Showing the last loaded board pages.</span><button class="text-button" type="button" on:click={() => loadBoard()}>Retry</button></div>{/if}
+            {#if boardPartial}<div class="inline-alert warning content-alert" role="status"><span aria-hidden="true">…</span><span>Some board columns are only partially loaded.</span><button class="text-button" type="button" on:click={() => loadBoard()}>Retry columns</button></div>{/if}
+            {#if boardReconciliationNotice}<div class="inline-alert info content-alert" role="status"><span aria-hidden="true">↻</span><span>{boardReconciliationNotice}</span><button class="text-button" type="button" on:click={() => loadBoard()}>Refresh</button></div>{/if}
+            {#if boardLoading && tasks.length}<div class="board-loading-note" role="status" aria-live="polite">Loading the latest board pages…</div>{/if}
             {#if boardLoading && !tasks.length}
               <div class="board board-loading" aria-label="Loading board">{#each [1, 2, 3, 4] as item}<div class="column-skeleton"><div></div><div></div><div></div></div>{/each}</div>
             {:else if !sortedColumns.length}
-              <div class="empty-state board-empty"><div class="empty-icon">◇</div><h2>Your board is almost ready</h2><p>Columns will appear here once this project has been initialized.</p><button class="button primary" type="button" on:click={loadBoard}>Refresh board</button></div>
+              <div class="empty-state board-empty"><div class="empty-icon">◇</div><h2>Your board is almost ready</h2><p>Columns will appear here once this project has been initialized.</p><button class="button primary" type="button" on:click={() => loadBoard()}>Refresh board</button></div>
             {:else}
               <section class="board" aria-label={`${activeProject.name} board`}>
                 {#each sortedColumns as column}
-                  <article class="board-column" on:dragover|preventDefault={(event) => { if (event.dataTransfer) event.dataTransfer.dropEffect = 'move'; }} on:drop={(event) => dropTask(event, column.id)}>
-                    <header class="column-header"><div class="column-name"><span class="column-dot" style={`--column-color: ${columnColor(column)}`}></span><h2>{column.name}</h2><span class="column-count">{tasksByColumn[column.id].length}</span></div></header>
+                {@const orderingGate = makeBoardOrderingGate({
+                  criteriaTransition: boardCriteriaTransition,
+                  filterTimerPending: boardFilterTimer !== undefined,
+                  boardLoading,
+                  metadataError: Boolean(boardError),
+                  pageRefreshActive: Boolean(boardColumnRefreshes[column.id]),
+                  page: boardPages[column.id],
+                  filters,
+                  workFilter: boardWorkFilter,
+                  sort: boardSort,
+                  order: boardOrder
+                })}
+                {@const orderedColumnTasks = tasksByColumn[column.id] || []}
+                <article
+                  class="board-column"
+                  class:drop-target={dragOverColumnId === column.id}
+                  aria-label={`${column.name} column`}
+                  aria-dropeffect="move"
+                  on:dragover={(event) => dragOverColumn(event, column.id)}
+                  on:dragleave={(event) => dragLeaveColumn(event, column.id)}
+                  on:drop={(event) => dropTask(event, column.id)}
+                >
+                    <header class="column-header"><div class="column-name"><span class="column-dot" style={`--column-color: ${columnColor(column)}`}></span><h2>{column.name}</h2><span class="column-count">{tasksByColumn[column.id].length}{boardPages[column.id]?.nextCursor ? '+' : ''}</span></div></header>
                     <div class="column-progress"><span style={`width: ${Math.min(100, tasksByColumn[column.id].length * 4)}%; --column-color: ${columnColor(column)}`}></span></div>
                     <div class="column-cards">
+                      {#if dragOverColumnId === column.id && draggingTaskId && tasksByColumn[column.id].some((task) => task.id === draggingTaskId) === false}
+                        <div class="drop-placeholder" role="status">Drop task in {column.name}</div>
+                      {/if}
                       {#if !tasksByColumn[column.id].length}
-                        <div class="column-empty"><span>Nothing here yet</span><button class="text-button" type="button" on:click={() => quickAddColumn = column.id}>Add the first task</button></div>
+                        <div class="column-empty">{#if boardPages[column.id]?.error}<span>{boardPages[column.id].error}</span><button class="text-button" type="button" on:click={() => loadBoardColumn(column.id, { reset: true })}>Retry</button>{:else if boardFiltersActive()}<span>No tasks match the current filters.</span><button class="text-button" type="button" on:click={clearFilters}>Clear filters</button>{:else}<span>Nothing here yet</span><button class="text-button quick-add-trigger" type="button" data-quick-add-trigger={column.id} on:click={(event) => openQuickAdd(column.id, event.currentTarget as HTMLButtonElement)}>Add the first task</button>{/if}</div>
                       {:else}
-                        {#each tasksByColumn[column.id] as task (task.id)}
-                          <article class="task-card" class:dependency-blocked={dependencyBlocked(task)} class:dragging={draggingTaskId === task.id} draggable="true" on:dragstart={(event) => dragStart(event, task)} on:dragend={() => draggingTaskId = ''}>
-                            <button class="task-main" type="button" data-task-trigger on:click={() => openTask(task)} on:keydown={(event) => keyboardMove(event, task)}>
+                        {#each tasksByColumn[column.id].slice(0, boardRenderLimit) as task (task.id)}
+                          <article class="task-card" class:dependency-blocked={dependencyBlocked(task)} class:dragging={draggingTaskId === task.id} on:dragend={endDrag} on:dragover|preventDefault={(event) => { if (event.dataTransfer) event.dataTransfer.dropEffect = 'move'; }} on:drop={(event) => dropTask(event, column.id, task.id)}>
+                            <button class="task-drag-handle" type="button" draggable="true" aria-label={`Drag ${task.key}, ${task.title}`} title="Drag task" on:click|stopPropagation={() => undefined} on:dragstart|stopPropagation={(event) => dragStart(event, task)}>⠿</button>
+                            <button class="task-main" type="button" data-task-trigger aria-keyshortcuts="Alt+ArrowUp Alt+ArrowDown Alt+Home Alt+End" on:click={() => openTask(task)} on:keydown={(event) => keyboardMove(event, task)}>
                               <span class="task-card-top"><span class="task-key">{task.key}</span>{#if task.kind === 'bug'}<span class="issue-kind-badge">Bug</span>{#if task.bug?.severity}<span class="severity-badge">{task.bug.severity.toUpperCase()}</span>{/if}{/if}<span class={`priority-dot priority-${task.priority}`} title={`${priorityLabels[task.priority]} priority`}></span>{#if task.claimed_by}<span class="claim-mini" title={`Claimed by ${actorName(task.claimed_by) || 'another actor'}`}>●</span>{/if}</span>
                               <strong class="task-title">{task.title}</strong>
                               {#if task.description}<span class="task-excerpt">{task.description.replace(/[#*_`]/g, '').slice(0, 92)}{task.description.length > 92 ? '…' : ''}</span>{/if}
-                              {#if task.labels?.length}<span class="task-labels">{#each task.labels.slice(0, 3) as label}<span class="label-chip" style={`--label-color: ${label.color || '#8b7cf6'}`}>{label.name}</span>{/each}{#if task.labels.length > 3}<span class="label-more">+{task.labels.length - 3}</span>{/if}</span>{/if}
-                              <TaskDependencyStatus {task} />
+	                              {#if task.labels?.length}<span class="task-labels">{#each task.labels.slice(0, 3) as label}<span class="label-chip" style={`--label-color: ${label.color || '#8b7cf6'}`}>{label.name}</span>{/each}{#if task.labels.length > 3}<span class="label-more">+{task.labels.length - 3}</span>{/if}</span>{/if}
+	                              <TaskDependencyStatus {task} />
+	                              {#if task.checklist_summary?.total}<span class="checklist-card-progress" title={`${task.checklist_summary.completed} of ${task.checklist_summary.total} checklist items complete`} aria-label={`${task.checklist_summary.completed} of ${task.checklist_summary.total} checklist items complete`}>☑ {task.checklist_summary.completed}/{task.checklist_summary.total}</span>{/if}
+	                              {#if hierarchyBadgeLabel(task)}<span class="hierarchy-badge" aria-label={`Hierarchy: ${hierarchyBadgeLabel(task)}`}><span aria-hidden="true">⌘</span>{hierarchyBadgeLabel(task)}</span>{/if}
                             </button>
                             {#if showAgentPulse(task)}<AgentPulse {task} now={pulseClock} actorLabel={agentLabelForTask(task)} />{/if}
-                            <div class="task-card-footer"><span class={`due-date ${taskDueClass(task)}`}>{#if task.due_at}<span aria-hidden="true">◷</span>{formatDate(task.due_at)}{/if}</span><span class="card-footer-spacer"></span>{#if task.assignee}<span class="mini-avatar" title={`Assigned to ${actorName(task.assignee) || actorId(task.assignee)}`}>{(actorName(task.assignee) || actorId(task.assignee)).slice(0, 1).toUpperCase()}</span>{/if}{#if task.comment_count}<span class="comment-count" title={`${task.comment_count} comments`}>◌ {task.comment_count}</span>{/if}<button class="icon-button card-move" type="button" aria-label={cardMoveLabel(task, -1)} title={cardMoveReason(task, -1) || undefined} disabled={!adjacentTaskColumn(task, -1) || Boolean(cardMoveReason(task, -1)) || taskActionLoading === task.id} on:click={() => moveTaskBy(task, -1)}>←</button><button class="icon-button card-move" type="button" aria-label={cardMoveLabel(task, 1)} title={cardMoveReason(task, 1) || undefined} disabled={!adjacentTaskColumn(task, 1) || Boolean(cardMoveReason(task, 1)) || taskActionLoading === task.id} on:click={() => moveTaskBy(task, 1)}>→</button></div>
+                            <div class="task-card-footer"><span class={`due-date ${taskDueClass(task)}`}>{#if task.due_at}<span aria-hidden="true">◷</span>{formatDate(task.due_at)}{/if}</span><span class="card-footer-spacer"></span>{#if task.assignee}<span class="mini-avatar" title={`Assigned to ${actorName(task.assignee) || actorId(task.assignee)}`}>{(actorName(task.assignee) || actorId(task.assignee)).slice(0, 1).toUpperCase()}</span>{/if}{#if task.comment_count}<span class="comment-count" title={`${task.comment_count} comments`}>◌ {task.comment_count}</span>{/if}<button class="icon-button card-move order-move" type="button" aria-label={orderingMoveLabel(task, 'first', orderingGate)} title={orderingMoveTitle('first', orderingGate)} disabled={orderingMoveDisabled(task, 'first', orderedColumnTasks, orderingGate, taskActionLoading === task.id)} on:click={() => moveTaskToPosition(task, 'first')}>⇈</button><button class="icon-button card-move order-move" type="button" aria-label={orderingMoveLabel(task, 'previous', orderingGate)} title={orderingMoveTitle('previous', orderingGate)} disabled={orderingMoveDisabled(task, 'previous', orderedColumnTasks, orderingGate, taskActionLoading === task.id)} on:click={() => moveTaskToPosition(task, 'previous')}>↑</button><button class="icon-button card-move order-move" type="button" aria-label={orderingMoveLabel(task, 'next', orderingGate)} title={orderingMoveTitle('next', orderingGate)} disabled={orderingMoveDisabled(task, 'next', orderedColumnTasks, orderingGate, taskActionLoading === task.id)} on:click={() => moveTaskToPosition(task, 'next')}>↓</button><button class="icon-button card-move order-move" type="button" aria-label={orderingMoveLabel(task, 'last', orderingGate)} title={orderingMoveTitle('last', orderingGate)} disabled={orderingMoveDisabled(task, 'last', orderedColumnTasks, orderingGate, taskActionLoading === task.id)} on:click={() => moveTaskToPosition(task, 'last')}>⇊</button><button class="icon-button card-move" type="button" aria-label={cardMoveLabel(task, -1)} title={cardMoveReason(task, -1) || undefined} disabled={!adjacentTaskColumn(task, -1) || Boolean(cardMoveReason(task, -1)) || taskActionLoading === task.id} on:click={() => moveTaskBy(task, -1)}>←</button><button class="icon-button card-move" type="button" aria-label={cardMoveLabel(task, 1)} title={cardMoveReason(task, 1) || undefined} disabled={!adjacentTaskColumn(task, 1) || Boolean(cardMoveReason(task, 1)) || taskActionLoading === task.id} on:click={() => moveTaskBy(task, 1)}>→</button></div>
                           </article>
                         {/each}
+                        {#if tasksByColumn[column.id].length > boardRenderLimit}<div class="column-empty"><span>Showing the first {boardRenderLimit} loaded tasks.</span></div>{/if}
                       {/if}
+                      {#if boardPages[column.id]?.nextCursor}<button class="load-more-tasks" type="button" on:click={() => loadMoreBoardColumn(column.id)} disabled={boardPages[column.id].loading}>{boardPages[column.id].loading ? 'Loading…' : 'Load more tasks'}</button>{/if}
+                      {#if boardPages[column.id]?.error && tasksByColumn[column.id].length}<div class="column-page-error" role="alert"><span>{boardPages[column.id].error}</span><button class="text-button" type="button" on:click={() => loadBoardColumn(column.id, { reset: false })}>Retry</button></div>{/if}
                     </div>
                     <div class="quick-add-wrap">
                       {#if quickAddColumn === column.id}
-                        <form class="quick-add-form" on:submit|preventDefault={() => submitQuickAdd(column.id)}><input bind:value={quickAddTitle[column.id]} aria-label={`New task in ${column.name}`} placeholder="What needs doing?" /><div><button class="text-button" type="button" on:click={() => quickAddColumn = ''}>Cancel</button><button class="button primary compact-button" type="submit" disabled={!quickAddTitle[column.id]?.trim() || taskActionLoading === `create-${column.id}`}>Add task</button></div></form>
-                      {:else}<button class="quick-add-trigger" type="button" on:click={() => quickAddColumn = column.id}><span>＋</span> Add task</button>{/if}
+                        <form class="quick-add-form" on:submit|preventDefault={() => submitQuickAdd(column.id)}><input bind:this={quickAddInput} bind:value={quickAddTitle[column.id]} aria-label={`New task in ${column.name}`} placeholder="What needs doing?" /><div><button class="text-button" type="button" on:click={cancelQuickAdd}>Cancel</button><button class="button primary compact-button" type="submit" disabled={!quickAddTitle[column.id]?.trim() || taskActionLoading === `create-${column.id}`}>Add task</button></div></form>
+                      {:else}<button class="quick-add-trigger" type="button" data-quick-add-trigger={column.id} on:click={(event) => openQuickAdd(column.id, event.currentTarget as HTMLButtonElement)}><span>＋</span> Add task</button>{/if}
                     </div>
                   </article>
                 {/each}
@@ -3480,6 +5790,27 @@
           {:else}
             <div class="empty-state welcome-state"><div class="welcome-orbit"><span>R</span></div><span class="eyebrow">Choose a project</span><h1>Audits live with a board.</h1><p>Select a project first, then review its captured board audits.</p><button class="button primary button-large" type="button" on:click={() => setView('board')}>Browse projects</button></div>
           {/if}
+        {:else if view === 'search'}
+          <section class="page-heading search-heading">
+            <div><div class="breadcrumbs"><span>Workspace</span><span>/</span><span>Search</span>{#if searchView}<span>/</span><span>{searchView.name}</span>{/if}</div><h1>{searchView ? searchView.name : 'Search everything'}</h1><p>Find tasks across every project you can access, then open the board context in one click.</p></div>
+            <div class="heading-actions"><button class="button quiet-button" type="button" on:click={() => { searchViewId = ''; navigate('/search'); void loadSearch(); }}>New search</button><button class="button quiet-button" type="button" on:click={() => loadSearch()}>↻ Refresh</button></div>
+          </section>
+          <section class="search-workspace" aria-label="Global task search">
+              <form class="search-toolbar" on:submit|preventDefault={runSearch}>
+                <div class="filter-search"><span aria-hidden="true">⌕</span><input aria-label="Search all tasks" bind:value={searchQuery} placeholder="Search tasks, keys, labels, projects…" /></div>
+              <select aria-label="Filter search by state" bind:value={searchState} on:change={runSearch}><option value="all">All states</option>{#each Object.entries(stateLabels) as pair}<option value={pair[0]}>{pair[1]}</option>{/each}</select>
+              <select aria-label="Filter search by priority" bind:value={searchPriority} on:change={runSearch}><option value="all">All priorities</option>{#each Object.entries(priorityLabels) as pair}<option value={pair[0]}>{pair[1]}</option>{/each}</select>
+              <select aria-label="Sort search results" bind:value={searchSortField} on:change={runSearch}><option value="updated_at">Recently updated</option><option value="due_at">Due date</option><option value="priority">Priority</option><option value="title">Title</option><option value="key">Task key</option></select>
+              <select aria-label="Sort search direction" bind:value={searchSortDirection} on:change={runSearch}><option value="desc">Descending</option><option value="asc">Ascending</option></select>
+              <button class="button primary" type="submit">Search</button>
+            </form>
+            <section class="saved-view-panel" aria-label="Saved views">
+              <div class="saved-view-heading"><div><span class="eyebrow">Reusable filters</span><h2>Saved views</h2><p>Save this search and share it with your workspace.</p></div><div class="saved-view-save"><input aria-label="Saved view name" bind:value={savedViewName} placeholder="Name this view" /><label class="check-label"><input type="checkbox" bind:checked={savedViewShared} /><span>Share</span></label><button class="button quiet-button" type="button" disabled={savedViewSaving} on:click={searchViewId ? updateCurrentSearchView : saveCurrentSearchView}>{searchViewId ? 'Update view' : 'Save view'}</button></div></div>
+              {#if searchSavedViews.length}<div class="saved-view-list">{#each searchSavedViews as saved (saved.id)}<div class="saved-view-item"><button class:active={searchViewId === saved.id} class="saved-view-chip" type="button" on:click={() => openSavedView(saved)}><span>☆</span><span><strong>{saved.name}</strong><small>{saved.shared ? 'Shared' : 'Private'}</small></span></button>{#if saved.owner_id === user?.id}<button class="saved-view-delete" type="button" aria-label={`Delete saved view ${saved.name}`} on:click={() => removeCurrentSearchView(saved)}>×</button>{/if}</div>{/each}</div>{/if}
+            </section>
+            {#if searchError}<div class="inline-alert error content-alert" role="alert"><span>!</span><span>{searchError}</span><button class="text-button" type="button" on:click={() => loadSearch()}>Retry</button></div>{/if}
+            {#if searchLoading}<div class="list-skeleton" aria-label="Loading search results"><div></div><div></div><div></div></div>{:else if !searchTasks.length}<div class="empty-state search-empty"><div class="empty-icon">⌕</div><h2>No matching tasks</h2><p>Try a task key, project name, label, or a shorter phrase.</p></div>{:else}<section class="search-results" aria-label="Search results">{#each searchTasks as task (task.id)}<button class="search-result-row" type="button" on:click={() => openWorkTask(task)}><span class="work-project-dot" style={`--project-color: ${projectForTask(task)?.color || '#6d5efc'}`}></span><span class="search-result-main"><span class="work-row-top"><span class="task-key">{task.key}</span><span class={`priority-pill priority-${task.priority}`}>{priorityLabels[task.priority]}</span></span><strong>{task.title}</strong><span class="work-project-name">{projectForTask(task)?.name || 'Project'}</span></span><span class="search-result-column">{searchColumnsByProject[task.project_id]?.find((column) => column.id === task.column_id)?.name || '—'}</span><span class="row-arrow">→</span></button>{/each}</section>{#if searchNextCursor}<div class="search-pagination"><button class="button quiet-button" type="button" on:click={() => loadSearch(true)}>Load more results</button></div>{/if}{/if}
+          </section>
         {:else if view === 'issues'}
           <section class="page-heading issues-heading">
             <div>
@@ -3493,7 +5824,7 @@
             </div>
           </section>
           <section class="issues-toolbar" aria-label="Issue filters">
-            <div class="filter-search"><span aria-hidden="true">⌕</span><input aria-label="Search issues" bind:value={issueFilters.query} placeholder="Search issues…" /><kbd>/</kbd></div>
+            <div class="filter-search"><span aria-hidden="true">⌕</span><input bind:this={issueSearchInput} aria-label="Search issues" bind:value={issueFilters.query} placeholder="Search issues…" /><kbd>/</kbd></div>
             <div class="filter-group">
               <select aria-label="Filter by issue type" bind:value={issueFilters.kind}><option value="bug">Bugs</option><option value="task">Tasks</option><option value="all">All kinds</option></select>
               <select aria-label="Filter by severity" bind:value={issueFilters.severity}><option value="all">All severities</option><option value="untriaged">Untriaged</option>{#each Object.entries(severityLabels) as pair}<option value={pair[0]}>{pair[1]}</option>{/each}</select>
@@ -3505,11 +5836,11 @@
             <span class="toolbar-spacer"></span><span class="task-total">{visibleIssues.length} {visibleIssues.length === 1 ? 'issue' : 'issues'}</span>
           </section>
           <section class="issue-metrics" aria-label="Issue health">
-            <article><span>Open</span><strong>{issueMetrics.open}</strong></article>
-            <article><span>Untriaged</span><strong>{issueMetrics.untriaged}</strong></article>
-            <article><span>S1 / S2 open</span><strong>{issueMetrics.severe}</strong></article>
-            <article><span>Resolved · 7d</span><strong>{issueMetrics.recentlyResolved}</strong></article>
-            <article><span>Reopened · recent activity</span><strong>{issueMetrics.reopened}</strong></article>
+            <article><span>Open</span><strong>{issueHealthMetrics.open}</strong></article>
+            <article><span>Untriaged</span><strong>{issueHealthMetrics.untriaged}</strong></article>
+            <article><span>S1 / S2 open</span><strong>{issueHealthMetrics.severe}</strong></article>
+            <article><span>Resolved · 7d</span><strong>{issueHealthMetrics.recentlyResolved}</strong></article>
+            <article><span>Reopened · 7d</span><strong>{issueHealthMetrics.reopened === null ? '—' : issueHealthMetrics.reopened}</strong></article>
           </section>
           {#if issuesError}<div class="inline-alert error content-alert" role="alert"><span>!</span><span>{issuesError}</span><button class="text-button" type="button" on:click={loadIssues}>Retry</button></div>{/if}
           {#if issuesLoading}<div class="list-skeleton" aria-label="Loading issues">{#each [1, 2, 3] as item}<div></div>{/each}</div>
@@ -3567,6 +5898,31 @@
           {#if roadmapLoading}<div class="roadmap-skeleton"><div></div><div></div><div></div></div>{:else}<section class="roadmap-content"><div class="roadmap-hero"><div class="hero-copy"><span class="eyebrow">Workspace pulse</span><h2>Momentum, at a glance.</h2><p>Progress is calculated from each project's semantic board state.</p></div><div class="hero-progress"><div class="progress-ring" style={`--progress: ${roadmapCompletion}%`}><span>{Math.round(roadmapCompletion)}<small>%</small></span></div><div><strong>{roadmapTotal} total tasks</strong><span>{roadmap?.completed_count ?? Math.round(roadmapTotal * roadmapCompletion / 100)} completed</span></div></div></div><div class="metric-grid"><div class="metric-card"><span class="metric-icon purple">◒</span><span class="metric-label">Completion</span><strong>{Math.round(roadmapCompletion)}%</strong><span class="metric-note">Across all projects</span></div><div class="metric-card"><span class="metric-icon red">!</span><span class="metric-label">Overdue</span><strong>{roadmap?.overdue_count ?? 0}</strong><span class="metric-note">Need attention</span></div><div class="metric-card"><span class="metric-icon amber">◷</span><span class="metric-label">Due soon</span><strong>{roadmap?.due_soon_count ?? 0}</strong><span class="metric-note">Next 7 days</span></div><div class="metric-card"><span class="metric-icon green">✓</span><span class="metric-label">Completed</span><strong>{roadmap?.completed_count ?? 0}</strong><span class="metric-note">Shipped so far</span></div></div><RoadmapLiveWork tasks={roadmapLiveTasks} {projects} columnsByProject={roadmapLiveColumnsByProject} actors={roadmapActors} now={pulseClock} loading={roadmapLiveLoading} error={roadmapLiveError} onOpen={openRoadmapTask} onViewAll={() => setView('my-work')} /><div class="roadmap-columns"><section class="roadmap-panel project-progress-panel"><div class="panel-heading"><div><h2>Project progress</h2><p>Where each project stands today.</p></div><button class="icon-button" type="button" aria-label="Refresh progress" on:click={() => loadRoadmap(roadmapProjectId)}>↻</button></div>{#if roadmapProjectRows.length}{#each roadmapProjectRows as row}<button class="project-progress-row" type="button" on:click={() => selectProject(row.project)}><span class="project-dot" style={`--project-color: ${row.project.color || '#6d5efc'}`}>{projectInitials(row.project)}</span><span class="project-progress-name"><strong>{row.project.name}</strong><small>{row.project.key}</small></span><span class="progress-track"><span style={`width: ${row.total_tasks ? (row.completed_tasks / row.total_tasks) * 100 : 0}%; --project-color: ${row.project.color || '#6d5efc'}`}></span></span><span class="progress-number">{row.total_tasks ? Math.round((row.completed_tasks / row.total_tasks) * 100) : 0}%</span><span>→</span></button>{/each}{:else}<div class="panel-empty">Create a project to see progress here.</div>{/if}</section><section class="roadmap-panel upcoming-panel"><div class="panel-heading"><div><h2>Coming up</h2><p>Tasks with the nearest due dates.</p></div></div>{#if roadmap?.upcoming_tasks?.length}{#each roadmap.upcoming_tasks.slice(0, 5) as task}<button class="upcoming-row" type="button" on:click={() => openWorkTask(task)}><span class="upcoming-key">{task.key}</span><span class="upcoming-title">{task.title}</span><span class={`upcoming-date ${taskDueClass(task)}`}>{formatDate(task.due_at)}</span></button>{/each}{:else}<div class="panel-empty">No upcoming deadlines. Nice breathing room.</div>{/if}</section></div><RoadmapActivity events={roadmapActivityEvents} tasksById={roadmapActivityTasks} {projects} actors={roadmapActors} filter={roadmapActivityFilter} loading={roadmapActivityLoading} error={roadmapActivityError} onFilterChange={(next) => roadmapActivityFilter = next} onOpen={openRoadmapActivity} /></section>{/if}
         {:else}
           <section class="page-heading"><div><div class="breadcrumbs"><span>Workspace</span><span>/</span><span>Preferences</span></div><h1>Settings</h1><p>Manage the agents and tokens that help your workspace move.</p></div></section>
+          {#if user?.admin}
+            <section class="settings-section admin-section" aria-labelledby="project-admin-heading">
+              <div class="settings-section-heading">
+                <div><span class="eyebrow">Workspace administration</span><h2 id="project-admin-heading">Projects &amp; columns</h2><p>Rename projects, tune their descriptions and colors, and keep the board’s semantic columns in a safe order.</p></div>
+                <span class="admin-lock-badge">Admin only</span>
+              </div>
+              {#if adminError}<div class="inline-alert error" role="alert"><span>!</span>{adminError}<button class="text-button" type="button" on:click={loadProjectAdmin}>Retry</button></div>{/if}
+              {#if adminLoading}<div class="list-skeleton" aria-label="Loading project administration"><div></div><div></div></div>
+              {:else if !adminProjects.length}<div class="empty-state compact-empty"><div class="empty-icon">◎</div><h3>No projects yet</h3><p>Create a project first, then its columns can be managed here.</p></div>
+              {:else if adminProject}
+                <div class="admin-project-picker"><label for="admin-project-select">Project<select id="admin-project-select" bind:value={adminProjectId} on:change={() => { const selected = adminProjects.find((project) => project.id === adminProjectId); if (selected) { setAdminProjectDraft(selected); void loadAdminColumns(selected.id); } }}><option value="" disabled>Choose a project</option>{#each adminProjects as project}<option value={project.id}>{project.key} · {project.name}{#if project.archived_at} · archived{/if}</option>{/each}</select></label><span class:admin-status-archived={Boolean(adminProject.archived_at)} class="admin-status">{adminProject.archived_at ? 'Archived' : 'Active'}</span></div>
+                <form class="admin-project-form" on:submit|preventDefault={confirmAdminProjectSave}>
+                  <div class="form-row"><label>Project name<input bind:value={adminProjectName} maxlength="200" /></label><label>Accent color<input class="color-input" type="color" bind:value={adminProjectColor} /></label></div>
+                  <label>Description <span class="optional">Optional</span><textarea rows="3" maxlength="20000" bind:value={adminProjectDescription}></textarea></label>
+                  <label>Checklist completion policy<select bind:value={adminChecklistPolicy}><option value="warn">Warn · allow completion with open items</option><option value="require">Require · block completion until all items are checked</option></select><span class="field-hint">Applies to task moves, bug resolution, and columns remapped to Done.</span></label>
+                  <div class="form-actions"><button class="button quiet-button" type="button" on:click={() => confirmAdminProjectArchive(adminProject)}>{adminProject.archived_at ? 'Restore project' : 'Archive project'}</button><button class="button primary" type="submit" disabled={adminSaving || !adminProjectName.trim()}>{#if adminSaving}<span class="button-spinner"></span>{/if}Save project</button></div>
+                </form>
+                <div class="admin-columns-heading"><div><h3>Columns</h3><p>Each semantic state must keep one live mapping. Archiving a column moves its tasks to another live column with the same state.</p></div></div>
+                <form class="admin-column-create" on:submit|preventDefault={confirmAdminColumnCreate}><label>New column name<input bind:value={adminColumnName} maxlength="100" placeholder="Review" /></label><label>Semantic mapping<select bind:value={adminColumnState}>{#each Object.entries(stateLabels) as [state, label]}<option value={state}>{label}</option>{/each}</select></label><button class="button primary" type="submit" disabled={adminColumnCreating || !adminColumnName.trim()}>＋ Add column</button></form>
+                {#if adminColumnsLoading}<div class="list-skeleton" aria-label="Loading columns"><div></div></div>
+                {:else if !adminColumns.length}<p class="admin-empty-note">No columns found for this project.</p>
+                {:else}<div class="admin-column-list" aria-label="Project columns">{#each adminColumns as column (column.id)}<article class:archived={Boolean(column.archived_at)} class="admin-column-row"><div class="admin-column-grip" aria-hidden="true">⋮⋮</div><div class="admin-column-fields"><label><span class="sr-only">Column name</span><input aria-label={`Column name for ${column.name}`} bind:value={column.name} maxlength="100" /></label><label><span class="sr-only">Semantic mapping</span><select aria-label={`Semantic mapping for ${column.name}`} bind:value={column.semantic_state}>{#each Object.entries(stateLabels) as [state, label]}<option value={state}>{label}</option>{/each}</select></label><span class="admin-column-position">#{column.position + 1}</span></div><div class="admin-column-actions"><button class="icon-button tiny" type="button" aria-label={`Move ${column.name} up`} disabled={Boolean(column.archived_at) || adminColumnSaving === column.id || (adminLiveColumnIndexes.get(column.id) ?? -1) <= 0} on:click={() => confirmAdminColumnMove(column, Math.max(0, column.position - 1))}>↑</button><button class="icon-button tiny" type="button" aria-label={`Move ${column.name} down`} disabled={Boolean(column.archived_at) || adminColumnSaving === column.id || (adminLiveColumnIndexes.get(column.id) ?? -1) >= adminLiveColumns.length - 1} on:click={() => confirmAdminColumnMove(column, column.position + 1)}>↓</button><button class="button quiet-button compact-button" type="button" disabled={adminColumnSaving === column.id || !column.name.trim()} on:click={() => confirmAdminColumnSave(column)}>{adminColumnSaving === column.id ? 'Saving…' : 'Save'}</button><button class="text-button compact-button" type="button" disabled={adminColumnSaving === column.id} on:click={() => confirmAdminColumnArchive(column)}>{column.archived_at ? 'Restore' : 'Archive'}</button></div></article>{/each}</div>{/if}
+              {/if}
+            </section>
+          {/if}
           <section class="settings-section codex-section">
             <div class="settings-section-heading"><div><span class="eyebrow">Luna assistant</span><h2>Your Codex subscription</h2><p>Connect your own Codex-enabled ChatGPT account. Helm stores it only in your private user runtime and never shares it with another user.</p></div>{#if codexAccount?.connected}<span class="codex-connected">✓ Connected</span>{/if}</div>
             {#if codexError}<div class="inline-alert error" role="alert"><span>!</span>{codexError}</div>{/if}
@@ -3582,9 +5938,10 @@
     </div>
 
     {#if drawerTask}
-      <div class="drawer-backdrop" role="presentation" on:click={closeDrawer}></div>
+      <div class="drawer-backdrop" role="presentation" on:click={() => closeDrawer()}></div>
       <div class="task-drawer" role="dialog" aria-modal="true" aria-label={`${drawerTask.key}: ${drawerTask.title}`} use:focusTrap>
-        <div class="drawer-header"><div><span class="drawer-key">{drawerTask.key}</span><span class="issue-kind-badge" class:task-kind={drawerTask.kind !== 'bug'}>{drawerTask.kind === 'bug' ? 'Bug' : 'Task'}</span>{#if drawerTask.kind === 'bug'}<span class:untriaged={!drawerTask.bug?.severity} class="severity-badge">{drawerTask.bug?.severity ? severityLabels[drawerTask.bug.severity] : 'Untriaged'}</span>{/if}<span class={`priority-pill priority-${drawerTask.priority}`}>{priorityLabels[drawerTask.priority]}</span></div><button class="icon-button" type="button" aria-label="Close task details" on:click={closeDrawer}>×</button></div>
+        <div class="drawer-focus-target sr-only" tabindex="-1" data-dialog-initial-focus aria-label="Task details"></div>
+        <div class="drawer-header"><div><span class="drawer-key">{drawerTask.key}</span><span class="issue-kind-badge" class:task-kind={drawerTask.kind !== 'bug'}>{drawerTask.kind === 'bug' ? 'Bug' : 'Task'}</span>{#if drawerTask.kind === 'bug'}<span class:untriaged={!drawerTask.bug?.severity} class="severity-badge">{drawerTask.bug?.severity ? severityLabels[drawerTask.bug.severity] : 'Untriaged'}</span>{/if}<span class={`priority-pill priority-${drawerTask.priority}`}>{priorityLabels[drawerTask.priority]}</span></div><button class="icon-button" type="button" aria-label="Close task details" on:click={() => closeDrawer()}>×</button></div>
         {#if drawerLoading}<div class="drawer-loading"><span class="spinner"></span><span>Loading task details…</span></div>{/if}
         {#if drawerError}<div class="inline-alert error drawer-alert" role="alert"><span>!</span>{drawerError}</div>{/if}
         <div class="drawer-tabs" role="tablist" aria-label="Task views">
@@ -3593,29 +5950,30 @@
         </div>
         {#if drawerView === 'details'}
         <div id="drawer-details-panel" class="drawer-details-panel" role="tabpanel" aria-labelledby="drawer-details-tab">
+          <div class="drawer-scroll" data-drawer-scroll>
         {#if drawerTask.kind === 'bug'}
           <div class="drawer-bug-controls">
             <section class="drawer-section bug-details-section" aria-labelledby="bug-details-heading"><div class="section-heading-inline"><h2 id="bug-details-heading">Bug report</h2><span class="optional">Reporter: {drawerTask.bug?.reporter_id || 'Unknown'}</span></div><label>Actual behavior<textarea rows="3" bind:value={draftBugActual} placeholder="What happened?"></textarea></label><label>Expected behavior<textarea rows="3" bind:value={draftBugExpected} placeholder="What should have happened?"></textarea></label><label>Reproduction steps<textarea rows="3" bind:value={draftBugReproduction} placeholder="1. Open…&#10;2. Click…"></textarea></label><div class="drawer-field-grid"><label>Environment<input bind:value={draftBugEnvironment} placeholder="Browser, OS, device" /></label><label>Affected version<input bind:value={draftBugVersion} placeholder="e.g. 1.4.0" /></label></div></section>
-            <section class="drawer-section bug-triage-section" aria-labelledby="bug-triage-heading"><div class="section-heading-inline"><h2 id="bug-triage-heading">Triage</h2><span class="optional">Set severity and ownership</span></div><div class="drawer-field-grid"><label>Severity<select aria-label="Bug severity" bind:value={triageSeverityDraft}><option value="s1">{severityLabels.s1}</option><option value="s2">{severityLabels.s2}</option><option value="s3">{severityLabels.s3}</option><option value="s4">{severityLabels.s4}</option></select></label><label>Priority<select aria-label="Triage priority" bind:value={draftPriority}><option value="urgent">Urgent</option><option value="high">High</option><option value="normal">Normal</option><option value="low">Low</option></select></label></div><label>Assignee<input aria-label="Triage assignee" bind:value={draftAssignee} placeholder="Actor ID (optional)" /></label><button class="button primary" type="button" title={dependencyBlocked(drawerTask) ? dependencyActionExplanation(drawerTask, 'start triage') : undefined} disabled={dependencyBlocked(drawerTask) || taskActionLoading === drawerTask.id} on:click={triageBug}>{#if taskActionLoading === drawerTask.id}<span class="button-spinner"></span>{/if}{drawerTask.bug?.severity ? 'Update triage' : 'Triage issue'}</button></section>
+            <section class="drawer-section bug-triage-section" aria-labelledby="bug-triage-heading"><div class="section-heading-inline"><h2 id="bug-triage-heading">Triage</h2><span class="optional">Set severity and ownership</span></div><div class="drawer-field-grid"><label>Severity<select aria-label="Bug severity" bind:value={triageSeverityDraft}><option value="s1">{severityLabels.s1}</option><option value="s2">{severityLabels.s2}</option><option value="s3">{severityLabels.s3}</option><option value="s4">{severityLabels.s4}</option></select></label><label>Priority<select aria-label="Triage priority" bind:value={draftPriority}><option value="urgent">Urgent</option><option value="high">High</option><option value="normal">Normal</option><option value="low">Low</option></select></label></div><label>Assignee<input aria-label="Triage assignee" bind:value={draftAssignee} placeholder="Actor ID (optional)" /></label><button class="button primary" type="button" title={dependencyBlocked(drawerTask) ? dependencyActionExplanation(drawerTask, 'start triage') : undefined} disabled={dependencyBlocked(drawerTask) || drawerSaving || taskActionLoading === drawerTask.id} on:click={triageBug}>{#if taskActionLoading === drawerTask.id}<span class="button-spinner"></span>{/if}{drawerTask.bug?.severity ? 'Update triage' : 'Triage issue'}</button></section>
             {#if drawerTask.bug?.resolution}
-              <section class="drawer-section bug-resolution-section" aria-labelledby="bug-resolution-heading"><div class="section-heading-inline"><h2 id="bug-resolution-heading">Resolved as {resolutionLabels[drawerTask.bug.resolution] || drawerTask.bug.resolution}</h2><span class="optional">Reopen if the issue persists</span></div><label>Reopen reason<textarea rows="2" bind:value={reopenReasonDraft} placeholder="Why does this need another look?"></textarea></label><button class="button quiet-button" type="button" disabled={taskActionLoading === drawerTask.id || !reopenReasonDraft.trim()} on:click={reopenBug}>Reopen issue</button></section>
+              <section class="drawer-section bug-resolution-section" aria-labelledby="bug-resolution-heading"><div class="section-heading-inline"><h2 id="bug-resolution-heading">Resolved as {resolutionLabels[drawerTask.bug.resolution] || drawerTask.bug.resolution}</h2><span class="optional">Reopen if the issue persists</span></div><label>Reopen reason<textarea rows="2" bind:value={reopenReasonDraft} placeholder="Why does this need another look?"></textarea></label><button class="button quiet-button" type="button" disabled={drawerSaving || taskActionLoading === drawerTask.id || !reopenReasonDraft.trim()} on:click={reopenBug}>Reopen issue</button></section>
             {:else}
-              <section class="drawer-section bug-resolution-section" aria-labelledby="bug-resolution-heading"><div class="section-heading-inline"><h2 id="bug-resolution-heading">Resolve</h2><span class="optional">Close the loop for reporters</span></div><label>Resolution<select aria-label="Bug resolution" bind:value={resolutionDraft}>{#each resolutionOptions as resolution}<option value={resolution}>{resolutionLabels[resolution]}</option>{/each}</select></label>{#if resolutionDraft === 'duplicate'}<label>Duplicate of<input aria-label="Duplicate issue" bind:value={duplicateOfDraft} placeholder="Task key or ID" /></label>{/if}<label>Resolution note <span class="optional">Optional</span><textarea rows="2" bind:value={resolutionNoteDraft} placeholder="What changed or why was this closed?"></textarea></label><button class="button complete-button" type="button" title={dependencyBlocked(drawerTask) ? dependencyActionExplanation(drawerTask, 'resolve this issue') : undefined} disabled={dependencyBlocked(drawerTask) || taskActionLoading === drawerTask.id} on:click={resolveBug}>Resolve issue</button></section>
+              <section class="drawer-section bug-resolution-section" aria-labelledby="bug-resolution-heading"><div class="section-heading-inline"><h2 id="bug-resolution-heading">Resolve</h2><span class="optional">Close the loop for reporters</span></div><label>Resolution<select aria-label="Bug resolution" bind:value={resolutionDraft}>{#each resolutionOptions as resolution}<option value={resolution}>{resolutionLabels[resolution]}</option>{/each}</select></label>{#if resolutionDraft === 'duplicate'}<label>Duplicate of<input aria-label="Duplicate issue" bind:value={duplicateOfDraft} placeholder="Task key or ID" /></label>{/if}<label>Resolution note <span class="optional">Optional</span><textarea rows="2" bind:value={resolutionNoteDraft} placeholder="What changed or why was this closed?"></textarea></label><button class="button complete-button" type="button" title={dependencyBlocked(drawerTask) ? dependencyActionExplanation(drawerTask, 'resolve this issue') : undefined} disabled={dependencyBlocked(drawerTask) || drawerSaving || taskActionLoading === drawerTask.id} on:click={resolveBug}>Resolve issue</button></section>
             {/if}
           </div>
         {/if}
         {#if drawerTask.claimed_by}
-          <div class="claim-lease" class:expired={!claimIsActive(drawerTask, pulseClock)} class:conflict={claimConflict(drawerTask, pulseClock)} role={claimConflict(drawerTask, pulseClock) ? 'alert' : undefined}>
+          <div class="claim-lease" class:expired={!claimIsActive(drawerTask, pulseClock)} class:expiring-soon={claimExpiresSoon(drawerTask, pulseClock)} class:conflict={claimConflict(drawerTask, pulseClock)} role={claimConflict(drawerTask, pulseClock) || claimExpiresSoon(drawerTask, pulseClock) ? 'alert' : undefined}>
             <span class="claim-lease-icon" aria-hidden="true">⚑</span>
-            <span><strong>{claimConflict(drawerTask, pulseClock) ? `Claim conflict · ${claimOwnerLabel(drawerTask)}` : `Claimed by ${claimOwnerLabel(drawerTask)}`}</strong>{#if drawerTask.claim_expires_at}<small><time datetime={drawerTask.claim_expires_at}>{claimIsActive(drawerTask, pulseClock) ? `Expires ${claimExpiryExact(drawerTask.claim_expires_at)}` : `Expired ${claimExpiryExact(drawerTask.claim_expires_at)}`}</time> · {claimCountdown(drawerTask, pulseClock)}</small>{:else}<small>No expiry reported</small>{/if}</span>
+            <span><strong>{claimConflict(drawerTask, pulseClock) ? `Claim conflict · ${claimOwnerLabel(drawerTask)}` : `Claimed by ${claimOwnerLabel(drawerTask)}`}</strong>{#if drawerTask.claim_expires_at}<small><time datetime={drawerTask.claim_expires_at}>{claimIsActive(drawerTask, pulseClock) ? `Expires ${claimExpiryExact(drawerTask.claim_expires_at)}` : `Expired ${claimExpiryExact(drawerTask.claim_expires_at)}`}</time> · {claimCountdown(drawerTask, pulseClock)} · Task version v{drawerTask.version}</small>{:else}<small>No expiry reported · Task version v{drawerTask.version}</small>{/if}{#if claimExpiresSoon(drawerTask, pulseClock)}<small class="claim-lease-warning">Expiring soon — renew this claim before it expires.</small>{/if}</span>
           </div>
         {/if}
-        <button class="button quiet-button block-button" type="button" disabled={Boolean(drawerTask.completed_at) || taskActionLoading === drawerTask.id} on:click={openBlockReason}>■ Block</button>
+        <button class="button quiet-button block-button" type="button" disabled={Boolean(drawerTask.completed_at) || drawerSaving || taskActionLoading === drawerTask.id} on:click={openBlockReason}>■ Block</button>
         {#if blockReasonOpen}
-          <section class="block-reason-form" aria-labelledby="block-reason-heading"><label id="block-reason-heading">Why is this task blocked?<textarea rows="3" bind:value={blockReasonDraft} placeholder="Describe the dependency or decision needed." required></textarea></label><div class="form-actions"><button class="text-button" type="button" on:click={() => { blockReasonOpen = false; blockReasonDraft = ''; }}>Cancel</button><button class="button danger-button" type="button" disabled={!blockReasonDraft.trim() || taskActionLoading === drawerTask.id} on:click={() => runTaskAction('block', blockReasonDraft)}>Block task</button></div></section>
+          <section class="block-reason-form" aria-labelledby="block-reason-heading"><label id="block-reason-heading">Why is this task blocked?<textarea rows="3" bind:value={blockReasonDraft} placeholder="Describe the dependency or decision needed." required></textarea></label><div class="form-actions"><button class="text-button" type="button" on:click={() => { blockReasonOpen = false; blockReasonDraft = ''; }}>Cancel</button><button class="button danger-button" type="button" disabled={!blockReasonDraft.trim() || drawerSaving || taskActionLoading === drawerTask.id} on:click={() => runTaskAction('block', blockReasonDraft)}>Block task</button></div></section>
         {/if}
         <TaskDependencyStatus task={drawerTask} mode="notice" />
-              <div class="drawer-scroll"><label class="drawer-title-label"><span class="sr-only">Task title</span><input id="drawer-title" class="drawer-title-input" data-dialog-initial-focus bind:value={draftTitle} /></label><div class="drawer-meta"><span class="task-project-marker" style={`--project-color: ${projectForTask(drawerTask)?.color || '#6d5efc'}`}></span><span>{projectForTask(drawerTask)?.name || 'Project'}</span><span>·</span><span>Updated {formatRelative(drawerTask?.updated_at)}</span></div><div class="drawer-actions"><button class="button quiet-button" type="button" title={dependencyBlocked(drawerTask) ? dependencyActionExplanation(drawerTask, claimAction(drawerTask) === 'renew' ? 'renew this claim' : 'claim this task') : undefined} disabled={taskActionLoading === drawerTask?.id || dependencyBlocked(drawerTask)} on:click={() => runTaskAction(claimAction(drawerTask))}>{drawerTask.claimed_by && actorId(drawerTask.claimed_by) === user?.id && claimIsActive(drawerTask, pulseClock) ? '↻ Renew claim' : drawerTask.claimed_by && claimConflict(drawerTask, pulseClock) ? `Claimed by ${actorName(drawerTask.claimed_by) || 'agent'}` : '⚑ Claim task'}</button>{#if drawerTask.claimed_by && actorId(drawerTask.claimed_by) === user?.id && claimIsActive(drawerTask, pulseClock)}<button class="button quiet-button" type="button" disabled={taskActionLoading === drawerTask?.id} on:click={() => runTaskAction('release')}>Release</button>{/if}<button class="button complete-button" type="button" title={dependencyBlocked(drawerTask) ? dependencyActionExplanation(drawerTask, 'complete this task') : undefined} disabled={Boolean(drawerTask.completed_at) || dependencyBlocked(drawerTask) || taskActionLoading === drawerTask.id} on:click={() => runTaskAction('complete')}>{drawerTask.completed_at ? '✓ Completed' : '✓ Complete'}</button></div>{#if showAgentPulse(drawerTask)}<AgentWorkPanel task={drawerTask} now={pulseClock} actorLabel={agentLabelForTask(drawerTask)} />{/if}<section class="drawer-section"><div class="drawer-field-grid"><label>Priority<select bind:value={draftPriority}><option value="urgent">Urgent</option><option value="high">High</option><option value="normal">Normal</option><option value="low">Low</option></select></label><label>Due date<input type="date" bind:value={draftDueDate} /></label></div><label>Assignee<input bind:value={draftAssignee} placeholder="Actor ID (optional)" /></label><label>Labels <span class="optional">Comma separated</span><input bind:value={draftLabels} placeholder="frontend, design" /></label>{#if labels.filter((label) => label.project_id === drawerTask?.project_id).length}<div class="drawer-label-picker"><span class="optional">Project labels</span><div class="drawer-label-options">{#each labels.filter((label) => label.project_id === drawerTask?.project_id) as label (label.id)}<span class="drawer-label-option" style={`--label-color: ${label.color || '#8b7cf6'}`}><span>{label.name}</span><button class="icon-button tiny danger-button" type="button" aria-label={`Delete label ${label.name}`} disabled={labelDeleting === label.id} on:click|stopPropagation={() => deleteProjectLabel(label)}>×</button></span>{/each}</div></div>{/if}</section>
+              <label class="drawer-title-label"><span class="sr-only">Task title</span><input id="drawer-title" class="drawer-title-input" bind:value={draftTitle} /></label><div class="drawer-meta"><span class="task-project-marker" style={`--project-color: ${projectForTask(drawerTask)?.color || '#6d5efc'}`}></span><span>{projectForTask(drawerTask)?.name || 'Project'}</span><span>·</span><span>Updated {formatRelative(drawerTask?.updated_at)}</span></div><div class="drawer-actions"><button class="button quiet-button" type="button" title={dependencyBlocked(drawerTask) ? dependencyActionExplanation(drawerTask, claimAction(drawerTask) === 'renew' ? 'renew this claim' : 'claim this task') : claimConflict(drawerTask, pulseClock) ? `Claim held by ${claimOwnerLabel(drawerTask)} · task version v${drawerTask.version}` : undefined} disabled={drawerSaving || taskActionLoading === drawerTask?.id || dependencyBlocked(drawerTask) || claimConflict(drawerTask, pulseClock)} on:click={() => runTaskAction(claimAction(drawerTask))}>{drawerTask.claimed_by && actorId(drawerTask.claimed_by) === user?.id && claimIsActive(drawerTask, pulseClock) ? '↻ Renew claim' : drawerTask.claimed_by && claimConflict(drawerTask, pulseClock) ? `Claimed by ${actorName(drawerTask.claimed_by) || 'agent'}` : '⚑ Claim task'}</button>{#if drawerTask.claimed_by && actorId(drawerTask.claimed_by) === user?.id && claimIsActive(drawerTask, pulseClock)}<button class="button quiet-button" type="button" disabled={drawerSaving || taskActionLoading === drawerTask?.id} on:click={() => runTaskAction('release')}>Release</button>{/if}<button class="button complete-button" type="button" title={dependencyBlocked(drawerTask) ? dependencyActionExplanation(drawerTask, 'complete this task') : undefined} disabled={drawerSaving || Boolean(drawerTask.completed_at) || dependencyBlocked(drawerTask) || taskActionLoading === drawerTask.id} on:click={() => runTaskAction('complete')}>{drawerTask.completed_at ? '✓ Completed' : '✓ Complete'}</button></div>{#if showAgentPulse(drawerTask)}<AgentWorkPanel task={drawerTask} now={pulseClock} actorLabel={agentLabelForTask(drawerTask)} />{/if}<section class="drawer-section"><div class="drawer-field-grid"><label>Priority<select bind:value={draftPriority}><option value="urgent">Urgent</option><option value="high">High</option><option value="normal">Normal</option><option value="low">Low</option></select></label><label>Due date<input type="date" bind:value={draftDueDate} /></label></div><label>Assignee<input bind:value={draftAssignee} placeholder="Actor ID (optional)" /></label><label>Labels <span class="optional">Comma separated</span><input bind:value={draftLabels} placeholder="frontend, design" /></label>{#if labels.filter((label) => label.project_id === drawerTask?.project_id).length}<div class="drawer-label-picker"><span class="optional">Project labels</span><div class="drawer-label-options">{#each labels.filter((label) => label.project_id === drawerTask?.project_id) as label (label.id)}<span class="drawer-label-option" style={`--label-color: ${label.color || '#8b7cf6'}`}><span>{label.name}</span><button class="icon-button tiny danger-button" type="button" aria-label={`Delete label ${label.name}`} disabled={labelDeleting === label.id} on:click|stopPropagation={() => deleteProjectLabel(label)}>×</button></span>{/each}</div></div>{/if}</section>
                 <TaskDependencies
                   bind:this={drawerDependencyPanel}
                   task={drawerTask}
@@ -3624,7 +5982,22 @@
                   onNavigate={openDependencyTask}
                   onRefreshTask={refreshDependencyTask}
                 />
-                <section class="drawer-section description-section"><div class="section-heading-inline"><h2>Description</h2><span class="markdown-hint">Markdown supported</span></div><textarea class="description-input" rows="7" bind:value={draftDescription} placeholder="What does success look like?"></textarea></section><button class="button primary save-task-button" type="button" disabled={drawerSaving || !draftTitle.trim()} on:click={saveTask}>{#if drawerSaving}<span class="button-spinner"></span>{/if}Save changes</button></div>
+	                <TaskChecklist
+	                  task={drawerTask}
+	                  onTaskUpdated={handleChecklistTaskUpdated}
+	                  onRefreshTask={refreshDependencyTask}
+	                />
+	                <TaskHierarchy
+	                  bind:this={drawerHierarchyPanel}
+	                  task={drawerTask}
+	                  refreshToken={drawerHierarchyRefresh}
+	                  onTaskUpdated={handleHierarchyTaskUpdated}
+	                  onNavigate={openHierarchyTask}
+	                  onRefreshTask={refreshHierarchyTask}
+	                  onCreateChild={createChildTask}
+	                />
+	                <section class="drawer-section description-section"><div class="section-heading-inline"><h2>Description</h2><span class="markdown-hint">Markdown supported</span></div><textarea class="description-input" rows="7" bind:value={draftDescription} placeholder="What does success look like?"></textarea></section><div class="drawer-save-bar" class:dirty={drawerDraftDirty} aria-live="polite"><span class="drawer-save-status">{#if drawerSaving}<span class="button-spinner"></span>Saving changes…{:else if drawerTaskDraftDirty}<span class="drawer-status-dot"></span>Unsaved changes{:else if drawerDraftDirty}<span class="drawer-status-dot"></span>Action draft pending{:else}<span class="drawer-status-check">✓</span>All changes saved{/if}</span><button class="button primary save-task-button" type="button" disabled={drawerSaving || !drawerTaskDraftDirty || !draftTitle.trim()} on:click={() => void saveTask()}>{#if drawerSaving}<span class="button-spinner"></span>{/if}{drawerTaskDraftDirty ? 'Save changes' : 'Saved'}</button></div>
+	          </div>
         </div>
         {:else}
           <div id="drawer-activity-panel" class="drawer-scroll drawer-activity-scroll" role="tabpanel" aria-labelledby="drawer-activity-tab">
@@ -3645,6 +6018,11 @@
                 onFilterChange={setDrawerTimelineFilter}
                 onLoadOlder={loadOlderDrawerActivity}
                 onRetry={() => { void loadDrawerTimeline(drawerTask?.id); }}
+                currentActorId={user?.id || ''}
+                canManageComments={Boolean(user?.admin)}
+                onEditComment={editDrawerComment}
+                onConfirmDelete={confirmDrawerCommentDelete}
+                onDeleteComment={deleteDrawerComment}
               />
             </section>
           </div>
@@ -3655,9 +6033,23 @@
 
     {#if commandOpen}
       <div class="modal-backdrop command-backdrop" role="presentation" on:click={closeCommandPalette}></div>
-      <div class="command-menu" role="dialog" aria-modal="true" aria-label="Search Helm" use:focusTrap>
-        <div class="command-input-wrap"><span aria-hidden="true">⌕</span><input bind:this={commandInput} data-dialog-initial-focus bind:value={commandQuery} on:keydown={commandKeydown} placeholder="Jump to a project or view…" aria-label="Search projects and views" /><kbd>ESC</kbd></div>
-        <div class="command-results">{#if commandChoices.length}{#each commandChoices as choice, index}<button class:selected={index === commandIndex} class="command-row" type="button" on:mouseenter={() => commandIndex = index} on:click={() => selectCommand(choice)}><span class={`command-icon ${choice.kind}`}>{choice.kind === 'project' ? (choice.project ? projectInitials(choice.project) : 'P') : choice.kind === 'issue' ? '⚠' : choice.view === 'issues' ? '⚠' : choice.view === 'my-work' ? '◌' : choice.view === 'roadmap' ? '◒' : '⚙'}</span><span><strong>{choice.label}</strong><small>{choice.hint}</small></span><span class="command-enter">↵</span></button>{/each}{:else}<div class="command-empty">No projects, issues, or views match “{commandQuery}”</div>{/if}</div><div class="command-footer"><span><kbd>↑</kbd><kbd>↓</kbd> Navigate</span><span><kbd>↵</kbd> Open</span><span><kbd>ESC</kbd> Close</span></div>
+      <div class="command-menu" role="dialog" aria-modal="true" aria-labelledby="command-dialog-title" use:focusTrap>
+        <h2 id="command-dialog-title" class="sr-only">Search Helm</h2>
+        <div class="command-input-wrap"><span aria-hidden="true">⌕</span><input bind:this={commandInput} data-dialog-initial-focus bind:value={commandQuery} on:input={() => { commandIndex = 0; commandInputChanged(); }} on:keydown={commandKeydown} placeholder="Search projects, tasks, issues, views, or actions…" aria-label="Search projects and views, tasks, issues, and actions" role="combobox" aria-expanded={commandOpen} aria-controls="command-results" aria-autocomplete="list" aria-activedescendant={activeCommandOptionId || undefined} autocomplete="off" /><kbd>ESC</kbd></div>
+        {#if commandIssuesLoading || commandSearchLoading}<div class="command-status" role="status" aria-live="polite">Searching Helm…</div>{/if}
+        {#if commandIssuesError}<div class="command-status command-status-error" role="alert"><span>{commandIssuesError}</span><button class="text-button" type="button" on:click={() => void loadCommandIssues()}>Retry issue search</button></div>{/if}
+        <div id="command-results" class="command-results" role="listbox" aria-label="Command results" aria-busy={commandIssuesLoading || commandSearchLoading}>
+          {#if commandChoices.length}
+            {#each commandChoices as choice, index (choice.id)}
+              <button id={commandChoiceId(choice)} class:selected={index === commandIndex} class={`command-row ${choice.kind}`} role="option" aria-selected={index === commandIndex} aria-posinset={index + 1} aria-setsize={commandChoices.length} aria-label={`${choice.label}. ${choice.hint}`} tabindex="-1" type="button" on:focus={() => commandIndex = index} on:mouseenter={() => commandIndex = index} on:click={() => void selectCommand(choice)} on:keydown={(event) => commandOptionKeydown(event, choice)} on:mousedown|preventDefault><span class={`command-icon ${choice.kind}`} aria-hidden="true">{commandChoiceIcon(choice)}</span><span><strong>{choice.label}</strong><small>{choice.hint}</small></span><span class="command-enter" aria-hidden="true">↵</span></button>
+            {/each}
+          {:else if commandIssuesLoading || commandSearchLoading}
+            <div class="command-empty" role="status" aria-live="polite">Searching Helm…</div>
+          {:else}
+            <div class="command-empty" role="status" aria-live="polite">No commands match “{commandQuery}”. Try a different search.</div>
+          {/if}
+        </div>
+        <div class="command-footer"><span><kbd>↑</kbd><kbd>↓</kbd> Navigate</span><span><kbd>↵</kbd> Open</span><span><kbd data-command-shortcut>{commandShortcut}</kbd> Open palette</span><span><kbd>ESC</kbd> Close</span></div>
       </div>
     {/if}
 
@@ -3666,10 +6058,11 @@
       <div class="modal task-create-modal" role="dialog" aria-modal="true" aria-labelledby="task-modal-title" use:focusTrap>
         <div class="modal-header"><div><span class="eyebrow">Capture an idea</span><h2 id="task-modal-title">Create a task</h2></div><button class="icon-button" type="button" aria-label="Close" on:click={closeTaskModal}>×</button></div>
         {#if taskModalError}<div class="inline-alert error" role="alert"><span>!</span>{taskModalError}</div>{/if}
-        <form on:submit|preventDefault={createGlobalTask}>
-          <div class="form-row task-destination-row"><label>Project<select bind:value={taskModalProjectId} on:change={changeTaskModalProject}>{#each projects as project}<option value={project.id}>{project.key} · {project.name}</option>{/each}</select></label><label>Column<select bind:value={taskModalColumnId} disabled={taskModalLoading || !taskModalColumns.length}>{#each taskModalColumns as column}<option value={column.id}>{column.name}</option>{/each}</select></label></div>
-          <section class="luna-assist-panel" aria-labelledby="luna-assist-heading" aria-describedby="luna-assist-description">
-            <div class="luna-assist-heading"><div><span class="eyebrow">Optional assist</span><h3 id="luna-assist-heading">Plan it with Luna</h3><p id="luna-assist-description">Describe the outcome and Luna will suggest the task details.</p></div><span class="luna-mark" aria-hidden="true">✦</span></div>
+		<form on:submit|preventDefault={createGlobalTask}>
+		  <div class="form-row task-destination-row"><label>Project<select bind:value={taskModalProjectId} on:change={changeTaskModalProject}>{#each projects as project}<option value={project.id}>{project.key} · {project.name}</option>{/each}</select></label><label>Column<select bind:value={taskModalColumnId} disabled={taskModalLoading || !taskModalColumns.length}>{#each taskModalColumns as column}<option value={column.id}>{column.name}</option>{/each}</select></label></div>
+		  {#if taskModalParentId && drawerTask?.id === taskModalParentId}<p class="task-parent-note">This task will be created as a child of <strong>{drawerTask.key}</strong>.</p>{/if}
+		  <section class="luna-assist-panel" aria-labelledby="luna-assist-heading" aria-describedby="luna-assist-description">
+		    <div class="luna-assist-heading"><div><span class="eyebrow">Optional assist</span><h3 id="luna-assist-heading">Plan it with Luna</h3><p id="luna-assist-description">Describe the outcome and Luna will suggest the task details.</p></div><span class="luna-mark" aria-hidden="true">✦</span></div>
             <label>Rough idea<textarea data-dialog-initial-focus rows="2" bind:value={taskModalIdea} placeholder="e.g. Let self-hosted users connect their own Codex subscription"></textarea></label>
             {#if taskModalAssisting}<div class="luna-progress" aria-live="polite"><span class="button-spinner"></span><span>{taskModalAssistStage}</span><button class="text-button" type="button" on:click={cancelTaskAssist}>Cancel</button></div>
             {:else}<button class="button luna-button" type="button" disabled={!taskModalIdea.trim() && !taskModalTitle.trim()} on:click={assistTaskWithLuna}>✦ {taskModalSuggestion ? 'Try again with Luna' : 'Assist with Luna'}</button>{/if}
@@ -3720,9 +6113,42 @@
       </div>
     {/if}
 
+    {#if portablePreview}
+      <div class="modal-backdrop" role="presentation" on:click={closePortablePreview}></div>
+      <div class="modal portable-preview-modal" role="dialog" aria-modal="true" aria-labelledby="portable-preview-title" use:focusTrap>
+        <div class="modal-header"><div><span class="eyebrow">Portable archive</span><h2 id="portable-preview-title">Review import</h2></div><button class="icon-button" type="button" aria-label="Close" on:click={closePortablePreview}>×</button></div>
+        <p><strong>{portablePreview.fileName}</strong> will be merged into {activeProject?.name || 'the current project'}.</p>
+        <div class="portable-import-summary"><strong>{portablePreview.report.counts.tasks_created || 0}</strong><span>tasks to create</span><strong>{portablePreview.report.remaps.length}</strong><span>reported remaps</span><strong>{portablePreview.report.warnings.length}</strong><span>warnings</span><strong>{portablePreview.report.errors.length}</strong><span>validation failures</span></div>
+        {#if portablePreviewError}<div class="inline-alert error" role="alert"><span>!</span><span>{portablePreviewError}</span></div>{/if}
+        {#if portablePreview.report.errors.length}<div class="portable-import-errors" role="alert"><strong>Validation failures</strong><ul>{#each portablePreview.report.errors as issue}<li><code>{issue.entity}{issue.id ? ` · ${issue.id}` : ''}{issue.field ? ` · ${issue.field}` : ''}</code><span>{issue.message}</span></li>{/each}</ul></div>{/if}
+        {#if portablePreview.report.remaps.length}<div class="portable-import-remaps"><strong>Remappings</strong><ul>{#each portablePreview.report.remaps as remap}<li><code>{remap.entity}{remap.field ? ` · ${remap.field}` : ''}: {remap.source} → {remap.target}</code><span>{remap.reason}</span></li>{/each}</ul></div>{/if}
+        {#if portablePreview.report.warnings.length}<div class="portable-import-warnings"><strong>Review warnings</strong><ul>{#each portablePreview.report.warnings as warning}<li>{warning}</li>{/each}</ul></div>{/if}
+        <div class="modal-actions"><button class="text-button" type="button" disabled={portableBusy} on:click={closePortablePreview}>Cancel</button><button class="button primary" type="button" disabled={portableBusy || portablePreview.report.errors.length > 0} on:click={() => void confirmPortableImport()}>{#if portableBusy}<span class="button-spinner"></span>{/if}Import archive</button></div>
+      </div>
+    {/if}
+
     {#if showProjectModal}
       <div class="modal-backdrop" role="presentation" on:click={closeProjectModal}></div>
       <div class="modal project-modal" role="dialog" aria-modal="true" aria-labelledby="project-modal-title" use:focusTrap><div class="modal-header"><div><span class="eyebrow">New workspace</span><h2 id="project-modal-title">Create a project</h2></div><button class="icon-button" type="button" aria-label="Close" on:click={closeProjectModal}>×</button></div>{#if projectFormError}<div class="inline-alert error" role="alert"><span>!</span>{projectFormError}</div>{/if}<form on:submit|preventDefault={createProject}><div class="project-form-title"><span class="project-dot huge" style={`--project-color: ${projectColorDraft}`}>{projectInitials({ name: projectNameDraft || 'New project', key: projectKeyDraft || 'NP' })}</span><div><label>Project name<input data-dialog-initial-focus bind:value={projectNameDraft} placeholder="Product launch" /></label></div></div><div class="form-row"><label>Project key<input maxlength="16" bind:value={projectKeyDraft} placeholder="PROD" /></label><label>Accent color<input class="color-input" type="color" bind:value={projectColorDraft} /></label></div><label>Description <span class="optional">Optional</span><textarea rows="3" bind:value={projectDescriptionDraft} placeholder="A short note about what this project is for."></textarea><span class="field-hint">Helm will add Backlog, Ready, In progress, Blocked, and Done columns automatically.</span></label><div class="modal-actions"><button class="text-button" type="button" on:click={closeProjectModal}>Cancel</button><button class="button primary" type="submit" disabled={projectCreating || !projectNameDraft.trim() || !projectKeyDraft.trim()}>{#if projectCreating}<span class="button-spinner"></span>{/if}Create project</button></div></form></div>
+    {/if}
+
+    {#if confirmRequest}
+      <ConfirmDialog
+        title={confirmRequest.title}
+        message={confirmRequest.message}
+        confirmLabel={confirmRequest.confirmLabel}
+        onConfirm={() => settleConfirm(true)}
+        onCancel={() => settleConfirm(false)}
+      />
+    {/if}
+
+    {#if adminConfirmation}
+      <div class="modal-backdrop" role="presentation" on:click={cancelAdminConfirmation}></div>
+      <div class="modal admin-confirm-modal" role="alertdialog" aria-modal="true" aria-labelledby="admin-confirm-title" aria-describedby="admin-confirm-message" use:focusTrap>
+        <div class="modal-header"><div><span class="eyebrow">Confirm administration change</span><h2 id="admin-confirm-title">{adminConfirmation.title}</h2></div><button class="icon-button" type="button" aria-label="Close confirmation" on:click={cancelAdminConfirmation}>×</button></div>
+        <p id="admin-confirm-message" class="admin-confirm-message">{adminConfirmation.message}</p>
+        <div class="modal-actions"><button class="text-button" type="button" disabled={adminConfirmationBusy} on:click={cancelAdminConfirmation}>Cancel</button><button class="button primary" data-dialog-initial-focus type="button" disabled={adminConfirmationBusy} on:click={runAdminConfirmation}>{#if adminConfirmationBusy}<span class="button-spinner"></span>{/if}{adminConfirmation.confirmLabel}</button></div>
+      </div>
     {/if}
 
     {#if revealedToken}
@@ -3731,6 +6157,6 @@
     {/if}
 
     <div class="sr-only" aria-live="polite" aria-atomic="true">{liveAnnouncement}</div>
-    <div class="toast-stack" aria-live="polite" aria-atomic="true">{#each toasts as item (item.id)}<div class={`toast ${item.kind}`}><span>{item.kind === 'success' ? '✓' : item.kind === 'error' ? '!' : 'i'}</span>{item.message}<button class="icon-button tiny" type="button" aria-label="Dismiss notification" on:click={() => toasts = toasts.filter((toastItem) => toastItem.id !== item.id)}>×</button></div>{/each}</div>
+    <div class="toast-stack" aria-label="Notifications">{#each toasts as item (item.id)}<div class={`toast ${item.kind}`} role={item.role} aria-live={item.live} aria-atomic="true"><span aria-hidden="true">{item.kind === 'success' ? '✓' : item.kind === 'error' ? '!' : 'i'}</span><span class="toast-message">{item.message}</span>{#if item.action}<button class="toast-action" type="button" disabled={item.action.pending} on:click={() => void runToastAction(item)}>{item.action.pending ? 'Working…' : item.action.label}</button>{/if}<button class="icon-button tiny" type="button" aria-label="Dismiss notification" on:click={() => toasts = toasts.filter((toastItem) => toastItem.id !== item.id)}>×</button></div>{/each}</div>
   </div>
 {/if}

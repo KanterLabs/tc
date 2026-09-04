@@ -33,6 +33,11 @@ type TaskInput struct {
 	DueAtSet    bool
 	Labels      []string
 	LabelsSet   bool
+	// ParentTaskID accepts an opaque task ID or project-local task key. A
+	// separate set flag distinguishes an omitted patch field from an explicit
+	// null that unlinks the task from its parent.
+	ParentTaskID *string
+	ParentSet    bool
 }
 
 const (
@@ -105,7 +110,21 @@ func validateTaskInput(input TaskInput, creating bool) (TaskInput, error) {
 	if len(input.Labels) > 100 {
 		return TaskInput{}, invalid("too many labels", nil)
 	}
+	if input.ParentTaskID != nil {
+		value := strings.TrimSpace(*input.ParentTaskID)
+		if value == "" {
+			return TaskInput{}, invalid("parent_task_id must not be empty", nil)
+		}
+		input.ParentTaskID = &value
+	}
 	return input, nil
+}
+
+func nullableStringValue(value *string) string {
+	if value == nil {
+		return ""
+	}
+	return *value
 }
 
 // validateBugInput normalizes patch values and enforces bounded text sizes.
@@ -210,6 +229,20 @@ func (s *Store) CreateTask(ctx context.Context, projectID string, input TaskInpu
 	if err != nil {
 		return Task{}, err
 	}
+	var parent *hierarchyTask
+	if validated.ParentTaskID != nil {
+		resolved, parentErr := resolveHierarchyTask(ctx, s.DB, *validated.ParentTaskID)
+		if parentErr != nil {
+			return Task{}, parentErr
+		}
+		if resolved.ProjectID != project.ID {
+			return Task{}, hierarchyInvalid(ErrHierarchyCrossProject, "parent and child must belong to the same project", map[string]any{
+				"child_project_id":  project.ID,
+				"parent_project_id": resolved.ProjectID,
+			}, ErrInvalid)
+		}
+		parent = &resolved
+	}
 	columnID := ""
 	if validated.ColumnID != nil {
 		columnID = strings.TrimSpace(*validated.ColumnID)
@@ -225,6 +258,9 @@ func (s *Store) CreateTask(ctx context.Context, projectID string, input TaskInpu
 	}
 	if err != nil {
 		return Task{}, err
+	}
+	if column.ArchivedAt != nil {
+		return Task{}, invalid("column is archived", nil)
 	}
 	if kind == bugKind && column.SemanticState == "completed" {
 		return Task{}, invalid("bugs must be resolved before entering a completed column", nil)
@@ -257,20 +293,39 @@ func (s *Store) CreateTask(ctx context.Context, projectID string, input TaskInpu
 		dueAt = *validated.DueAt
 	}
 	id, created := newID(), now()
-	completedAt := any(nil)
-	if column.SemanticState == "completed" {
-		completedAt = created
-	}
 	var number int
 	err = s.withTx(ctx, func(tx *sql.Tx) error {
 		if _, err := tx.ExecContext(ctx, `INSERT INTO project_counters(project_id, next_number) VALUES (?, 2) ON CONFLICT(project_id) DO UPDATE SET next_number = project_counters.next_number + 1`, project.ID); err != nil {
 			return err
 		}
+		// The counter write above acquires SQLite's writer lock before this
+		// authoritative read. A column can be reclassified or archived after
+		// preflight while this create waits; use the state that will actually
+		// govern the inserted task and roll back the counter on rejection.
+		destinationState, err := authoritativeColumnStateTx(ctx, tx, column.ID, project.ID)
+		if err != nil {
+			return err
+		}
+		if kind == bugKind && destinationState == "completed" {
+			return invalid("bugs must be resolved before entering a completed column", nil)
+		}
+		var completedAt any
+		if destinationState == "completed" {
+			completedAt = created
+		}
 		if err := tx.QueryRowContext(ctx, `SELECT next_number - 1 FROM project_counters WHERE project_id = ?`, project.ID).Scan(&number); err != nil {
 			return err
 		}
-		if _, err := tx.ExecContext(ctx, `INSERT INTO tasks(id, project_id, number, column_id, kind, title, description, priority, position, assignee_id, due_at, version, completed_at, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULLIF(?, ''), NULLIF(?, ''), 1, ?, ?, ?)`, id, project.ID, number, column.ID, kind, *validated.Title, description, priority, position, assignee, dueAt, completedAt, created, created); err != nil {
-			return err
+		parentID := ""
+		if parent != nil {
+			parentID = parent.ID
+		}
+		if insertErr := txExecTaskCreate(ctx, tx, id, project.ID, number, column.ID, kind, *validated.Title, description, priority, position, assignee, dueAt, completedAt, created, parentID); insertErr != nil {
+			child := hierarchyTask{ID: id, ProjectID: project.ID, Number: number, Key: fmt.Sprintf("%s-%d", project.Key, number)}
+			if parent != nil {
+				return mapHierarchyMutationError(insertErr, child, *parent)
+			}
+			return insertErr
 		}
 		if validated.LabelsSet {
 			if err := replaceTaskLabels(ctx, tx, id, project.ID, validated.Labels); err != nil {
@@ -286,8 +341,24 @@ func (s *Store) CreateTask(ctx context.Context, projectID string, input TaskInpu
 		if kind == bugKind {
 			eventType = "bug.created"
 		}
-		_, err := insertEvent(ctx, tx, eventType, actorID, project.ID, id, map[string]any{"number": number})
-		return err
+		payload := map[string]any{"number": number}
+		if parent != nil {
+			payload["parent_id"] = parent.ID
+			payload["parent_key"] = parent.Key
+		}
+		if _, err := insertEvent(ctx, tx, eventType, actorID, project.ID, id, payload); err != nil {
+			return err
+		}
+		if parent != nil {
+			_, err := insertEvent(ctx, tx, "task.parent_linked", actorID, project.ID, id, map[string]any{
+				"child_id":   id,
+				"parent_id":  parent.ID,
+				"parent_key": parent.Key,
+				"version":    1,
+			})
+			return err
+		}
+		return nil
 	})
 	if err != nil {
 		return Task{}, err
@@ -311,6 +382,41 @@ func (s *Store) GetTask(ctx context.Context, id string) (Task, error) {
 		return Task{}, err
 	}
 	return task, nil
+}
+
+// GetTaskForRestore returns the current task snapshot and whether it is soft
+// deleted. Restore is intentionally the only caller that can inspect a
+// deleted task; normal reads continue to hide deleted work.
+func (s *Store) GetTaskForRestore(ctx context.Context, reference string) (Task, bool, error) {
+	reference = strings.TrimSpace(reference)
+	row := s.DB.QueryRowContext(ctx, `SELECT `+taskColumns+`, t.deleted_at
+		FROM tasks t
+		JOIN projects p ON p.id=t.project_id
+		WHERE t.id=? OR lower(p.key || '-' || CAST(t.number AS TEXT))=lower(?)
+		LIMIT 1`, reference, reference)
+	var task Task
+	var deletedAt sql.NullString
+	var assignee, claimed, claimExpiry, due, completed, parent sql.NullString
+	if err := row.Scan(&task.ID, &task.Number, &task.ProjectID, &task.Kind, &task.ColumnID, &task.Title, &task.Description, &task.Priority, &task.Position, &assignee, &claimed, &claimExpiry, &due, &task.Version, &completed, &task.CreatedAt, &task.UpdatedAt, &parent, &deletedAt); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return Task{}, false, notFound("task not found")
+		}
+		return Task{}, false, err
+	}
+	task.Assignee, task.ClaimedBy, task.ClaimExpiresAt, task.DueAt, task.CompletedAt, task.ParentTaskID = nullableString(assignee), nullableString(claimed), nullableString(claimExpiry), nullableString(due), nullableString(completed), nullableString(parent)
+	task.ParentID = task.ParentTaskID
+	if err := s.enrichTask(ctx, &task); err != nil {
+		return Task{}, false, err
+	}
+	if err := s.populateDependencySummary(ctx, &task); err != nil {
+		return Task{}, false, err
+	}
+	return task, deletedAt.Valid, nil
+}
+
+func txExecTaskCreate(ctx context.Context, tx *sql.Tx, id, projectID string, number int, columnID, kind, title, description, priority string, position float64, assignee, dueAt string, completedAt any, created, parentID string) error {
+	_, err := tx.ExecContext(ctx, `INSERT INTO tasks(id, project_id, number, column_id, kind, title, description, priority, position, assignee_id, due_at, version, completed_at, created_at, updated_at, parent_task_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULLIF(?, ''), NULLIF(?, ''), 1, ?, ?, ?, NULLIF(?, ''))`, id, projectID, number, columnID, kind, title, description, priority, position, assignee, dueAt, completedAt, created, created, parentID)
+	return err
 }
 
 // ResolveTaskReference accepts either an opaque task ID or the project-local
@@ -373,12 +479,18 @@ func (s *Store) enrichTaskAt(ctx context.Context, task *Task, at time.Time) erro
 		}
 		task.Bug = bug
 	}
+	if err := s.populateTaskChecklist(ctx, task); err != nil {
+		return err
+	}
 	work, err := s.agentWorkAt(ctx, task.ID, at)
 	if err != nil {
 		return err
 	}
 	task.AgentWork = work
-	return s.DB.QueryRowContext(ctx, `SELECT COUNT(1) FROM comments WHERE task_id=?`, task.ID).Scan(&task.CommentCount)
+	if err := s.DB.QueryRowContext(ctx, `SELECT COUNT(1) FROM comments WHERE task_id=? AND deleted_at IS NULL`, task.ID).Scan(&task.CommentCount); err != nil {
+		return err
+	}
+	return s.populateTaskHierarchyAt(ctx, task, at)
 }
 
 func (s *Store) ListTasks(ctx context.Context, projectID string, filter TaskFilter) ([]Task, bool, error) {
@@ -391,8 +503,91 @@ func (s *Store) ListTasksWithExtra(ctx context.Context, projectID string, filter
 	return s.listTasks(ctx, projectID, filter, true)
 }
 
+// ListTasksCursor is the large-board task collection path. It always fetches
+// one sentinel row and returns a strict keyset cursor for the last visible
+// task. Retained callers can continue using ListTasks/ListTasksWithExtra with
+// the integer offset in TaskFilter.Cursor.
+func (s *Store) ListTasksCursor(ctx context.Context, projectID string, filter TaskFilter) ([]Task, bool, string, error) {
+	return s.listTasksCursor(ctx, projectID, filter, true)
+}
+
+// taskCollectionSnapshot is the read-side boundary for keyset pagination.
+// EventCursor is a durable, project-scoped revision: every task, column,
+// label, comment, dependency, hierarchy, and agent-work mutation that can
+// affect an enriched task collection emits a project event. Heartbeats are a
+// deliberate exception because they only refresh task_agent_work.updated_at
+// without changing the task version or emitting activity; the durable
+// task-collection revision catches those changes so action-needed/stale
+// membership cannot drift across pages. The revision is intentionally generic
+// so future eventless collection mutations can share the same escape hatch.
+type taskCollectionSnapshot struct {
+	EventCursor            int64
+	TaskCollectionRevision int64
+}
+
+func (s *Store) taskCollectionSnapshot(ctx context.Context, projectID string) (taskCollectionSnapshot, error) {
+	var snapshot taskCollectionSnapshot
+	// Keep both boundaries in one statement so they come from one SQLite read
+	// snapshot. The project event revision is indexed by project and the task
+	// collection revision is a single project row, making this O(1) regardless of board
+	// size. COALESCE preserves the retained ListTasks behavior for an unknown
+	// project, which simply has no matching task rows.
+	if err := s.DB.QueryRowContext(ctx, `SELECT COALESCE((SELECT MAX(cursor) FROM events WHERE project_id=?), 0), COALESCE((SELECT task_collection_revision FROM projects WHERE id=?), 0)`, projectID, projectID).Scan(&snapshot.EventCursor, &snapshot.TaskCollectionRevision); err != nil {
+		return snapshot, err
+	}
+	return snapshot, nil
+}
+
+func taskCollectionChanged(expected, current taskCollectionSnapshot) error {
+	details := map[string]any{
+		"expected_revision":                 expected.EventCursor,
+		"current_revision":                  current.EventCursor,
+		"expected_task_collection_revision": expected.TaskCollectionRevision,
+		"current_task_collection_revision":  current.TaskCollectionRevision,
+		"restart":                           true,
+	}
+	return &Error{Kind: ErrTaskCollectionChanged, Message: "task collection changed; restart pagination from the first page", Details: details}
+}
+
 func (s *Store) listTasks(ctx context.Context, projectID string, filter TaskFilter, allowExtra bool) ([]Task, bool, error) {
+	tasks, more, _, err := s.listTasksCursor(ctx, projectID, filter, allowExtra)
+	return tasks, more, err
+}
+
+func (s *Store) listTasksCursor(ctx context.Context, projectID string, filter TaskFilter, allowExtra bool) ([]Task, bool, string, error) {
+	sortName, err := NormalizeTaskSort(filter.Sort)
+	if err != nil {
+		return nil, false, "", invalid(err.Error(), nil)
+	}
+	filter.Sort = sortName
+	var cursor TaskCursor
+	useKeyset := strings.TrimSpace(filter.CursorToken) != ""
 	readAt := time.Now().UTC()
+	var expectedSnapshot taskCollectionSnapshot
+	if useKeyset {
+		cursor, err = DecodeTaskCursor(filter.CursorToken)
+		if err != nil {
+			return nil, false, "", invalid(err.Error(), nil)
+		}
+		if cursor.Sort != filter.Sort || cursor.Descending != filter.Descending {
+			return nil, false, "", invalid("cursor does not match the requested sort", nil)
+		}
+		if cursor.ProjectID != projectID {
+			return nil, false, "", invalid("cursor does not match the requested project", nil)
+		}
+		readAt, err = time.Parse(time.RFC3339Nano, cursor.ReadAt)
+		if err != nil {
+			return nil, false, "", invalid("cursor is invalid", nil)
+		}
+		readAt = readAt.UTC()
+	}
+	expectedSnapshot, err = s.taskCollectionSnapshot(ctx, projectID)
+	if err != nil {
+		return nil, false, "", err
+	}
+	if useKeyset && (expectedSnapshot.EventCursor != cursor.CollectionRevision || expectedSnapshot.TaskCollectionRevision != cursor.TaskCollectionRevision) {
+		return nil, false, "", taskCollectionChanged(taskCollectionSnapshot{EventCursor: cursor.CollectionRevision, TaskCollectionRevision: cursor.TaskCollectionRevision}, expectedSnapshot)
+	}
 	staleCutoff := agentWorkStaleCutoff(readAt)
 	if filter.Limit <= 0 {
 		filter.Limit = 50
@@ -404,7 +599,7 @@ func (s *Store) listTasks(ctx context.Context, projectID string, filter TaskFilt
 	if filter.Limit > maxLimit {
 		filter.Limit = maxLimit
 	}
-	query := `SELECT ` + taskColumns + ` FROM tasks t JOIN columns c ON c.id=t.column_id WHERE t.project_id = ? AND t.deleted_at IS NULL`
+	query := `SELECT ` + taskColumns + ` FROM tasks t JOIN columns c ON c.id=t.column_id JOIN projects p ON p.id=t.project_id WHERE t.project_id = ? AND t.deleted_at IS NULL`
 	args := []any{projectID}
 	if filter.State != "" {
 		query += ` AND c.semantic_state = ?`
@@ -479,7 +674,7 @@ func (s *Store) listTasks(ctx context.Context, projectID string, filter TaskFilt
 				  AND prerequisite.deleted_at IS NULL
 				  AND (prerequisite.completed_at IS NULL OR prerequisite_column.semantic_state <> 'completed'))`
 		default:
-			return nil, false, invalid("dependency must be blocked or ready", map[string]any{"dependency": filter.Dependency})
+			return nil, false, "", invalid("dependency must be blocked or ready", map[string]any{"dependency": filter.Dependency})
 		}
 	}
 	// Completion suppresses the liveness classification of a retained
@@ -509,54 +704,98 @@ func (s *Store) listTasks(ctx context.Context, projectID string, filter TaskFilt
 		args = append(args, filter.Label, filter.Label)
 	}
 	if filter.Query != "" {
-		query += ` AND (lower(t.title) LIKE ? OR lower(t.description) LIKE ? OR EXISTS (SELECT 1 FROM bug_details bd WHERE bd.task_id=t.id AND (lower(bd.actual_behavior) LIKE ? OR lower(bd.expected_behavior) LIKE ? OR lower(bd.reproduction_steps) LIKE ? OR lower(bd.environment) LIKE ? OR lower(bd.affected_version) LIKE ?)))`
+		query += ` AND (lower(p.key || '-' || CAST(t.number AS TEXT)) LIKE ? OR lower(t.title) LIKE ? OR lower(t.description) LIKE ? OR EXISTS (SELECT 1 FROM bug_details bd WHERE bd.task_id=t.id AND (lower(bd.actual_behavior) LIKE ? OR lower(bd.expected_behavior) LIKE ? OR lower(bd.reproduction_steps) LIKE ? OR lower(bd.environment) LIKE ? OR lower(bd.affected_version) LIKE ?)))`
 		q := "%" + strings.ToLower(filter.Query) + "%"
-		args = append(args, q, q, q, q, q, q, q)
+		args = append(args, q, q, q, q, q, q, q, q)
 	}
 	if filter.UpdatedAfter != nil {
 		query += ` AND t.updated_at > ?`
 		args = append(args, filter.UpdatedAfter.UTC().Format(time.RFC3339Nano))
 	}
-	// Task numbers are only unique within a project and do not describe the
-	// board ordering below. Treat Cursor as an opaque row offset so a page
-	// boundary cannot skip rows whose numbers sort lower in a later column.
-	query += ` ORDER BY c.position, t.position, t.number, t.id LIMIT ? OFFSET ?`
-	args = append(args, filter.Limit+1, filter.Cursor)
+	if useKeyset {
+		query, args, err = appendTaskCursorPredicate(query, args, cursor, filter.Descending)
+		if err != nil {
+			return nil, false, "", invalid(err.Error(), nil)
+		}
+	}
+	order, err := taskOrderSQL(filter.Sort, filter.Descending)
+	if err != nil {
+		return nil, false, "", invalid(err.Error(), nil)
+	}
+	// Offset remains available only for retained callers that do not provide a
+	// keyset token. New board requests use a strict tuple predicate and start
+	// from the first matching row without paying an ever-growing OFFSET cost.
+	query += ` ORDER BY ` + order + ` LIMIT ?`
+	args = append(args, filter.Limit+1)
+	if !useKeyset {
+		query += ` OFFSET ?`
+		args = append(args, filter.Cursor)
+	}
 	rows, err := s.DB.QueryContext(ctx, query, args...)
 	if err != nil {
-		return nil, false, err
+		return nil, false, "", err
 	}
 	result := make([]Task, 0, filter.Limit)
 	for rows.Next() {
 		task, err := taskFromRow(rows)
 		if err != nil {
 			rows.Close()
-			return nil, false, err
+			return nil, false, "", err
 		}
 		result = append(result, task)
 	}
 	if err := rows.Err(); err != nil {
 		rows.Close()
-		return nil, false, err
+		return nil, false, "", err
 	}
 	rows.Close()
 	hasMore := len(result) > filter.Limit
+	nextCursor := ""
 	if hasMore {
 		result = result[:filter.Limit]
 	}
 	for i := range result {
 		if err := s.enrichTaskAt(ctx, &result[i], readAt); err != nil {
-			return nil, false, err
+			return nil, false, "", err
 		}
 	}
 	if err := s.populateTaskDependencySummaries(ctx, result); err != nil {
-		return nil, false, err
+		return nil, false, "", err
 	}
-	return result, hasMore, nil
+	currentSnapshot, err := s.taskCollectionSnapshot(ctx, projectID)
+	if err != nil {
+		return nil, false, "", err
+	}
+	if currentSnapshot != expectedSnapshot {
+		return nil, false, "", taskCollectionChanged(expectedSnapshot, currentSnapshot)
+	}
+	if hasMore && len(result) > 0 {
+		nextCursor = EncodeTaskCursor(result[len(result)-1], filter.Sort, filter.Descending, currentSnapshot.EventCursor, readAt, currentSnapshot.TaskCollectionRevision)
+	}
+	return result, hasMore, nextCursor, nil
 }
 
 func (s *Store) UpdateTask(ctx context.Context, id string, input TaskInput, expected int64, actorID string) (Task, error) {
 	return s.UpdateTaskWithClaimOverride(ctx, id, input, expected, actorID, false)
+}
+
+func validateTaskBugLifecycleTx(ctx context.Context, tx *sql.Tx, taskID, kind, destinationState string) error {
+	if kind != bugKind {
+		return nil
+	}
+	var resolution sql.NullString
+	err := tx.QueryRowContext(ctx, `SELECT resolution FROM bug_details WHERE task_id=?`, taskID).Scan(&resolution)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return err
+	}
+	resolved := err == nil && resolution.Valid && strings.TrimSpace(resolution.String) != ""
+	if destinationState == "completed" && !resolved {
+		return invalid("bugs must be resolved before entering a completed column", nil)
+	}
+	if destinationState != "completed" && resolved {
+		return invalid("resolved bugs must be reopened before leaving a completed column", nil)
+	}
+	return nil
 }
 
 // UpdateTaskWithClaimOverride applies a task patch while atomically honoring
@@ -574,6 +813,30 @@ func (s *Store) UpdateTaskWithClaimOverride(ctx context.Context, id string, inpu
 	if err != nil {
 		return Task{}, err
 	}
+	parentSet := validated.ParentSet || validated.ParentTaskID != nil
+	parentID := ""
+	if current.ParentTaskID != nil {
+		parentID = *current.ParentTaskID
+	}
+	var parent *hierarchyTask
+	if parentSet {
+		parentID = ""
+		if validated.ParentTaskID != nil {
+			resolved, parentErr := resolveHierarchyTask(ctx, s.DB, *validated.ParentTaskID)
+			if parentErr != nil {
+				return Task{}, parentErr
+			}
+			if resolved.ProjectID != current.ProjectID {
+				return Task{}, hierarchyInvalid(ErrHierarchyCrossProject, "parent and child must belong to the same project", map[string]any{
+					"child_project_id":  current.ProjectID,
+					"parent_project_id": resolved.ProjectID,
+				}, ErrInvalid)
+			}
+			parent = &resolved
+			parentID = resolved.ID
+		}
+	}
+	parentChanged := parentSet && parentID != nullableStringValue(current.ParentTaskID)
 	if current.Kind == "" {
 		// Databases opened before migration 008 are upgraded before serving
 		// requests, but retain the safe default for direct store test fixtures.
@@ -656,12 +919,18 @@ func (s *Store) UpdateTaskWithClaimOverride(ctx context.Context, id string, inpu
 	if column.ProjectID != current.ProjectID {
 		return Task{}, invalid("column belongs to another project", nil)
 	}
+	if column.ArchivedAt != nil {
+		return Task{}, invalid("column is archived", nil)
+	}
 	sourceColumn := column
 	if current.ColumnID != column.ID {
 		sourceColumn, err = s.GetColumn(ctx, current.ColumnID)
 		if err != nil {
 			return Task{}, err
 		}
+	}
+	if sourceColumn.ArchivedAt != nil {
+		return Task{}, invalid("task is assigned to an archived column", nil)
 	}
 	if kind == bugKind && column.SemanticState == "completed" && (current.Bug == nil || current.Bug.Resolution == nil) {
 		return Task{}, invalid("bugs must be resolved before entering a completed column", nil)
@@ -675,25 +944,33 @@ func (s *Store) UpdateTaskWithClaimOverride(ctx context.Context, id string, inpu
 		}
 	}
 	updated := now()
-	completedAt := any(nil)
-	if column.SemanticState == "completed" {
-		if current.CompletedAt != nil {
-			completedAt = *current.CompletedAt
-		} else {
-			completedAt = updated
-		}
-	}
 	err = s.withTx(ctx, func(tx *sql.Tx) error {
-		beforeDependency := dependencyTaskFromTask(current, sourceColumn.SemanticState)
-		query := `UPDATE tasks SET kind=?, title=?, description=?, priority=?, column_id=?, position=?, assignee_id=NULLIF(?, ''), due_at=NULLIF(?, ''), version=version+1, completed_at=?, updated_at=? WHERE id=? AND version=? AND deleted_at IS NULL`
-		args := []any{kind, title, description, priority, columnID, position, assignee, dueAt, completedAt, updated, id, expected}
+		checklistStatus := checklistCompletionStatus{}
+		// Derive completion from the authoritative column rows inside the write.
+		// The target column can be reclassified by an administrator between the
+		// preflight read above and this transaction; using its current semantic
+		// state keeps both completed_at and the checklist policy decision aligned.
+		// A board can hold only the first cursor page in memory. When a task
+		// changes columns without an explicit insertion position, calculate the
+		// authoritative destination tail inside the guarded writer statement.
+		// Keeping this in the UPDATE avoids retaining a stale read snapshot while
+		// waiting for another SQLite writer.
+		appendToDestination := current.ColumnID != columnID && validated.Position == nil
+		query := `UPDATE tasks SET kind=?, title=?, description=?, priority=?, column_id=?, position=CASE WHEN ? THEN (SELECT COALESCE(MAX(candidate.position)+1, 0) FROM tasks candidate WHERE candidate.column_id=? AND candidate.deleted_at IS NULL AND candidate.id<>?) ELSE ? END, assignee_id=NULLIF(?, ''), due_at=NULLIF(?, ''), parent_task_id=NULLIF(?, ''), version=version+1, completed_at=CASE WHEN (SELECT semantic_state FROM columns WHERE id=?) = 'completed' THEN CASE WHEN (SELECT semantic_state FROM columns WHERE id=tasks.column_id) = 'completed' THEN tasks.completed_at ELSE ? END ELSE NULL END, updated_at=? WHERE id=? AND version=? AND deleted_at IS NULL`
+		args := []any{kind, title, description, priority, columnID, appendToDestination, columnID, id, position, assignee, dueAt, parentID, columnID, updated, updated, id, expected}
 		if !allowClaimOverride {
 			query += ` AND (claimed_by IS NULL OR claim_expires_at IS NULL OR julianday(claim_expires_at) <= julianday(?) OR claimed_by=?)`
 			args = append(args, updated, actorID)
 		}
 		result, err := tx.ExecContext(ctx, query, args...)
 		if err != nil {
-			return mapDependencyLifecycleError(ctx, tx, err, dependencyLifecycleTarget{TaskID: id})
+			mapped := mapDependencyLifecycleError(ctx, tx, err, dependencyLifecycleTarget{TaskID: id})
+			child := hierarchyTask{ID: current.ID, ProjectID: current.ProjectID, Number: current.Number, Key: current.Key}
+			parentTask := hierarchyTask{}
+			if parent != nil {
+				parentTask = *parent
+			}
+			return mapHierarchyMutationError(mapped, child, parentTask)
 		}
 		count, _ := result.RowsAffected()
 		if count == 0 {
@@ -707,6 +984,35 @@ func (s *Store) UpdateTaskWithClaimOverride(ctx context.Context, id string, inpu
 				}
 			}
 			return conflict("task has changed", map[string]any{"current": current})
+		}
+		destinationState, err := authoritativeColumnStateTx(ctx, tx, columnID, current.ProjectID)
+		if err != nil {
+			return err
+		}
+		sourceState := destinationState
+		if current.ColumnID != columnID {
+			sourceState, err = authoritativeColumnStateTx(ctx, tx, current.ColumnID, current.ProjectID)
+			if err != nil {
+				return err
+			}
+		}
+		if err := validateTaskBugLifecycleTx(ctx, tx, id, kind, destinationState); err != nil {
+			return err
+		}
+		beforeDependency := dependencyTaskFromTask(current, sourceState)
+		completionTransition := sourceState != "completed" && destinationState == "completed"
+		// Evaluate the policy only after the guarded task update has acquired the
+		// SQLite writer transaction. A rejection then rolls back the task version,
+		// column, and all activity atomically. Keep this ordering when merging the
+		// admin column semantics work so direct task moves cannot bypass TC-10.
+		if completionTransition {
+			checklistStatus, err = checklistCompletionStatusForTaskTx(ctx, tx, current.ProjectID, current.ID)
+			if err != nil {
+				return err
+			}
+			if err := rejectIncompleteChecklist(checklistStatus); err != nil {
+				return err
+			}
 		}
 		if validated.LabelsSet {
 			if err := replaceTaskLabels(ctx, tx, id, current.ProjectID, validated.Labels); err != nil {
@@ -724,12 +1030,46 @@ func (s *Store) UpdateTaskWithClaimOverride(ctx context.Context, id string, inpu
 		}
 		taskMutation := validated.Title != nil || validated.Description != nil || validated.Priority != nil || validated.ColumnID != nil || validated.Position != nil || validated.AssigneeSet || validated.DueAtSet || validated.LabelsSet || kind != current.Kind
 		if taskMutation {
-			if _, err = insertEvent(ctx, tx, "task.updated", actorID, current.ProjectID, id, map[string]any{"version": expected + 1}); err != nil {
+			eventPayload := map[string]any{"version": expected + 1}
+			if completionTransition {
+				addChecklistCompletionEventFields(eventPayload, checklistStatus)
+			}
+			if _, err = insertEvent(ctx, tx, "task.updated", actorID, current.ProjectID, id, eventPayload); err != nil {
 				return err
 			}
 		}
 		if kind == bugKind && (bugMutation || current.Kind != kind) {
 			if _, err = insertEvent(ctx, tx, "bug.updated", actorID, current.ProjectID, id, map[string]any{"version": expected + 1}); err != nil {
+				return err
+			}
+		}
+		if parentChanged {
+			payload := map[string]any{
+				"child_id": id,
+				"version":  expected + 1,
+			}
+			if parent != nil {
+				payload["parent_id"] = parent.ID
+				payload["parent_key"] = parent.Key
+			}
+			if previous := nullableStringValue(current.ParentTaskID); previous != "" {
+				payload["previous_parent_id"] = previous
+			}
+			eventType := "task.parent_unlinked"
+			if parent != nil {
+				eventType = "task.parent_linked"
+			}
+			if _, err = insertEvent(ctx, tx, eventType, actorID, current.ProjectID, id, payload); err != nil {
+				return err
+			}
+		}
+		// An empty patch or same-value kind/parent-only patch still advances the
+		// task version and updated_at in the guarded UPDATE above. Preserve the
+		// existing event cardinality for semantic task, bug, and parent updates,
+		// but record one fallback task event when none of those paths emitted an
+		// event so collection cursors observe the visible write.
+		if !taskMutation && !bugMutation && !parentChanged {
+			if _, err = insertEvent(ctx, tx, "task.updated", actorID, current.ProjectID, id, map[string]any{"version": expected + 1}); err != nil {
 				return err
 			}
 		}
@@ -772,7 +1112,9 @@ func (s *Store) DeleteTaskWithClaimOverride(ctx context.Context, id string, expe
 		}
 		result, err := tx.ExecContext(ctx, query, args...)
 		if err != nil {
-			return mapDependencyLifecycleError(ctx, tx, err, dependencyLifecycleTarget{TaskID: id, AllDependents: true})
+			mapped := mapDependencyLifecycleError(ctx, tx, err, dependencyLifecycleTarget{TaskID: id, AllDependents: true})
+			child := hierarchyTask{ID: current.ID, ProjectID: current.ProjectID, Number: current.Number, Key: current.Key}
+			return mapHierarchyMutationError(mapped, child, hierarchyTask{})
 		}
 		count, _ := result.RowsAffected()
 		if count == 0 {
@@ -791,6 +1133,67 @@ func (s *Store) DeleteTaskWithClaimOverride(ctx context.Context, id string, expe
 		return err
 	})
 	return err
+}
+
+// RestoreTask reverses one soft delete with the deleted version as its
+// optimistic-concurrency token. The guarded UPDATE and restore event are one
+// transaction, so an Undo cannot resurrect a task after another writer has
+// changed or restored it. Retained claims are cleared on restore; an undo is
+// not allowed to revive a lease whose owner may no longer be present.
+func (s *Store) RestoreTask(ctx context.Context, id string, expected int64, actorID string) (Task, error) {
+	if expected <= 0 {
+		return Task{}, ErrPrecondition
+	}
+	id = strings.TrimSpace(id)
+	actorID = strings.TrimSpace(actorID)
+	if id == "" {
+		return Task{}, notFound("task not found")
+	}
+	if actorID == "" {
+		return Task{}, invalid("actor is required", nil)
+	}
+
+	current, deleted, err := s.GetTaskForRestore(ctx, id)
+	if err != nil {
+		return Task{}, err
+	}
+	if !deleted {
+		return Task{}, conflict("task has already been restored", map[string]any{"current": current})
+	}
+
+	err = s.withTx(ctx, func(tx *sql.Tx) error {
+		result, updateErr := tx.ExecContext(ctx, `UPDATE tasks
+			SET deleted_at=NULL,
+				claimed_by=NULL,
+				claim_expires_at=NULL,
+				version=version+1,
+				updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now')
+			WHERE id=? AND version=? AND deleted_at IS NOT NULL
+				AND version < 9223372036854775807`, id, expected)
+		if updateErr != nil {
+			return mapDependencyLifecycleError(ctx, tx, updateErr, dependencyLifecycleTarget{TaskID: id})
+		}
+		changed, _ := result.RowsAffected()
+		if changed == 0 {
+			latest, latestErr := taskFromRow(tx.QueryRowContext(ctx, `SELECT `+taskColumns+` FROM tasks t WHERE t.id=?`, id))
+			if errors.Is(latestErr, sql.ErrNoRows) {
+				return notFound("task not found")
+			}
+			if latestErr != nil {
+				return latestErr
+			}
+			return conflict("task has changed", map[string]any{"current": latest})
+		}
+		_, eventErr := insertEvent(ctx, tx, "task.restored", actorID, current.ProjectID, id, map[string]any{
+			"number":  current.Number,
+			"version": expected + 1,
+		})
+		return eventErr
+	})
+	if err != nil {
+		return Task{}, err
+	}
+	return s.GetTask(ctx, id)
 }
 
 // activeClaimByOtherTx reads the current row after a guarded mutation did not
@@ -1071,15 +1474,8 @@ func (s *Store) transitionTask(ctx context.Context, id, actorID string, expected
 	if err != nil {
 		return Task{}, err
 	}
-	sourceColumn := column
-	if current.ColumnID != column.ID {
-		sourceColumn, err = s.GetColumn(ctx, current.ColumnID)
-		if err != nil {
-			return Task{}, err
-		}
-	}
 	err = s.withTx(ctx, func(tx *sql.Tx) error {
-		beforeDependency := dependencyTaskFromTask(current, sourceColumn.SemanticState)
+		checklistStatus := checklistCompletionStatus{}
 		// Compare the task's pre-update column state inside the guarded UPDATE.
 		// Repeating complete while already completed must preserve its original
 		// timestamp; only a transition into completed gets a new one.
@@ -1106,6 +1502,32 @@ func (s *Store) transitionTask(ctx context.Context, id, actorID string, expected
 			}
 			return conflict("task has changed", map[string]any{"current": current})
 		}
+		destinationState, err := authoritativeColumnStateTx(ctx, tx, column.ID, current.ProjectID)
+		if err != nil {
+			return err
+		}
+		if destinationState != state {
+			return conflict("task destination changed semantic state", map[string]any{"column_id": column.ID, "expected_state": state, "current_state": destinationState})
+		}
+		sourceState := destinationState
+		if current.ColumnID != column.ID {
+			sourceState, err = authoritativeColumnStateTx(ctx, tx, current.ColumnID, current.ProjectID)
+			if err != nil {
+				return err
+			}
+		}
+		beforeDependency := dependencyTaskFromTask(current, sourceState)
+		if state == "completed" {
+			// Keep policy evaluation after the guarded write so a require-policy
+			// rejection rolls back the transition, version, and activity atomically.
+			checklistStatus, err = checklistCompletionStatusForTaskTx(ctx, tx, current.ProjectID, current.ID)
+			if err != nil {
+				return err
+			}
+			if err := rejectIncompleteChecklist(checklistStatus); err != nil {
+				return err
+			}
+		}
 		if strings.TrimSpace(note) != "" {
 			if len(note) > 10000 {
 				return invalid("action note is too long", nil)
@@ -1118,7 +1540,11 @@ func (s *Store) transitionTask(ctx context.Context, id, actorID string, expected
 				return err
 			}
 		}
-		if _, err = insertEvent(ctx, tx, eventType, actorID, current.ProjectID, id, map[string]any{"column_id": column.ID}); err != nil {
+		eventPayload := map[string]any{"column_id": column.ID}
+		if state == "completed" {
+			addChecklistCompletionEventFields(eventPayload, checklistStatus)
+		}
+		if _, err = insertEvent(ctx, tx, eventType, actorID, current.ProjectID, id, eventPayload); err != nil {
 			return err
 		}
 		change, stateChanged, err := dependencyTaskStateChange(ctx, tx, beforeDependency)

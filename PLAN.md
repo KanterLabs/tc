@@ -321,9 +321,10 @@ it, and a human can observe the entire history in the UI.
 
 ## 9. Explicitly deferred scope
 
-- Multiple boards per project
-- Trello-compatible API behavior
-- Trello import
+- Multiple boards per project (the v1 board descriptor is virtual and remains
+  one board per project until an explicit additive migration decision)
+- Trello-compatible API behavior (the isolated Trello import adapter supports
+  only the documented conversion subset)
 - Attachments and object storage
 - Public bug/issue intake and external issue-tracker synchronization
 - Bug notifications, service-level agreements, and separate bug permissions
@@ -334,6 +335,10 @@ it, and a human can observe the entire history in the UI.
 - Rule-based automations
 - Rich-text collaborative editing
 - Native mobile applications
+
+Portable project export/import is now supported by the versioned
+`helm.portable` v1 API. It is additive and transactional, and does not change
+the disaster-recovery backup/restore contract.
 
 ## 10. Release definition
 
