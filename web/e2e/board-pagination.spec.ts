@@ -63,7 +63,7 @@ test('keeps large board pages bounded, filterable, and reconciled live', async (
   const ready = columnFor(collectionData(columnPayload), 'ready');
 
   const fixtureTasks: Task[] = [];
-  for (let index = 1; index <= boardPageSize + 2; index += 1) {
+  for (let index = 1; index <= boardPageSize * 2 + 2; index += 1) {
     fixtureTasks.push(await postJSON<Task>(request, `/api/v1/projects/${project.id}/tasks`, {
       title: `Page fixture ${String(index).padStart(2, '0')} ${runID}`,
       column_id: ready.id,
@@ -110,6 +110,7 @@ test('keeps large board pages bounded, filterable, and reconciled live', async (
   await expect(readyColumn).toBeVisible();
   await expect(readyColumn.locator('.task-card')).toHaveCount(boardPageSize);
   await expect(page.locator('.task-card')).toHaveCount(boardPageSize);
+  await expect(page.getByRole('button', { name: 'Retry columns', exact: true })).toHaveCount(0);
   await expect.poll(() => eventResponses, { timeout: 15_000 }).toBeGreaterThan(0);
 
   const firstReadyRequest = taskRequests.find((url) => {
@@ -146,8 +147,24 @@ test('keeps large board pages bounded, filterable, and reconciled live', async (
   await loadMore.focus();
   await expect(loadMore).toBeFocused();
   await loadMore.press('Enter');
+  await expect(readyColumn.locator('.task-card')).toHaveCount(boardPageSize * 2);
+  await expect(outsideCard).toHaveCount(0);
+  await expect(page.getByRole('button', { name: 'Retry columns', exact: true })).toHaveCount(0);
+
+  // A real failed page retains the loaded cards and offers a working retry.
+  // Ordinary pagination must not show that failure warning.
+  await page.route(`**/api/v1/projects/${project.id}/tasks?**`, async (route) => {
+    await route.fulfill({ status: 503, contentType: 'application/json', body: JSON.stringify({
+      error: { code: 'unavailable', message: 'Temporary page failure' }
+    }) });
+  }, { times: 1 });
+  await loadMore.click();
+  await expect(page.getByRole('button', { name: 'Retry columns', exact: true })).toBeVisible();
+  await expect(readyColumn.locator('.task-card')).toHaveCount(boardPageSize * 2);
+  await readyColumn.getByRole('button', { name: 'Retry', exact: true }).click();
   await expect(outsideCard).toBeVisible();
   await expect(readyColumn.locator('.task-card')).toHaveCount(fixtureTasks.length);
+  await expect(page.getByRole('button', { name: 'Retry columns', exact: true })).toHaveCount(0);
   await expect(loadMore).toHaveCount(0);
   await expect.poll(() => taskRequests.some((url) => {
     const params = taskRequestParams(url);
