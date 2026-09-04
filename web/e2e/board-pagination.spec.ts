@@ -162,10 +162,14 @@ test('keeps large board pages bounded, filterable, and reconciled live', async (
   await expect(page.getByRole('button', { name: 'Retry columns', exact: true })).toBeVisible();
   await expect(readyColumn.locator('.task-card')).toHaveCount(boardPageSize * 2);
   await readyColumn.getByRole('button', { name: 'Retry', exact: true }).click();
+  await expect(readyColumn.locator('.task-card')).toHaveCount(boardPageSize * 2);
+  await readyColumn.getByRole('button', { name: 'Show next cards', exact: true }).click();
   await expect(outsideCard).toBeVisible();
-  await expect(readyColumn.locator('.task-card')).toHaveCount(fixtureTasks.length);
+  await expect(readyColumn.locator('.task-card')).toHaveCount(2);
   await expect(page.getByRole('button', { name: 'Retry columns', exact: true })).toHaveCount(0);
   await expect(loadMore).toHaveCount(0);
+  await readyColumn.getByRole('button', { name: 'Show previous cards', exact: true }).click();
+  await expect(readyColumn.locator('.task-card')).toHaveCount(boardPageSize * 2);
   await expect.poll(() => taskRequests.some((url) => {
     const params = taskRequestParams(url);
     return params.get('column') === ready.id && Boolean(params.get('cursor')) && !params.get('q');

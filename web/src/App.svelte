@@ -329,6 +329,7 @@
   let boardOffline = false;
   let boardReconciliationNotice = '';
   let boardPages: Record<string, BoardColumnPage> = {};
+  let boardCardOffsets: Record<string, number> = {};
   let boardColumnGenerations: Record<string, number> = {};
   let boardColumnRefreshSequence = 0;
   let boardColumnRefreshes: Record<string, number> = {};
@@ -339,6 +340,7 @@
   let boardSort: BoardSort = 'position';
   let boardOrder: 'asc' | 'desc' = 'asc';
   const boardPageSize = 50;
+  const boardRenderLimit = 100;
   let issueTasks: Task[] = [];
   let issueColumns: Column[] = [];
   let issuesLoading = false;
@@ -1563,6 +1565,7 @@
       labels = labelResult.data;
       invalidateBoardColumnRequests(Object.keys(boardPages));
       boardPages = Object.fromEntries(columns.map((column) => [column.id, emptyBoardColumnPage()]));
+      boardCardOffsets = {};
       tasks = [];
       observeWorkTransitions(tasks);
       const pageResults = await Promise.all(
@@ -5743,6 +5746,7 @@
                   order: boardOrder
                 })}
                 {@const orderedColumnTasks = tasksByColumn[column.id] || []}
+                {@const cardOffset = Math.min(boardCardOffsets[column.id] || 0, Math.floor(Math.max(0, orderedColumnTasks.length - 1) / boardRenderLimit) * boardRenderLimit)}
                 <article
                   class="board-column"
                   class:drop-target={dragOverColumnId === column.id}
@@ -5761,7 +5765,7 @@
                       {#if !tasksByColumn[column.id].length}
                         <div class="column-empty">{#if boardPages[column.id]?.error}<span>{boardPages[column.id].error}</span><button class="text-button" type="button" on:click={() => loadBoardColumn(column.id, { reset: true })}>Retry</button>{:else if boardFiltersActive()}<span>No tasks match the current filters.</span><button class="text-button" type="button" on:click={clearFilters}>Clear filters</button>{:else}<span>Nothing here yet</span><button class="text-button quick-add-trigger" type="button" data-quick-add-trigger={column.id} on:click={(event) => openQuickAdd(column.id, event.currentTarget as HTMLButtonElement)}>Add the first task</button>{/if}</div>
                       {:else}
-                        {#each tasksByColumn[column.id] as task (task.id)}
+                        {#each orderedColumnTasks.slice(cardOffset, cardOffset + boardRenderLimit) as task (task.id)}
                           <article class="task-card" class:dependency-blocked={dependencyBlocked(task)} class:dragging={draggingTaskId === task.id} on:dragend={endDrag} on:dragover|preventDefault={(event) => { if (event.dataTransfer) event.dataTransfer.dropEffect = 'move'; }} on:drop={(event) => dropTask(event, column.id, task.id)}>
                             <button class="task-drag-handle" type="button" draggable="true" aria-label={`Drag ${task.key}, ${task.title}`} title="Drag task" on:click|stopPropagation={() => undefined} on:dragstart|stopPropagation={(event) => dragStart(event, task)}>⠿</button>
                             <button class="task-main" type="button" data-task-trigger aria-keyshortcuts="Alt+ArrowUp Alt+ArrowDown Alt+Home Alt+End" on:click={() => openTask(task)} on:keydown={(event) => keyboardMove(event, task)}>
@@ -5778,7 +5782,10 @@
                           </article>
                         {/each}
                       {/if}
-                      {#if boardPages[column.id]?.nextCursor}<button class="load-more-tasks" type="button" on:click={() => loadMoreBoardColumn(column.id)} disabled={boardPages[column.id].loading}>{boardPages[column.id].loading ? 'Loading…' : 'Load more tasks'}</button>{/if}
+                      {#if orderedColumnTasks.length > boardRenderLimit}<div class="column-empty" role="status">Showing {cardOffset + 1}–{Math.min(cardOffset + boardRenderLimit, orderedColumnTasks.length)} of {orderedColumnTasks.length} loaded cards</div>{/if}
+                      {#if cardOffset > 0}<button class="load-more-tasks" type="button" on:click={() => { boardCardOffsets = { ...boardCardOffsets, [column.id]: cardOffset - boardRenderLimit }; }}>Show previous cards</button>{/if}
+                      {#if cardOffset + boardRenderLimit < orderedColumnTasks.length}<button class="load-more-tasks" type="button" on:click={() => { boardCardOffsets = { ...boardCardOffsets, [column.id]: cardOffset + boardRenderLimit }; }}>Show next cards</button>
+                      {:else if boardPages[column.id]?.nextCursor}<button class="load-more-tasks" type="button" on:click={() => loadMoreBoardColumn(column.id)} disabled={boardPages[column.id].loading}>{boardPages[column.id].loading ? 'Loading…' : 'Load more tasks'}</button>{/if}
                       {#if boardPages[column.id]?.error && tasksByColumn[column.id].length}<div class="column-page-error" role="alert"><span>{boardPages[column.id].error}</span><button class="text-button" type="button" on:click={() => loadBoardColumn(column.id, { reset: false })}>Retry</button></div>{/if}
                     </div>
                     <div class="quick-add-wrap">
