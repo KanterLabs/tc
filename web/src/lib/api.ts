@@ -236,13 +236,13 @@ async function collectPages<T>(load: (cursor?: string) => Promise<Collection<T>>
 }
 
 export const api = {
-  authStatus: () => request<AuthStatus>('/auth/status'),
+  authStatus: (signal?: AbortSignal) => request<AuthStatus>('/auth/status', { signal }),
   authSetup: (input: { name: string; email: string; password: string }) =>
     request<Actor | { user: Actor }>('/auth/setup', { method: 'POST', body: input }),
   authLogin: (input: { email: string; password: string }) =>
     request<Actor | { user: Actor }>('/auth/login', { method: 'POST', body: input }),
   authLogout: () => request<{ ok: boolean }>('/auth/logout', { method: 'POST' }),
-  authMe: () => request<Actor>('/auth/me'),
+  authMe: (signal?: AbortSignal) => request<Actor>('/auth/me', { signal }),
   codexAccount: (refresh = false) => request<CodexAccountStatus>(pathWithQuery('/codex/account', { refresh })),
   startCodexLogin: () => request<CodexDeviceLogin>('/codex/login', { method: 'POST' }),
   cancelCodexLogin: (loginId: string) => request<{ status: string }>('/codex/login/cancel', { method: 'POST', body: { login_id: loginId } }),

@@ -297,6 +297,9 @@
   let authView: AuthView = 'login';
   let authSubmitting = false;
   let authError = '';
+  let authBootstrapFailed = false;
+  let bootstrapController: AbortController | undefined;
+  let bootstrapRequest = 0;
   let loginEmail = '';
   let loginPassword = '';
   let setupName = '';
@@ -305,6 +308,7 @@
 
   const accessBootstrapKey = 'helm.cloudflare-access-bootstrap';
   const legacyAccessBootstrapKey = 'roadmap.cloudflare-access-bootstrap';
+  const bootstrapTimeoutMs = 12_000;
 
   let theme: 'light' | 'dark' = 'light';
   let view: View = 'board';
@@ -325,6 +329,7 @@
   let boardOffline = false;
   let boardReconciliationNotice = '';
   let boardPages: Record<string, BoardColumnPage> = {};
+  let boardCardOffsets: Record<string, number> = {};
   let boardColumnGenerations: Record<string, number> = {};
   let boardColumnRefreshSequence = 0;
   let boardColumnRefreshes: Record<string, number> = {};
@@ -1185,6 +1190,7 @@
       if (boardFilterTimer) window.clearTimeout(boardFilterTimer);
       window.removeEventListener('online', onlineHandler);
       window.removeEventListener('offline', offlineHandler);
+      bootstrapController?.abort();
     };
     void bootstrap();
     const keyHandler = (event: KeyboardEvent) => handleKeydown(event);
@@ -1214,11 +1220,18 @@
   }
 
   async function bootstrap() {
+    const requestId = ++bootstrapRequest;
+    bootstrapController?.abort();
+    const controller = new AbortController();
+    bootstrapController = controller;
+    const timeout = window.setTimeout(() => controller.abort(), bootstrapTimeoutMs);
     booting = true;
     authError = '';
+    authBootstrapFailed = false;
     let authStatusLoaded = false;
     try {
-      authStatus = await api.authStatus();
+      authStatus = await api.authStatus(controller.signal);
+      if (requestId !== bootstrapRequest) return;
       authStatusLoaded = true;
       sessionStorage.removeItem(accessBootstrapKey);
       sessionStorage.removeItem(legacyAccessBootstrapKey);
@@ -1233,7 +1246,8 @@
         return;
       }
       try {
-        user = authStatus.user || authStatus.actor || (await api.authMe());
+        user = authStatus.user || authStatus.actor || (await api.authMe(controller.signal));
+        if (requestId !== bootstrapRequest) return;
       } catch (error) {
         // Development's disabled mode intentionally has no session actor.
         if (authStatus.mode === 'disabled') {
@@ -1248,6 +1262,7 @@
       }
       await finishAuthentication();
     } catch (error) {
+      if (requestId !== bootstrapRequest) return;
       // Cloudflare Access protects the browser UI and API as distinct
       // applications so agents can use Service Auth on /api/v1/*. A browser
       // therefore needs one top-level API navigation to receive the API-path
@@ -1264,9 +1279,16 @@
         window.location.assign(`${API_PREFIX}/auth/status`);
         return;
       }
-      authError = friendlyError(error, 'Helm could not connect to the server.');
+      authBootstrapFailed = true;
+      authError = controller.signal.aborted
+        ? 'Helm took too long to respond. Check your connection and try again.'
+        : friendlyError(error, 'Helm could not connect to the server.');
     } finally {
-      booting = false;
+      window.clearTimeout(timeout);
+      if (requestId === bootstrapRequest) {
+        bootstrapController = undefined;
+        booting = false;
+      }
     }
   }
 
@@ -1276,6 +1298,11 @@
     // check even when the browser logs back in as the same actor.
     sessionGeneration += 1;
     const requestedSession = sessionGeneration;
+    // Authentication is enough to reveal the application chrome. Project and
+    // board reads can be noticeably slower on a remote self-hosted instance;
+    // render their in-context skeleton instead of holding the user on the
+    // full-screen bootstrap splash until every request has completed.
+    booting = false;
     await loadProjects();
     if (sessionGeneration !== requestedSession || !user) return;
     startPolling();
@@ -1538,6 +1565,7 @@
       labels = labelResult.data;
       invalidateBoardColumnRequests(Object.keys(boardPages));
       boardPages = Object.fromEntries(columns.map((column) => [column.id, emptyBoardColumnPage()]));
+      boardCardOffsets = {};
       tasks = [];
       observeWorkTransitions(tasks);
       const pageResults = await Promise.all(
@@ -5542,7 +5570,7 @@
           <p>{authView === 'setup' ? 'Set up the first administrator account.' : 'Sign in to pick up where you left off.'}</p>
         </div>
         {#if authError}
-          <div class="inline-alert error" role="alert"><span>!</span>{authError}</div>
+          <div class="inline-alert error" role="alert"><span>!</span><span>{authError}</span>{#if authBootstrapFailed}<button class="text-button" type="button" on:click={bootstrap}>Retry</button>{/if}</div>
         {/if}
         {#if authView === 'setup'}
           <label>Full name<input bind:value={setupName} autocomplete="name" placeholder="Alex Morgan" /></label>
@@ -5664,7 +5692,17 @@
 
       <main class="content" class:my-work-live={view === 'my-work' && myWorkView === 'live'} tabindex="-1" data-destructive-focus-target>
         {#if view === 'board' || view === 'timeline'}
-          {#if activeProject}
+          {#if projectsLoading && !projects.length}
+            <section class="workspace-loading" role="status" aria-label="Loading workspace" aria-live="polite" aria-busy="true">
+              <span class="sr-only">Loading projects and board…</span>
+              <div class="workspace-loading-heading" aria-hidden="true">
+                <span class="loading-line loading-line-short"></span>
+                <span class="loading-line loading-line-title"></span>
+                <span class="loading-line loading-line-copy"></span>
+              </div>
+              <div class="board board-loading" aria-hidden="true">{#each [1, 2, 3, 4] as item}<div class="column-skeleton"><div></div><div></div><div></div></div>{/each}</div>
+            </section>
+          {:else if activeProject}
             <section class="page-heading board-heading">
               <div><div class="breadcrumbs"><span>Workspace</span><span>/</span><span>{activeProject.key}</span></div><div class="heading-title-row"><span class="heading-project-dot" style={`--project-color: ${activeProject.color || '#6d5efc'}`}></span><h1>{activeProject.name}</h1><button class="icon-button favorite-heading" class:starred={activeProject.favorite} type="button" aria-label={activeProject.favorite ? 'Remove from favorites' : 'Add to favorites'} on:click={(event) => toggleFavorite(event, activeProject)}>{activeProject.favorite ? '★' : '☆'}</button></div><p>{view === 'timeline' ? 'Everything recently worked on in this board, in one chronological view.' : activeProject.description || 'A focused space for turning ideas into shipped work.'}</p></div>
               <div class="heading-actions"><button class="button quiet-button" type="button" disabled={portableBusy} on:click={() => void exportActiveProject()}><span aria-hidden="true">⇩</span> Export</button><button class="button quiet-button" type="button" disabled={portableBusy} on:click={() => portableFileInput?.click()}><span aria-hidden="true">⇧</span> Import</button><button class="button quiet-button" type="button" on:click={openProjectRoadmap}><span aria-hidden="true">◒</span> Progress</button><button class="button quiet-button" type="button" on:click={openProjectAudits}><span aria-hidden="true">◎</span> Audits</button><button class="button quiet-button" type="button" data-report-bug-trigger on:click={openBugModal}><span aria-hidden="true">⚠</span> Report bug</button><button class="button primary" type="button" data-task-modal-trigger on:click={() => openTaskModal()}><span aria-hidden="true">＋</span> New task</button><input class="sr-only" bind:this={portableFileInput} type="file" accept=".json,application/json" aria-label="Import a Helm portable archive" on:change={handlePortableFile} /></div>
@@ -5685,11 +5723,11 @@
 
             {#if boardError}<div class="inline-alert error content-alert" role="alert"><span>!</span><span>{boardError}</span><button class="text-button" type="button" on:click={() => loadBoard()}>Retry</button></div>{/if}
             {#if boardOffline}<div class="inline-alert warning content-alert" role="status"><span aria-hidden="true">⌁</span><span>You are offline. Showing the last loaded board pages.</span><button class="text-button" type="button" on:click={() => loadBoard()}>Retry</button></div>{/if}
-            {#if boardPartial}<div class="inline-alert warning content-alert" role="status"><span aria-hidden="true">…</span><span>Some board columns are only partially loaded.</span><button class="text-button" type="button" on:click={() => loadBoard()}>Retry columns</button></div>{/if}
+            {#if Object.values(boardPages).some((page) => Boolean(page.error))}<div class="inline-alert warning content-alert" role="status"><span aria-hidden="true">…</span><span>Some board columns could not be loaded.</span><button class="text-button" type="button" on:click={() => loadBoard()}>Retry columns</button></div>{/if}
             {#if boardReconciliationNotice}<div class="inline-alert info content-alert" role="status"><span aria-hidden="true">↻</span><span>{boardReconciliationNotice}</span><button class="text-button" type="button" on:click={() => loadBoard()}>Refresh</button></div>{/if}
             {#if boardLoading && tasks.length}<div class="board-loading-note" role="status" aria-live="polite">Loading the latest board pages…</div>{/if}
             {#if boardLoading && !tasks.length}
-              <div class="board board-loading" aria-label="Loading board">{#each [1, 2, 3, 4] as item}<div class="column-skeleton"><div></div><div></div><div></div></div>{/each}</div>
+              <div class="board board-loading" role="status" aria-label="Loading board" aria-live="polite" aria-busy="true"><span class="sr-only">Loading board…</span>{#each [1, 2, 3, 4] as item}<div class="column-skeleton" aria-hidden="true"><div></div><div></div><div></div></div>{/each}</div>
             {:else if !sortedColumns.length}
               <div class="empty-state board-empty"><div class="empty-icon">◇</div><h2>Your board is almost ready</h2><p>Columns will appear here once this project has been initialized.</p><button class="button primary" type="button" on:click={() => loadBoard()}>Refresh board</button></div>
             {:else}
@@ -5708,6 +5746,7 @@
                   order: boardOrder
                 })}
                 {@const orderedColumnTasks = tasksByColumn[column.id] || []}
+                {@const cardOffset = Math.min(boardCardOffsets[column.id] || 0, Math.floor(Math.max(0, orderedColumnTasks.length - 1) / boardRenderLimit) * boardRenderLimit)}
                 <article
                   class="board-column"
                   class:drop-target={dragOverColumnId === column.id}
@@ -5726,7 +5765,7 @@
                       {#if !tasksByColumn[column.id].length}
                         <div class="column-empty">{#if boardPages[column.id]?.error}<span>{boardPages[column.id].error}</span><button class="text-button" type="button" on:click={() => loadBoardColumn(column.id, { reset: true })}>Retry</button>{:else if boardFiltersActive()}<span>No tasks match the current filters.</span><button class="text-button" type="button" on:click={clearFilters}>Clear filters</button>{:else}<span>Nothing here yet</span><button class="text-button quick-add-trigger" type="button" data-quick-add-trigger={column.id} on:click={(event) => openQuickAdd(column.id, event.currentTarget as HTMLButtonElement)}>Add the first task</button>{/if}</div>
                       {:else}
-                        {#each tasksByColumn[column.id].slice(0, boardRenderLimit) as task (task.id)}
+                        {#each orderedColumnTasks.slice(cardOffset, cardOffset + boardRenderLimit) as task (task.id)}
                           <article class="task-card" class:dependency-blocked={dependencyBlocked(task)} class:dragging={draggingTaskId === task.id} on:dragend={endDrag} on:dragover|preventDefault={(event) => { if (event.dataTransfer) event.dataTransfer.dropEffect = 'move'; }} on:drop={(event) => dropTask(event, column.id, task.id)}>
                             <button class="task-drag-handle" type="button" draggable="true" aria-label={`Drag ${task.key}, ${task.title}`} title="Drag task" on:click|stopPropagation={() => undefined} on:dragstart|stopPropagation={(event) => dragStart(event, task)}>⠿</button>
                             <button class="task-main" type="button" data-task-trigger aria-keyshortcuts="Alt+ArrowUp Alt+ArrowDown Alt+Home Alt+End" on:click={() => openTask(task)} on:keydown={(event) => keyboardMove(event, task)}>
@@ -5742,9 +5781,11 @@
                             <div class="task-card-footer"><span class={`due-date ${taskDueClass(task)}`}>{#if task.due_at}<span aria-hidden="true">◷</span>{formatDate(task.due_at)}{/if}</span><span class="card-footer-spacer"></span>{#if task.assignee}<span class="mini-avatar" title={`Assigned to ${actorName(task.assignee) || actorId(task.assignee)}`}>{(actorName(task.assignee) || actorId(task.assignee)).slice(0, 1).toUpperCase()}</span>{/if}{#if task.comment_count}<span class="comment-count" title={`${task.comment_count} comments`}>◌ {task.comment_count}</span>{/if}<button class="icon-button card-move order-move" type="button" aria-label={orderingMoveLabel(task, 'first', orderingGate)} title={orderingMoveTitle('first', orderingGate)} disabled={orderingMoveDisabled(task, 'first', orderedColumnTasks, orderingGate, taskActionLoading === task.id)} on:click={() => moveTaskToPosition(task, 'first')}>⇈</button><button class="icon-button card-move order-move" type="button" aria-label={orderingMoveLabel(task, 'previous', orderingGate)} title={orderingMoveTitle('previous', orderingGate)} disabled={orderingMoveDisabled(task, 'previous', orderedColumnTasks, orderingGate, taskActionLoading === task.id)} on:click={() => moveTaskToPosition(task, 'previous')}>↑</button><button class="icon-button card-move order-move" type="button" aria-label={orderingMoveLabel(task, 'next', orderingGate)} title={orderingMoveTitle('next', orderingGate)} disabled={orderingMoveDisabled(task, 'next', orderedColumnTasks, orderingGate, taskActionLoading === task.id)} on:click={() => moveTaskToPosition(task, 'next')}>↓</button><button class="icon-button card-move order-move" type="button" aria-label={orderingMoveLabel(task, 'last', orderingGate)} title={orderingMoveTitle('last', orderingGate)} disabled={orderingMoveDisabled(task, 'last', orderedColumnTasks, orderingGate, taskActionLoading === task.id)} on:click={() => moveTaskToPosition(task, 'last')}>⇊</button><button class="icon-button card-move" type="button" aria-label={cardMoveLabel(task, -1)} title={cardMoveReason(task, -1) || undefined} disabled={!adjacentTaskColumn(task, -1) || Boolean(cardMoveReason(task, -1)) || taskActionLoading === task.id} on:click={() => moveTaskBy(task, -1)}>←</button><button class="icon-button card-move" type="button" aria-label={cardMoveLabel(task, 1)} title={cardMoveReason(task, 1) || undefined} disabled={!adjacentTaskColumn(task, 1) || Boolean(cardMoveReason(task, 1)) || taskActionLoading === task.id} on:click={() => moveTaskBy(task, 1)}>→</button></div>
                           </article>
                         {/each}
-                        {#if tasksByColumn[column.id].length > boardRenderLimit}<div class="column-empty"><span>Showing the first {boardRenderLimit} loaded tasks.</span></div>{/if}
                       {/if}
-                      {#if boardPages[column.id]?.nextCursor}<button class="load-more-tasks" type="button" on:click={() => loadMoreBoardColumn(column.id)} disabled={boardPages[column.id].loading}>{boardPages[column.id].loading ? 'Loading…' : 'Load more tasks'}</button>{/if}
+                      {#if orderedColumnTasks.length > boardRenderLimit}<div class="column-empty" role="status">Showing {cardOffset + 1}–{Math.min(cardOffset + boardRenderLimit, orderedColumnTasks.length)} of {orderedColumnTasks.length} loaded cards</div>{/if}
+                      {#if cardOffset > 0}<button class="load-more-tasks" type="button" on:click={() => { boardCardOffsets = { ...boardCardOffsets, [column.id]: cardOffset - boardRenderLimit }; }}>Show previous cards</button>{/if}
+                      {#if cardOffset + boardRenderLimit < orderedColumnTasks.length}<button class="load-more-tasks" type="button" on:click={() => { boardCardOffsets = { ...boardCardOffsets, [column.id]: cardOffset + boardRenderLimit }; }}>Show next cards</button>
+                      {:else if boardPages[column.id]?.nextCursor}<button class="load-more-tasks" type="button" on:click={() => loadMoreBoardColumn(column.id)} disabled={boardPages[column.id].loading}>{boardPages[column.id].loading ? 'Loading…' : 'Load more tasks'}</button>{/if}
                       {#if boardPages[column.id]?.error && tasksByColumn[column.id].length}<div class="column-page-error" role="alert"><span>{boardPages[column.id].error}</span><button class="text-button" type="button" on:click={() => loadBoardColumn(column.id, { reset: false })}>Retry</button></div>{/if}
                     </div>
                     <div class="quick-add-wrap">
