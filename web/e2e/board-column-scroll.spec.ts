@@ -96,7 +96,7 @@ function boardColumn(board: Locator, column: Column): Locator {
 
 async function settleLayout(page: Page): Promise<void> {
   await page.evaluate(() => new Promise<void>((resolve) => {
-    requestAnimationFrame(() => requestAnimationFrame(resolve));
+    requestAnimationFrame(() => requestAnimationFrame(() => resolve()));
   }));
 }
 
@@ -228,7 +228,7 @@ test('bounds equal-height columns while retaining independent board and body scr
     if (viewport.name === 'phone portrait') {
       const mobileNav = await page.locator('.mobile-nav').boundingBox();
       expect(mobileNav, 'phone portrait should expose the fixed mobile navigation').not.toBeNull();
-      expect(manyMetrics.footerAfter.bottom, 'the Add task footer should remain above the fixed mobile navigation').toBeLessThanOrEqual((mobileNav?.top || 0) + 2);
+      expect(manyMetrics.footerAfter.bottom, 'the Add task footer should remain above the fixed mobile navigation').toBeLessThanOrEqual((mobileNav?.y || 0) + 2);
     }
 
     // A short landscape viewport intentionally leaves the page itself
