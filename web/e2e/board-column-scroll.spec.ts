@@ -255,6 +255,13 @@ test('bounds equal-height columns while retaining independent board and body scr
     // reset the current column's vertical page to the top before new cards
     // replace the old result set.
     if (viewport.name === 'phone portrait') {
+      await manyColumn.locator('.column-cards').evaluate((element) => {
+        element.scrollTop = 120;
+        element.dispatchEvent(new Event('scroll'));
+      });
+      await page.getByRole('button', { name: 'Refresh board', exact: true }).click();
+      await expect(manyColumn.locator('.task-card')).toHaveCount(50);
+      await expect.poll(() => manyColumn.locator('.column-cards').evaluate((element) => element.scrollTop)).toBe(120);
       const priorityFilter = page.getByLabel('Filter by priority');
       await priorityFilter.selectOption('high');
       await expect.poll(() => manyColumn.locator('.column-cards').evaluate((element) => element.scrollTop)).toBe(0);

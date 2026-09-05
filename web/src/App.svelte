@@ -5768,7 +5768,7 @@
                 >
                     <header class="column-header"><div class="column-name"><span class="column-dot" style={`--column-color: ${columnColor(column)}`}></span><h2>{column.name}</h2><span class="column-count">{tasksByColumn[column.id].length}{boardPages[column.id]?.nextCursor ? '+' : ''}</span></div></header>
                     <div class="column-progress"><span style={`width: ${Math.min(100, tasksByColumn[column.id].length * 4)}%; --column-color: ${columnColor(column)}`}></span></div>
-                    <div class="column-cards" use:columnScroll={{ scope: `${activeProject.id}:${boardCriteriaRevision}`, column: column.id, page: cardOffset }}>
+                    <div class="column-cards" use:columnScroll={{ scope: `${activeProject.id}:${boardCriteriaRevision}`, column: column.id, page: cardOffset, ready: !boardLoading }}>
                       {#if dragOverColumnId === column.id && draggingTaskId && tasksByColumn[column.id].some((task) => task.id === draggingTaskId) === false}
                         <div class="drop-placeholder" role="status">Drop task in {column.name}</div>
                       {/if}

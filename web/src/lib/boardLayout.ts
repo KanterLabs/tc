@@ -42,7 +42,7 @@ export function boardViewport(node: HTMLElement) {
   };
 }
 
-type ScrollContext = { scope: string; column: string; page: number };
+type ScrollContext = { scope: string; column: string; page: number; ready?: boolean };
 
 /** Per-app cache survives a refresh's loading placeholder, not project/filter changes. */
 export function createColumnScroll() {
@@ -55,15 +55,18 @@ export function createColumnScroll() {
         scope = context.scope;
         positions.clear();
       }
+      // Other columns can finish first and remount this body while it is still empty.
+      // Restoring then would clamp the saved offset to zero before its cards arrive.
+      if (context.ready === false) return;
       const saved = positions.get(context.column);
       const top = saved?.page === context.page ? saved.top : 0;
       positions.set(context.column, { page: context.page, top });
       void tick().then(() => {
-        if (alive) node.scrollTop = top;
+        if (alive && context.ready !== false) node.scrollTop = top;
       });
     };
     const save = () => {
-      if (scope === context.scope) {
+      if (scope === context.scope && context.ready !== false) {
         positions.set(context.column, { page: context.page, top: node.scrollTop });
       }
     };
@@ -71,7 +74,8 @@ export function createColumnScroll() {
     node.addEventListener('scroll', save, { passive: true });
     return {
       update(next: ScrollContext) {
-        const changed = next.scope !== context.scope || next.column !== context.column || next.page !== context.page;
+        const changed = next.scope !== context.scope || next.column !== context.column || next.page !== context.page
+          || (context.ready === false && next.ready !== false);
         context = next;
         if (changed) restore();
       },

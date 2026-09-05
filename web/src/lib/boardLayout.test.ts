@@ -16,7 +16,11 @@ describe('column scroll lifecycle', () => {
     expect(first.scrollTop).toBe(450);
     mounted.destroy();
     const replacement = document.createElement('div');
-    const restored = action(replacement, context);
+    const restored = action(replacement, { ...context, ready: false });
+    await tick();
+    replacement.dispatchEvent(new Event('scroll'));
+    expect(replacement.scrollTop).toBe(0);
+    restored.update({ ...context, ready: true });
     const empty = document.createElement('div');
     const other = action(empty, { ...context, column: 'done' });
     await tick();
