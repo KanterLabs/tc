@@ -1,6 +1,21 @@
 import { describe, expect, it } from 'vitest';
 import { tick } from 'svelte';
-import { createColumnScroll } from './boardLayout';
+import { createColumnScroll, tenCardColumnHeight } from './boardLayout';
+
+describe('ten-card capacity', () => {
+  it('fits ten actual card heights plus nine gaps, padding and fixed controls', () => {
+    expect(tenCardColumnHeight([200, ...Array(9).fill(100)], 8, 19, 90)).toBe(1281);
+  });
+
+  it('ignores cards beyond the capacity and rounds up fractional pixels', () => {
+    expect(tenCardColumnHeight([...Array(10).fill(100.25), 900], 8, 19, 90)).toBe(1184);
+  });
+
+  it('reserves ten slots from fewer cards and uses a fallback for empty boards', () => {
+    expect(tenCardColumnHeight([150, 100], 8, 19, 90)).toBe(1431);
+    expect(tenCardColumnHeight([], 8, 19, 90, 160)).toBe(1781);
+  });
+});
 
 describe('column scroll lifecycle', () => {
   it('preserves independent positions across refresh remounts and same-context updates', async () => {

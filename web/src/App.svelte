@@ -63,7 +63,11 @@
 
 <script lang="ts">
   import { onMount, tick } from 'svelte';
-  import { boardViewport, createColumnScroll } from './lib/boardLayout';
+  import { offlineReadOnly } from './lib/connectivity';
+  import { clearOfflineBoards, readOfflineBoards, saveOfflineBoard, setOfflineOwner, type OfflineBoard as OfflineBoardSnapshot } from './lib/offlineBoards';
+  import OfflineBoard from './lib/components/OfflineBoard.svelte';
+  import PwaStatus from './lib/components/PwaStatus.svelte';
+  import { boardCardHeight, createColumnScroll } from './lib/boardLayout';
   import { flip } from 'svelte/animate';
   import { backOut } from 'svelte/easing';
   import { fade, fly, scale } from 'svelte/transition';
@@ -328,6 +332,10 @@
   let boardMetadataErrors: BoardMetadataErrorState = { full: '', targeted: {} };
   let boardPartial = false;
   let boardOffline = false;
+  let offlineBoards: OfflineBoardSnapshot[] = [];
+  let offlineReadRevision = 0;
+  let reconnecting = false;
+  let reconnectError = '';
   let boardReconciliationNotice = '';
   let boardPages: Record<string, BoardColumnPage> = {};
   let boardCardOffsets: Record<string, number> = {};
@@ -1176,14 +1184,18 @@
     recentProjectIds = loadRecentProjects(localStorage);
     boardOffline = !navigator.onLine;
     const onlineHandler = () => {
-      boardOffline = false;
-      if (activeProject && view === 'board') void loadBoard();
+      if ($offlineReadOnly) void reconnectOffline();
     };
     const offlineHandler = () => {
       boardOffline = true;
+      if (!$offlineReadOnly) void enterOffline();
     };
+    const clearHandler = () => { offlineReadRevision += 1; offlineBoards = []; };
     window.addEventListener('online', onlineHandler);
     window.addEventListener('offline', offlineHandler);
+    window.addEventListener('helm:network-unavailable', offlineHandler);
+    window.addEventListener('helm:offline-cleared', clearHandler);
+    window.addEventListener('helm:auth-invalidated', clearHandler);
     const cleanup = () => {
       if (pollTimer) window.clearInterval(pollTimer);
       if (pulseTimer) window.clearInterval(pulseTimer);
@@ -1192,9 +1204,13 @@
       if (boardFilterTimer) window.clearTimeout(boardFilterTimer);
       window.removeEventListener('online', onlineHandler);
       window.removeEventListener('offline', offlineHandler);
+      window.removeEventListener('helm:network-unavailable', offlineHandler);
+      window.removeEventListener('helm:offline-cleared', clearHandler);
+      window.removeEventListener('helm:auth-invalidated', clearHandler);
       bootstrapController?.abort();
     };
-    void bootstrap();
+    if ($offlineReadOnly || navigator.onLine === false) void enterOffline();
+    else void bootstrap();
     const keyHandler = (event: KeyboardEvent) => handleKeydown(event);
     window.addEventListener('keydown', keyHandler);
     window.addEventListener('pointerdown', handleProjectSwitcherPointerDown);
@@ -1206,6 +1222,43 @@
       window.removeEventListener('popstate', handlePopState);
     };
   });
+
+  async function enterOffline() {
+    const revision = ++offlineReadRevision;
+    offlineReadOnly.set(true);
+    boardOffline = true;
+    sessionGeneration += 1;
+    if (pollTimer) window.clearInterval(pollTimer);
+    if (pulseTimer) window.clearInterval(pulseTimer);
+    if (livenessRefreshTimer) window.clearInterval(livenessRefreshTimer);
+    const saved = await readOfflineBoards();
+    if (revision === offlineReadRevision && $offlineReadOnly) offlineBoards = saved;
+    booting = false;
+  }
+
+  async function reconnectOffline() {
+    if (reconnecting) return;
+    reconnecting = true;
+    reconnectError = '';
+    try { await bootstrap(); }
+    finally {
+      reconnecting = false;
+      if ($offlineReadOnly) reconnectError = authError || 'Still offline. Your saved boards remain read-only.';
+    }
+  }
+
+  async function clearSavedBoards() {
+    offlineReadRevision += 1;
+    offlineBoards = [];
+    await clearOfflineBoards();
+    offlineBoards = [];
+  }
+
+  function saveBoardSnapshot() {
+    if ($offlineReadOnly || !user || !activeProject || boardLoading || Object.values(boardPages).some(page => !page.loaded || page.loading || page.error)) return;
+    const filtered = boardWorkFilter !== 'all' || Object.entries(filters).some(([key, value]) => key === 'query' ? Boolean(value) : value !== 'all');
+    void saveOfflineBoard(user.id, activeProject, columns, tasks, boardPartial || filtered);
+  }
 
   function applyTheme() {
     if (typeof document !== 'undefined') {
@@ -1238,11 +1291,17 @@
       sessionStorage.removeItem(accessBootstrapKey);
       sessionStorage.removeItem(legacyAccessBootstrapKey);
       if (authStatus.setup_required || authStatus.needs_setup) {
+        await clearSavedBoards();
+        user = null;
+        offlineReadOnly.set(false);
         authView = 'setup';
         booting = false;
         return;
       }
       if (authStatus.authenticated === false) {
+        await clearSavedBoards();
+        user = null;
+        offlineReadOnly.set(false);
         authView = 'login';
         booting = false;
         return;
@@ -1255,6 +1314,9 @@
         if (authStatus.mode === 'disabled') {
           user = { id: 'local', kind: 'human', name: 'Local user', admin: true };
         } else if (error instanceof ApiError && error.status === 401) {
+          await clearSavedBoards();
+          user = null;
+          offlineReadOnly.set(false);
           authView = 'login';
           booting = false;
           return;
@@ -1265,6 +1327,10 @@
       await finishAuthentication();
     } catch (error) {
       if (requestId !== bootstrapRequest) return;
+      if (navigator.onLine === false) {
+        await enterOffline();
+        return;
+      }
       // Cloudflare Access protects the browser UI and API as distinct
       // applications so agents can use Service Auth on /api/v1/*. A browser
       // therefore needs one top-level API navigation to receive the API-path
@@ -1279,6 +1345,10 @@
       ) {
         sessionStorage.setItem(accessBootstrapKey, window.location.origin);
         window.location.assign(`${API_PREFIX}/auth/status`);
+        return;
+      }
+      if ((error instanceof TypeError || controller.signal.aborted) && (await readOfflineBoards()).length > 0) {
+        await enterOffline();
         return;
       }
       authBootstrapFailed = true;
@@ -1300,6 +1370,12 @@
     // check even when the browser logs back in as the same actor.
     sessionGeneration += 1;
     const requestedSession = sessionGeneration;
+    if (user) await setOfflineOwner(user.id);
+    if (sessionGeneration !== requestedSession || !user) return;
+    offlineReadOnly.set(false);
+    boardOffline = false;
+    offlineReadRevision += 1;
+    offlineBoards = [];
     // Authentication is enough to reveal the application chrome. Project and
     // board reads can be noticeably slower on a remote self-hosted instance;
     // render their in-context skeleton instead of holding the user on the
@@ -1344,6 +1420,7 @@
     clearAnnouncement();
     sessionGeneration += 1;
     user = null;
+    await clearSavedBoards();
     boardMutationRequest += 1;
     taskActionLoading = '';
     projectListRequest += 1;
@@ -1441,6 +1518,16 @@
       const result = await api.listAllProjects();
       if (requestId !== projectListRequest || sessionGeneration !== requestedSession || !user) return;
       const nextProjects = result.data.filter((project) => !project.archived_at);
+      const savedBoards = await readOfflineBoards();
+      if (requestId !== projectListRequest || sessionGeneration !== requestedSession || !user) return;
+      // A successful project listing is authoritative about access. Do not
+      // retain snapshots of projects that were removed or became inaccessible.
+      if (savedBoards.some(board => !nextProjects.some(project => project.id === board.project.id))) {
+        await clearSavedBoards();
+        if (requestId !== projectListRequest || sessionGeneration !== requestedSession || !user) return;
+        await setOfflineOwner(user.id);
+        if (requestId !== projectListRequest || sessionGeneration !== requestedSession || !user) return;
+      }
       projects = nextProjects;
       if (selectionVersion !== projectSwitchVersion) return;
       const routeSlug = getProjectSlugFromLocation();
@@ -1594,6 +1681,7 @@
       if (requestId === boardRequest && sessionGeneration === requestedSession) {
         boardLoading = false;
         if (requestedCriteriaRevision === boardCriteriaRevision) boardCriteriaTransition = false;
+        saveBoardSnapshot();
       }
     }
   }
@@ -1651,6 +1739,7 @@
       tasks = flattenBoardPages();
       boardPartial = Object.values(boardPages).some((item) => Boolean(item.error || item.nextCursor));
       boardOffline = false;
+      saveBoardSnapshot();
       observeWorkTransitions(tasks, announceChanges);
       if (announceChanges && recoveryNotice && requestIsCurrent()) {
         const refreshedMessage = 'This column changed while loading more tasks; its first page was refreshed.';
@@ -2717,6 +2806,7 @@
   }
 
   async function refreshLiveness(): Promise<void> {
+    if ($offlineReadOnly) return;
     if (!user) return;
     const refreshes: Promise<boolean>[] = [];
     if (view === 'board' || view === 'timeline') refreshes.push(refreshBoardTasks());
@@ -2817,6 +2907,7 @@
   }
 
   async function pollEvents() {
+    if ($offlineReadOnly) return;
     if (!user || pollInFlight) return pollInFlight || undefined;
     const requestedSession = sessionGeneration;
     const requestedCursor = eventsCursor;
@@ -3288,6 +3379,7 @@
   }
 
   function handleKeydown(event: KeyboardEvent) {
+    if ($offlineReadOnly) return;
     // A confirmation is the top-most modal. Do not let global shortcuts or a
     // second Escape handler act on the dialog's underlying drawer/view.
     if (confirmRequest) {
@@ -5552,7 +5644,13 @@
 
 <svelte:window />
 
-{#if booting}
+{#if user && !$offlineReadOnly}
+  <PwaStatus showCacheStatus={false} />
+{/if}
+
+{#if $offlineReadOnly}
+  <OfflineBoard boards={offlineBoards} reconnect={() => void reconnectOffline()} {reconnecting} error={reconnectError} clear={() => void clearSavedBoards()} />
+{:else if booting}
   <div class="splash" aria-live="polite">
     <HelmMark size={46} decorative className="brand-mark brand-mark-large" />
     <div class="splash-copy">
@@ -5741,7 +5839,7 @@
             {:else if !sortedColumns.length}
               <div class="empty-state board-empty"><div class="empty-icon">◇</div><h2>Your board is almost ready</h2><p>Columns will appear here once this project has been initialized.</p><button class="button primary" type="button" on:click={() => loadBoard()}>Refresh board</button></div>
             {:else}
-              <section class="board" use:boardViewport aria-label={`${activeProject.name} board`}>
+              <section class="board" use:boardCardHeight aria-label={`${activeProject.name} board`}>
                 {#each sortedColumns as column (column.id)}
                 {@const orderingGate = makeBoardOrderingGate({
                   criteriaTransition: boardCriteriaTransition,

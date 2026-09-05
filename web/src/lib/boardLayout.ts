@@ -1,12 +1,42 @@
 import { tick } from 'svelte';
 
-/** Measure the space above the board without resizing columns as the page scrolls. */
-export function boardViewport(node: HTMLElement) {
+export const visibleBoardCards = 10;
+
+/** Reserve ten natural-height cards, estimating unused slots from the loaded sample. */
+export function tenCardColumnHeight(heights: number[], gap: number, padding: number, chrome: number, fallback = 120) {
+  const sample = heights.slice(0, visibleBoardCards);
+  const total = sample.reduce((sum, height) => sum + height, 0);
+  const average = sample.length ? total / sample.length : fallback;
+  return Math.ceil(total + average * (visibleBoardCards - sample.length)
+    + gap * (visibleBoardCards - 1) + padding + chrome);
+}
+
+/** Keep columns aligned using the tallest ten-card stack, independent of viewport height. */
+export function boardCardHeight(node: HTMLElement) {
   let frame = 0;
   const measure = () => {
     frame = 0;
-    const top = Math.max(0, Math.round(node.getBoundingClientRect().top + window.scrollY));
-    node.style.setProperty('--board-top', `${top}px`);
+    const populated: number[] = [];
+    const empty: number[] = [];
+    const fallback = parseFloat(getComputedStyle(node).getPropertyValue('--board-empty-card-height')) || 120;
+    for (const column of node.querySelectorAll<HTMLElement>(':scope > .board-column')) {
+      const body = column.querySelector<HTMLElement>('.column-cards');
+      if (!body) continue;
+      const cards = Array.from(body.querySelectorAll<HTMLElement>(':scope > .task-card')).slice(0, visibleBoardCards);
+      const style = getComputedStyle(body);
+      const padding = parseFloat(style.paddingTop) + parseFloat(style.paddingBottom);
+      const chrome = column.getBoundingClientRect().height - body.getBoundingClientRect().height;
+      const height = tenCardColumnHeight(cards.map((card) => card.getBoundingClientRect().height),
+        parseFloat(style.rowGap) || 0, padding, chrome, fallback);
+      (cards.length ? populated : empty).push(height);
+    }
+    // Empty columns share the populated columns' capacity, not a competing estimate.
+    const heights = populated.length ? populated : empty;
+    if (!heights.length) return;
+    const value = `${Math.max(...heights)}px`;
+    if (node.style.getPropertyValue('--board-column-height') !== value) {
+      node.style.setProperty('--board-column-height', value);
+    }
   };
   const schedule = () => {
     if (!frame) frame = window.requestAnimationFrame(measure);
@@ -14,30 +44,30 @@ export function boardViewport(node: HTMLElement) {
   const resize = new ResizeObserver(schedule);
   const observeLayout = () => {
     resize.disconnect();
-    if (node.parentElement) {
-      resize.observe(node.parentElement);
-      // Heading, toolbar and notices may change height independently of the board.
-      for (const sibling of node.parentElement.children) {
-        if (sibling !== node) resize.observe(sibling);
+    resize.observe(node);
+    for (const column of node.querySelectorAll<HTMLElement>(':scope > .board-column')) {
+      for (const child of column.children) {
+        if (!child.classList.contains('column-cards')) resize.observe(child);
+      }
+      // Only the visible-capacity sample needs observation, even on very large boards.
+      const cards = column.querySelectorAll('.column-cards > .task-card');
+      for (let index = 0; index < Math.min(cards.length, visibleBoardCards); index += 1) {
+        resize.observe(cards[index]);
       }
     }
-    const topbar = document.querySelector('.topbar');
-    if (topbar) resize.observe(topbar);
     schedule();
   };
   const mutations = new MutationObserver(observeLayout);
-  if (node.parentElement) mutations.observe(node.parentElement, { childList: true });
+  mutations.observe(node, { childList: true, subtree: true });
   observeLayout();
   measure();
   window.addEventListener('resize', schedule);
-  window.visualViewport?.addEventListener('resize', schedule);
   return {
     destroy() {
       resize.disconnect();
       mutations.disconnect();
       window.cancelAnimationFrame(frame);
       window.removeEventListener('resize', schedule);
-      window.visualViewport?.removeEventListener('resize', schedule);
     }
   };
 }
