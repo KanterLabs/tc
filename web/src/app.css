@@ -205,7 +205,10 @@ kbd { display: inline-flex; align-items: center; justify-content: center; min-wi
 .heading-actions { display: flex; align-items: center; gap: 8px; flex: 0 0 auto; }
 .eyebrow { display: block; margin-bottom: 8px; color: var(--purple); font-size: 11px; font-weight: 800; letter-spacing: .11em; text-transform: uppercase; }
 
-.board-toolbar { min-height: 43px; display: flex; align-items: center; gap: 8px; margin-bottom: 19px; }
+.board-toolbar { min-height: 43px; display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-bottom: 19px; }
+.board-toolbar .filter-group { min-width: 0; flex: 1 1 320px; overflow-x: auto; }
+.board-toolbar .filter-group select { flex-shrink: 0; }
+.board-toolbar .task-total { white-space: nowrap; }
 .filter-search { width: 220px; height: 35px; display: flex; align-items: center; gap: 7px; padding: 0 8px 0 11px; border: 1px solid var(--border); border-radius: 8px; color: var(--muted); background: var(--surface); }
 .filter-search input { min-width: 0; flex: 1; border: 0; color: var(--ink); background: transparent; font-size: 11px; }
 .filter-search kbd { min-width: 19px; height: 18px; }
@@ -259,7 +262,9 @@ input:focus, textarea:focus, select:focus { border-color: var(--purple); }
 .board-loading-note { margin: -8px 0 18px; color: var(--muted); font-size: 10px; }
 
 .board { min-width: 0; display: grid; grid-template-columns: none; grid-auto-flow: column; grid-auto-columns: minmax(220px, 1fr); align-items: start; gap: 14px; overflow-x: auto; padding: 2px 1px 18px; }
-.board-column { min-width: 0; min-height: 350px; display: flex; flex-direction: column; border: 1px solid var(--border); border-radius: 12px; background: color-mix(in srgb, var(--surface-muted) 70%, transparent); transition: border-color var(--dur-fast) var(--ease-out), background-color var(--dur-base) var(--ease-out); }
+/* On very short screens keep a usable card body and allow the page to reach the board. */
+.board-column { min-width: 0; min-height: 0; height: min(860px, max(220px, calc(100dvh - var(--board-top, 260px) - var(--board-bottom-space, 24px)))); display: flex; flex-direction: column; border: 1px solid var(--border); border-radius: 12px; background: color-mix(in srgb, var(--surface-muted) 70%, transparent); transition: border-color var(--dur-fast) var(--ease-out), background-color var(--dur-base) var(--ease-out); }
+.board-column > :not(.column-cards) { flex-shrink: 0; }
 .board-column.drop-target { border-color: color-mix(in srgb, var(--purple), var(--border) 40%); background: color-mix(in srgb, var(--purple-soft) 45%, var(--surface-muted)); }
 .board-column.drop-target .column-header { color: var(--purple); }
 .board-column.drop-target .column-progress { background: color-mix(in srgb, var(--purple), var(--border) 60%); }
@@ -270,7 +275,9 @@ input:focus, textarea:focus, select:focus { border-color: var(--purple); }
 .column-count { min-width: 19px; padding: 2px 5px; border-radius: 8px; color: var(--muted); background: var(--surface); font-size: 11px; font-weight: 700; text-align: center; }
 .column-progress { height: 2px; margin: 0 13px; overflow: hidden; border-radius: 3px; background: var(--border); }
 .column-progress span { display: block; height: 100%; border-radius: 3px; background: var(--column-color); opacity: .8; transition: width var(--dur-base) var(--ease-out); }
-.column-cards { min-height: 180px; max-height: min(68vh, 860px); display: flex; flex: 1; flex-direction: column; gap: 8px; overflow-y: auto; padding: 12px 9px 7px; contain: layout paint; }
+.column-cards { min-height: 0; display: flex; flex: 1; flex-direction: column; gap: 8px; overflow-y: auto; overscroll-behavior-y: contain; scrollbar-gutter: stable; padding: 12px 9px 7px; contain: layout paint; }
+/* Cards and paging controls must overflow, never shrink into clipped border lines. */
+.column-cards > * { flex-shrink: 0; }
 .load-more-tasks { width: 100%; padding: 8px 9px; border: 1px dashed var(--border-strong); border-radius: 7px; color: var(--purple); background: var(--surface); font-size: 10px; font-weight: 700; }
 .load-more-tasks:hover:not(:disabled) { border-color: var(--purple); background: var(--purple-soft); }
 .load-more-tasks:disabled { cursor: wait; opacity: .65; }
@@ -1062,6 +1069,7 @@ legend { margin-bottom: 8px; color: var(--ink-soft); font-size: 11px; font-weigh
   .board-toolbar { flex-wrap: wrap; }
   .filter-search { width: 100%; }
   .filter-group { width: 100%; overflow-x: auto; }
+  .board-toolbar .filter-group { flex-basis: 100%; }
   .filter-group select { flex: 1; min-width: 115px; }
   .toolbar-spacer { display: none; }
   .task-total { margin-left: auto; }
@@ -1134,7 +1142,7 @@ legend { margin-bottom: 8px; color: var(--ink-soft); font-size: 11px; font-weigh
   .filter-group select { height: 44px; flex: 0 0 142px; }
   .clear-filters { min-height: 44px; padding: 0 8px; }
   .board { grid-template-columns: none; grid-auto-flow: column; grid-auto-columns: minmax(82vw, 1fr); gap: 12px; margin-right: -14px; overflow-x: auto; padding: 2px 14px 16px 0; scroll-snap-type: x mandatory; }
-  .board-column { min-height: 305px; scroll-margin-top: calc(70px + env(safe-area-inset-top)); scroll-snap-align: start; }
+  .board-column { --board-bottom-space: calc(86px + env(safe-area-inset-bottom)); scroll-margin-top: calc(70px + env(safe-area-inset-top)); scroll-snap-align: start; }
   .column-header { position: relative; z-index: 2; min-height: 52px; border-radius: 12px 12px 0 0; background: color-mix(in srgb, var(--surface-muted) 94%, transparent); backdrop-filter: blur(10px); }
   .column-cards { min-height: 0; }
   .column-empty { min-height: 104px; }

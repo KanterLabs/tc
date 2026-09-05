@@ -63,6 +63,7 @@
 
 <script lang="ts">
   import { onMount, tick } from 'svelte';
+  import { boardViewport, createColumnScroll } from './lib/boardLayout';
   import { flip } from 'svelte/animate';
   import { backOut } from 'svelte/easing';
   import { fade, fly, scale } from 'svelte/transition';
@@ -341,6 +342,7 @@
   let boardOrder: 'asc' | 'desc' = 'asc';
   const boardPageSize = 50;
   const boardRenderLimit = 100;
+  const columnScroll = createColumnScroll();
   let issueTasks: Task[] = [];
   let issueColumns: Column[] = [];
   let issuesLoading = false;
@@ -3869,6 +3871,14 @@
     return ({ backlog: '#a4aab8', ready: '#4b9cf5', active: '#6d5efc', blocked: '#ec6b75', completed: '#35b88a' } as Record<string, string>)[column.semantic_state] || '#a4aab8';
   }
 
+  async function showBoardCardPage(event: MouseEvent, columnId: string, offset: number) {
+    const scroller = (event.currentTarget as HTMLElement).closest('.column-cards') as HTMLElement | null;
+    boardCardOffsets = { ...boardCardOffsets, [columnId]: offset };
+    await tick();
+    scroller?.querySelector<HTMLButtonElement>('[data-task-trigger]')?.focus({ preventScroll: true });
+    if (scroller) scroller.scrollTop = 0;
+  }
+
   function dragStart(event: DragEvent, task: Task) {
     draggingTaskId = task.id;
     dragOverColumnId = '';
@@ -5731,8 +5741,8 @@
             {:else if !sortedColumns.length}
               <div class="empty-state board-empty"><div class="empty-icon">◇</div><h2>Your board is almost ready</h2><p>Columns will appear here once this project has been initialized.</p><button class="button primary" type="button" on:click={() => loadBoard()}>Refresh board</button></div>
             {:else}
-              <section class="board" aria-label={`${activeProject.name} board`}>
-                {#each sortedColumns as column}
+              <section class="board" use:boardViewport aria-label={`${activeProject.name} board`}>
+                {#each sortedColumns as column (column.id)}
                 {@const orderingGate = makeBoardOrderingGate({
                   criteriaTransition: boardCriteriaTransition,
                   filterTimerPending: boardFilterTimer !== undefined,
@@ -5758,7 +5768,7 @@
                 >
                     <header class="column-header"><div class="column-name"><span class="column-dot" style={`--column-color: ${columnColor(column)}`}></span><h2>{column.name}</h2><span class="column-count">{tasksByColumn[column.id].length}{boardPages[column.id]?.nextCursor ? '+' : ''}</span></div></header>
                     <div class="column-progress"><span style={`width: ${Math.min(100, tasksByColumn[column.id].length * 4)}%; --column-color: ${columnColor(column)}`}></span></div>
-                    <div class="column-cards">
+                    <div class="column-cards" use:columnScroll={{ scope: `${activeProject.id}:${boardCriteriaRevision}`, column: column.id, page: cardOffset }}>
                       {#if dragOverColumnId === column.id && draggingTaskId && tasksByColumn[column.id].some((task) => task.id === draggingTaskId) === false}
                         <div class="drop-placeholder" role="status">Drop task in {column.name}</div>
                       {/if}
@@ -5783,8 +5793,8 @@
                         {/each}
                       {/if}
                       {#if orderedColumnTasks.length > boardRenderLimit}<div class="column-empty" role="status">Showing {cardOffset + 1}–{Math.min(cardOffset + boardRenderLimit, orderedColumnTasks.length)} of {orderedColumnTasks.length} loaded cards</div>{/if}
-                      {#if cardOffset > 0}<button class="load-more-tasks" type="button" on:click={() => { boardCardOffsets = { ...boardCardOffsets, [column.id]: cardOffset - boardRenderLimit }; }}>Show previous cards</button>{/if}
-                      {#if cardOffset + boardRenderLimit < orderedColumnTasks.length}<button class="load-more-tasks" type="button" on:click={() => { boardCardOffsets = { ...boardCardOffsets, [column.id]: cardOffset + boardRenderLimit }; }}>Show next cards</button>
+                      {#if cardOffset > 0}<button class="load-more-tasks" type="button" on:click={(event) => showBoardCardPage(event, column.id, cardOffset - boardRenderLimit)}>Show previous cards</button>{/if}
+                      {#if cardOffset + boardRenderLimit < orderedColumnTasks.length}<button class="load-more-tasks" type="button" on:click={(event) => showBoardCardPage(event, column.id, cardOffset + boardRenderLimit)}>Show next cards</button>
                       {:else if boardPages[column.id]?.nextCursor}<button class="load-more-tasks" type="button" on:click={() => loadMoreBoardColumn(column.id)} disabled={boardPages[column.id].loading}>{boardPages[column.id].loading ? 'Loading…' : 'Load more tasks'}</button>{/if}
                       {#if boardPages[column.id]?.error && tasksByColumn[column.id].length}<div class="column-page-error" role="alert"><span>{boardPages[column.id].error}</span><button class="text-button" type="button" on:click={() => loadBoardColumn(column.id, { reset: false })}>Retry</button></div>{/if}
                     </div>
