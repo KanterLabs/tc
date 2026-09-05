@@ -324,6 +324,12 @@ func TestProjectScopedTokenCannotCreateOutsideItsCeiling(t *testing.T) {
 	}
 }
 
+func TestManifestContentTypeDoesNotDependOnHostMIMETypes(t *testing.T) {
+	if got := staticContentType("manifest.webmanifest"); got != "application/manifest+json" {
+		t.Fatalf("manifest content type = %q", got)
+	}
+}
+
 func TestEmbeddedFrontendServesAssetsAndSPAPaths(t *testing.T) {
 	server, _ := testServer(t, "disabled")
 

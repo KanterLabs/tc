@@ -265,8 +265,8 @@ input:focus, textarea:focus, select:focus { border-color: var(--purple); }
 .board-loading-note { margin: -8px 0 18px; color: var(--muted); font-size: 10px; }
 
 .board { min-width: 0; display: grid; grid-template-columns: none; grid-auto-flow: column; grid-auto-columns: minmax(220px, 1fr); align-items: start; gap: 14px; overflow-x: auto; padding: 2px 1px 18px; }
-/* On very short screens keep a usable card body and allow the page to reach the board. */
-.board-column { min-width: 0; min-height: 0; height: min(860px, max(220px, calc(100dvh - var(--board-top, 260px) - var(--board-bottom-space, 24px)))); display: flex; flex-direction: column; border: 1px solid var(--border); border-radius: 12px; background: color-mix(in srgb, var(--surface-muted) 70%, transparent); transition: border-color var(--dur-fast) var(--ease-out), background-color var(--dur-base) var(--ease-out); }
+/* Ten measured cards determine the shared height; the page can exceed the viewport. */
+.board-column { min-width: 0; min-height: 0; height: var(--board-column-height, 1400px); display: flex; flex-direction: column; border: 1px solid var(--border); border-radius: 12px; background: color-mix(in srgb, var(--surface-muted) 70%, transparent); transition: border-color var(--dur-fast) var(--ease-out), background-color var(--dur-base) var(--ease-out); }
 .board-column > :not(.column-cards) { flex-shrink: 0; }
 .board-column.drop-target { border-color: color-mix(in srgb, var(--purple), var(--border) 40%); background: color-mix(in srgb, var(--purple-soft) 45%, var(--surface-muted)); }
 .board-column.drop-target .column-header { color: var(--purple); }
@@ -1145,7 +1145,8 @@ legend { margin-bottom: 8px; color: var(--ink-soft); font-size: 11px; font-weigh
   .filter-group select { height: 44px; flex: 0 0 142px; }
   .clear-filters { min-height: 44px; padding: 0 8px; }
   .board { grid-template-columns: none; grid-auto-flow: column; grid-auto-columns: minmax(82vw, 1fr); gap: 12px; margin-right: -14px; overflow-x: auto; padding: 2px 14px 16px 0; scroll-snap-type: x mandatory; }
-  .board-column { --board-bottom-space: calc(86px + env(safe-area-inset-bottom)); scroll-margin-top: calc(70px + env(safe-area-inset-top)); scroll-snap-align: start; }
+  .board { --board-empty-card-height: 160px; }
+  .board-column { scroll-margin-top: calc(70px + env(safe-area-inset-top)); scroll-snap-align: start; }
   .column-header { position: relative; z-index: 2; min-height: 52px; border-radius: 12px 12px 0 0; background: color-mix(in srgb, var(--surface-muted) 94%, transparent); backdrop-filter: blur(10px); }
   .column-cards { min-height: 0; }
   .column-empty { min-height: 104px; }

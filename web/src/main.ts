@@ -8,6 +8,9 @@ import '@fontsource/manrope/latin-800.css';
 import { mount } from 'svelte';
 import App from './App.svelte';
 import './app.css';
+import { registerPwa } from './lib/pwa';
+
+registerPwa();
 
 const app = mount(App, {
   target: document.getElementById('app') as HTMLElement

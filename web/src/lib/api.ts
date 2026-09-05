@@ -50,6 +50,9 @@ import {
   type PortableImportReport
 } from './types';
 
+import { writesBlocked } from './connectivity';
+import { clearOfflineBoards } from './offlineBoards';
+
 export const API_PREFIX = '/api/v1';
 
 export type RequestOptions = Omit<RequestInit, 'body'> & {
@@ -141,6 +144,9 @@ function asBody(body: unknown): BodyInit | undefined {
  */
 export async function request<T>(path: string, options: RequestOptions = {}): Promise<T> {
   const { body, idempotencyKey, ifMatch, ...init } = options;
+  if (!['GET', 'HEAD', 'OPTIONS'].includes((init.method || 'GET').toUpperCase()) && writesBlocked()) {
+    throw new ApiError('Offline mode is read-only. Reconnect before making changes.', 0, 'offline_read_only', {});
+  }
   const headers = new Headers(init.headers);
   if (body !== undefined && !(body instanceof FormData) && !(body instanceof Blob)) {
     headers.set('Content-Type', 'application/json');
@@ -151,12 +157,24 @@ export async function request<T>(path: string, options: RequestOptions = {}): Pr
     headers.set('If-Match', typeof ifMatch === 'number' ? etagForVersion(ifMatch) : ifMatch);
   }
 
-  const response = await fetch(`${API_PREFIX}${path}`, {
-    ...init,
-    body: asBody(body),
-    credentials: 'include',
-    headers
-  });
+  let response: Response;
+  try {
+    response = await fetch(`${API_PREFIX}${path}`, {
+      ...init,
+      cache: 'no-store',
+      body: asBody(body),
+      credentials: 'include',
+      headers
+    });
+  } catch (error) {
+    // Auth bootstrap handles Access redirects itself. Other unreachable reads
+    // and writes enter read-only mode even when navigator.onLine stays true.
+    // Failed writes are never retried: the server may already have committed.
+    if (error instanceof TypeError && !path.startsWith('/auth/') && typeof window !== 'undefined') {
+      window.dispatchEvent(new Event('helm:network-unavailable'));
+    }
+    throw error;
+  }
 
   const text = await response.text();
   let parsed: unknown = undefined;
@@ -169,6 +187,10 @@ export async function request<T>(path: string, options: RequestOptions = {}): Pr
   }
 
   if (!response.ok) {
+    if (response.status === 401 || response.status === 403) {
+      await clearOfflineBoards();
+      if (typeof window !== 'undefined') window.dispatchEvent(new Event('helm:auth-invalidated'));
+    }
     const envelope = parsed as Partial<ApiErrorShape> | undefined;
     const error = envelope?.error;
     throw new ApiError(

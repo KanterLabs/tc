@@ -141,7 +141,13 @@ test.describe('command palette', () => {
     await page.unroute(issuePattern, delayedIssues);
 
     await page.reload();
-    const failedIssues = async (route: Route) => route.abort('failed');
+    // A rejected network request now enters the dedicated read-only offline
+    // viewer. An HTTP failure still belongs to the palette's inline error UI.
+    const failedIssues = async (route: Route) => route.fulfill({
+      status: 503,
+      contentType: 'application/json',
+      body: JSON.stringify({ error: { code: 'service_unavailable', message: 'Issue results are temporarily unavailable.' } })
+    });
     await page.route(issuePattern, failedIssues);
     const errorPalette = await openPalette(page);
     const errorStatus = errorPalette.dialog.getByRole('alert');
